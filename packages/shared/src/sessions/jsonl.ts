@@ -116,6 +116,7 @@ export function createSessionHeader(session: StoredSession): SessionHeader {
     workspaceRootPath: toPortablePath(session.workspaceRootPath),
     createdAt: session.createdAt,
     lastUsedAt: Date.now(),
+    lastMessageAt: session.lastMessageAt,  // Actual message time, distinct from lastUsedAt (persist time)
     name: session.name,
     sdkSessionId: session.sdkSessionId,
     isFlagged: session.isFlagged,

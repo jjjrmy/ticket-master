@@ -62,6 +62,9 @@ export interface SessionConfig {
   name?: string;
   createdAt: number;
   lastUsedAt: number;
+  /** Timestamp of last meaningful message (user or final assistant). Used for date grouping in session list.
+   *  Separate from lastUsedAt which tracks any session access (auto-save, open to read, etc.). */
+  lastMessageAt?: number;
   /** Whether this session is flagged */
   isFlagged?: boolean;
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */
@@ -129,6 +132,8 @@ export interface SessionHeader {
   name?: string;
   createdAt: number;
   lastUsedAt: number;
+  /** Timestamp of last meaningful message — persisted separately from lastUsedAt for stable date grouping across restarts. */
+  lastMessageAt?: number;
   /** Whether this session is flagged */
   isFlagged?: boolean;
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */
@@ -192,6 +197,8 @@ export interface SessionMetadata {
   name?: string;
   createdAt: number;
   lastUsedAt: number;
+  /** Timestamp of last meaningful message — used for date grouping. Falls back to lastUsedAt for pre-fix sessions. */
+  lastMessageAt?: number;
   messageCount: number;
   /** Preview of first user message */
   preview?: string;

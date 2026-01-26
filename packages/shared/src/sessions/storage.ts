@@ -375,6 +375,7 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
       name: header.name,
       createdAt: header.createdAt,
       lastUsedAt: header.lastUsedAt,
+      lastMessageAt: header.lastMessageAt,
       messageCount: header.messageCount,
       preview: header.preview,
       sdkSessionId: header.sdkSessionId,
