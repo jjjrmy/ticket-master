@@ -261,6 +261,16 @@ app.whenReady().then(async () => {
     sessionManager = new SessionManager()
     sessionManager.setWindowManager(windowManager)
 
+    // Initialize cloud sync manager (for cloud workspace real-time sync)
+    const { getCloudSyncManager } = await import('./cloud-sync')
+    const cloudSyncManager = getCloudSyncManager()
+    cloudSyncManager.setWindowManager(windowManager)
+
+    // Wire up session change handler so SessionManager updates before renderer refetches
+    cloudSyncManager.setSessionChangeHandler((workspaceId, event) =>
+      sessionManager!.handleRemoteSessionChange(workspaceId, event)
+    )
+
     // Initialize notification service
     initNotificationService(windowManager)
 
@@ -378,6 +388,13 @@ app.on('before-quit', async (event) => {
     }
     // Clean up SessionManager resources (file watchers, timers, etc.)
     sessionManager.cleanup()
+
+    // Disconnect all cloud sync providers
+    try {
+      const { getCloudSyncManager } = await import('./cloud-sync')
+      await getCloudSyncManager().disposeAll()
+      mainLog.info('Disconnected cloud sync providers')
+    } catch { /* ignore cleanup errors */ }
 
     // If update is in progress, let electron-updater handle the quit flow
     // Force exit breaks the NSIS installer on Windows

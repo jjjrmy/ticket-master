@@ -85,6 +85,7 @@ import { skillsAtom } from "@/atoms/skills"
 import { type TodoStateId, type TodoState, statusConfigsToTodoStates } from "@/config/todo-states"
 import { useStatuses } from "@/hooks/useStatuses"
 import { useLabels } from "@/hooks/useLabels"
+import { useCloudSync } from "@/hooks/useCloudSync"
 import { useViews } from "@/hooks/useViews"
 import { LabelIcon, LabelValueTypeIcon } from "@/components/ui/label-icon"
 import { filterItems as filterLabelMenuItems, filterStates as filterLabelMenuStates, type LabelMenuItem } from "@/components/ui/label-menu"
@@ -857,6 +858,9 @@ function AppShellContent({
 
   // Load labels from workspace config
   const { labels: labelConfigs } = useLabels(activeWorkspace?.id || null)
+
+  // Cloud sync: listen for remote changes from cloud-worker WebSocket
+  useCloudSync({ workspaceId: activeWorkspaceId })
 
   // Views: compiled once on config load, evaluated per session in list/chat
   const { evaluateSession: evaluateViews, viewConfigs } = useViews(activeWorkspace?.id || null)

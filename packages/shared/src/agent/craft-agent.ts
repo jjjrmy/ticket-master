@@ -888,6 +888,10 @@ export class CraftAgent {
         });
       }
 
+      // Cloud workspaces store session data in the cloud, not locally
+      // Skip session folder path for cloud - use workspace root instead (always exists)
+      const isCloud = this.config.workspace.storageType === 'cloud';
+
       const options: Options = {
         ...getDefaultOptions(),
         model,
@@ -929,8 +933,9 @@ export class CraftAgent {
         // Use sdkCwd for SDK session storage - this is set once at session creation and never changes.
         // This ensures SDK can always find session transcripts regardless of workingDirectory changes.
         // Note: workingDirectory is still used for context injection and shown to the agent.
+        // For cloud workspaces, skip session folder lookup (doesn't exist locally) - use workspace root.
         cwd: this.config.session?.sdkCwd ??
-          (sessionId ? getSessionPath(this.workspaceRootPath, sessionId) : this.workspaceRootPath),
+          (sessionId && !isCloud ? getSessionPath(this.workspaceRootPath, sessionId) : this.workspaceRootPath),
         includePartialMessages: true,
         // Tools configuration:
         // - Mini agents: minimal set for quick config edits (reduces token count ~70%)
@@ -2250,8 +2255,9 @@ Please continue the conversation naturally from where we left off.
       parts.push(workingDirContext);
     }
 
-    // Add file attachments with stored path info (agent uses Read tool to access content)
-    // Text files are NOT embedded inline to prevent context overflow from large files
+    // Add file attachments with stored path info
+    // For local: storedPath is a file path (agent uses Read tool)
+    // For cloud: storedPath is a signed HTTPS URL (agent can use WebFetch)
     if (attachments) {
       for (const attachment of attachments) {
         if (attachment.storedPath) {
@@ -2309,10 +2315,10 @@ Please continue the conversation naturally from where we left off.
 
     // Add attachments - images/PDFs are uploaded inline, text files are path-only
     // Text files are NOT embedded to prevent context overflow; agent uses Read tool
+    // For local: storedPath is a file path; for cloud: storedPath is a signed HTTPS URL
     if (attachments) {
       for (const attachment of attachments) {
-        // Add path info text block so the agent knows where the file is stored
-        // This enables the agent to use the Read tool to access text/office files
+        // Add path info text block so agent knows where the file is stored
         if (attachment.storedPath) {
           let pathInfo = `[Attached file: ${attachment.name}]\n[Stored at: ${attachment.storedPath}]`;
           if (attachment.markdownPath) {

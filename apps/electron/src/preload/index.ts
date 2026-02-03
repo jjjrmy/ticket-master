@@ -1,7 +1,7 @@
 // Capture errors in the isolated preload context and forward to Sentry
 import '@sentry/electron/preload'
 import { contextBridge, ipcRenderer } from 'electron'
-import { IPC_CHANNELS, type SessionEvent, type ElectronAPI, type FileAttachment, type AuthType } from '../shared/types'
+import { IPC_CHANNELS, type SessionEvent, type CloudSyncEvent, type ElectronAPI, type FileAttachment, type AuthType } from '../shared/types'
 
 const api: ElectronAPI = {
   // Session management
@@ -30,6 +30,8 @@ const api: ElectronAPI = {
   getWorkspaces: () => ipcRenderer.invoke(IPC_CHANNELS.GET_WORKSPACES),
   createWorkspace: (folderPath: string, name: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.CREATE_WORKSPACE, folderPath, name),
+  createCloudWorkspace: (name: string, remoteUrl: string, apiKey: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.CREATE_CLOUD_WORKSPACE, name, remoteUrl, apiKey),
   checkWorkspaceSlug: (slug: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.CHECK_WORKSPACE_SLUG, slug),
 
@@ -435,6 +437,15 @@ const api: ElectronAPI = {
   checkGitBash: () => ipcRenderer.invoke(IPC_CHANNELS.GITBASH_CHECK),
   browseForGitBash: () => ipcRenderer.invoke(IPC_CHANNELS.GITBASH_BROWSE),
   setGitBashPath: (path: string) => ipcRenderer.invoke(IPC_CHANNELS.GITBASH_SET_PATH, path),
+
+  // Cloud sync events (remote changes from cloud-worker WebSocket)
+  onCloudSyncEvent: (callback: (event: CloudSyncEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, syncEvent: CloudSyncEvent) => {
+      callback(syncEvent)
+    }
+    ipcRenderer.on(IPC_CHANNELS.CLOUD_SYNC_EVENT, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.CLOUD_SYNC_EVENT, handler)
+  },
 
   // Menu actions (for unified Craft menu)
   menuQuit: () => ipcRenderer.invoke(IPC_CHANNELS.MENU_QUIT),

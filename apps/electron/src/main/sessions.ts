@@ -48,6 +48,7 @@ import { generateSessionTitle, regenerateSessionTitle, formatPathsToRelative, fo
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
 import type { ToolDisplayMeta } from '@craft-agent/core/types'
 import { DEFAULT_MODEL, getToolIconsDir } from '@craft-agent/shared/config'
+import type { CloudStorageProvider, RemoteChangeEvent } from '@craft-agent/shared/storage'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
 import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
 import { listLabels } from '@craft-agent/shared/labels/storage'
@@ -507,6 +508,10 @@ export class SessionManager {
    * workspaceId must be the global config ID (what the renderer knows).
    */
   setupConfigWatcher(workspaceRootPath: string, workspaceId: string): void {
+    // Cloud workspaces don't use filesystem config watchers - they use WebSocket events
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (workspace && this.isCloudWorkspace(workspace)) return
+
     // Check if already watching this workspace
     if (this.configWatchers.has(workspaceRootPath)) {
       return // Already watching this workspace
@@ -699,8 +704,8 @@ export class SessionManager {
     const workspaceRootPath = managed.workspace.rootPath
     sessionLog.info(`Reloading sources for session ${managed.id}`)
 
-    // Reload all sources from disk (craft-agents-docs is always available as MCP server)
-    const allSources = loadAllSources(workspaceRootPath)
+    // Reload all sources (from cloud for cloud workspaces, from disk for local)
+    const allSources = await this.resolveAllSources(managed.workspace)
     managed.agent.setAllSources(allSources)
 
     // Rebuild MCP and API servers for session's enabled sources
@@ -709,7 +714,7 @@ export class SessionManager {
       enabledSlugs.includes(s.config.slug) && s.config.enabled && s.config.isAuthenticated
     )
     // Pass session path so large API responses can be saved to session folder
-    const sessionPath = getSessionStoragePath(workspaceRootPath, managed.id)
+    const sessionPath = this.isCloudWorkspace(managed.workspace) ? undefined : getSessionStoragePath(workspaceRootPath, managed.id)
     const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath)
     const intendedSlugs = enabledSources.map(s => s.config.slug)
     managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
@@ -837,73 +842,121 @@ export class SessionManager {
     // Set up authentication environment variables (critical for SDK to work)
     await this.reinitializeAuth()
 
-    // Load existing sessions from disk
-    this.loadSessionsFromDisk()
+    // Load existing sessions (from disk for local, cloud API for cloud workspaces)
+    await this.loadSessions()
   }
 
-  // Load all existing sessions from disk into memory (metadata only - messages are lazy-loaded)
-  private loadSessionsFromDisk(): void {
+  // Load all existing sessions into memory (metadata only - messages are lazy-loaded)
+  // For local workspaces, reads from disk. For cloud workspaces, fetches from cloud API.
+  private async loadSessions(): Promise<void> {
     try {
       const workspaces = getWorkspaces()
       let totalSessions = 0
 
       // Iterate over each workspace and load its sessions
       for (const workspace of workspaces) {
-        const workspaceRootPath = workspace.rootPath
-        const sessionMetadata = listStoredSessions(workspaceRootPath)
-        // Load workspace config once per workspace for default working directory
-        const wsConfig = loadWorkspaceConfig(workspaceRootPath)
-        const wsDefaultWorkingDir = wsConfig?.defaults?.workingDirectory
-
-        for (const meta of sessionMetadata) {
-          // Create managed session from metadata only (messages lazy-loaded on demand)
-          // This dramatically reduces memory usage at startup - messages are loaded
-          // when getSession() is called for a specific session
-          const managed: ManagedSession = {
-            id: meta.id,
-            workspace,
-            agent: null,  // Lazy-load agent when needed
-            messages: [],  // Lazy-load messages when needed
-            isProcessing: false,
-            lastMessageAt: meta.lastMessageAt ?? meta.lastUsedAt,  // Fallback for sessions saved before lastMessageAt was persisted
-            streamingText: '',
-            processingGeneration: 0,
-            name: meta.name,
-            preview: meta.preview,
-            createdAt: meta.createdAt,
-            messageCount: meta.messageCount,
-            isFlagged: meta.isFlagged ?? false,
-            permissionMode: meta.permissionMode,
-            sdkSessionId: meta.sdkSessionId,
-            tokenUsage: meta.tokenUsage,  // From JSONL header (updated on save)
-            todoState: meta.todoState,
-            lastReadMessageId: meta.lastReadMessageId,  // Pre-computed for unread detection
-            lastFinalMessageId: meta.lastFinalMessageId,  // Pre-computed for unread detection
-            hasUnread: meta.hasUnread,  // Explicit unread flag for NEW badge state machine
-            enabledSourceSlugs: undefined,  // Loaded with messages
-            labels: meta.labels,
-            workingDirectory: meta.workingDirectory ?? wsDefaultWorkingDir,
-            sdkCwd: meta.sdkCwd,
-            model: meta.model,
-            thinkingLevel: meta.thinkingLevel,
-            lastMessageRole: meta.lastMessageRole,
-            messageQueue: [],
-            backgroundShellCommands: new Map(),
-            messagesLoaded: false,  // Mark as not loaded
-            // Shared viewer state - loaded from metadata for persistence across restarts
-            sharedUrl: meta.sharedUrl,
-            sharedId: meta.sharedId,
-            hidden: meta.hidden,
+        if (this.isCloudWorkspace(workspace)) {
+          // Cloud workspace: fetch session metadata from cloud backend
+          try {
+            const provider = await this.getCloudProvider(workspace)
+            if (!provider) continue
+            const remoteSessions = await provider.sessions.listSessions()
+            for (const meta of remoteSessions) {
+              const managed: ManagedSession = {
+                id: meta.id,
+                workspace,
+                agent: null,
+                messages: [],
+                isProcessing: false,
+                lastMessageAt: meta.lastMessageAt ?? meta.lastUsedAt,
+                streamingText: '',
+                processingGeneration: 0,
+                name: meta.name,
+                preview: meta.preview,
+                createdAt: meta.createdAt,
+                messageCount: meta.messageCount,
+                isFlagged: meta.isFlagged ?? false,
+                permissionMode: meta.permissionMode,
+                sdkSessionId: meta.sdkSessionId,
+                tokenUsage: meta.tokenUsage,
+                todoState: meta.todoState,
+                lastReadMessageId: meta.lastReadMessageId,
+                lastFinalMessageId: meta.lastFinalMessageId,
+                hasUnread: meta.hasUnread,
+                enabledSourceSlugs: undefined,
+                labels: meta.labels,
+                workingDirectory: meta.workingDirectory,
+                sdkCwd: meta.sdkCwd,
+                model: meta.model,
+                thinkingLevel: meta.thinkingLevel,
+                lastMessageRole: meta.lastMessageRole,
+                messageQueue: [],
+                backgroundShellCommands: new Map(),
+                messagesLoaded: false,
+                sharedUrl: meta.sharedUrl,
+                sharedId: meta.sharedId,
+                hidden: meta.hidden,
+              }
+              this.sessions.set(meta.id, managed)
+              totalSessions++
+            }
+          } catch (err) {
+            sessionLog.error(`Failed to load cloud sessions for workspace "${workspace.name}":`, err)
           }
+        } else {
+          // Local workspace: read from disk
+          const workspaceRootPath = workspace.rootPath
+          const sessionMetadata = listStoredSessions(workspaceRootPath)
+          // Load workspace config once per workspace for default working directory
+          const wsConfig = loadWorkspaceConfig(workspaceRootPath)
+          const wsDefaultWorkingDir = wsConfig?.defaults?.workingDirectory
 
-          this.sessions.set(meta.id, managed)
-          totalSessions++
+          for (const meta of sessionMetadata) {
+            const managed: ManagedSession = {
+              id: meta.id,
+              workspace,
+              agent: null,
+              messages: [],
+              isProcessing: false,
+              lastMessageAt: meta.lastMessageAt ?? meta.lastUsedAt,
+              streamingText: '',
+              processingGeneration: 0,
+              name: meta.name,
+              preview: meta.preview,
+              createdAt: meta.createdAt,
+              messageCount: meta.messageCount,
+              isFlagged: meta.isFlagged ?? false,
+              permissionMode: meta.permissionMode,
+              sdkSessionId: meta.sdkSessionId,
+              tokenUsage: meta.tokenUsage,
+              todoState: meta.todoState,
+              lastReadMessageId: meta.lastReadMessageId,
+              lastFinalMessageId: meta.lastFinalMessageId,
+              hasUnread: meta.hasUnread,
+              enabledSourceSlugs: undefined,
+              labels: meta.labels,
+              workingDirectory: meta.workingDirectory ?? wsDefaultWorkingDir,
+              sdkCwd: meta.sdkCwd,
+              model: meta.model,
+              thinkingLevel: meta.thinkingLevel,
+              lastMessageRole: meta.lastMessageRole,
+              messageQueue: [],
+              backgroundShellCommands: new Map(),
+              messagesLoaded: false,
+              sharedUrl: meta.sharedUrl,
+              sharedId: meta.sharedId,
+              hidden: meta.hidden,
+            }
+
+            this.sessions.set(meta.id, managed)
+            totalSessions++
+          }
         }
       }
 
-      sessionLog.info(`Loaded ${totalSessions} sessions from disk (metadata only)`)
+      sessionLog.info(`Loaded ${totalSessions} sessions (metadata only)`)
     } catch (error) {
-      sessionLog.error('Failed to load sessions from disk:', error)
+      sessionLog.error('Failed to load sessions:', error)
     }
   }
 
@@ -946,21 +999,195 @@ export class SessionManager {
         hidden: managed.hidden,
       }
 
-      // Queue for async persistence with debouncing
-      sessionPersistenceQueue.enqueue(storedSession)
+      if (this.isCloudWorkspace(managed.workspace)) {
+        // Cloud workspaces: save directly to cloud (fire-and-forget, skip local disk)
+        void (async () => {
+          try {
+            const provider = await this.getCloudProvider(managed.workspace)
+            if (provider) await provider.sessions.saveSession(storedSession)
+          } catch (err) {
+            sessionLog.error(`Cloud save failed for session ${storedSession.id}:`, err)
+          }
+        })()
+      } else {
+        // Local workspaces: queue for async persistence with debouncing
+        sessionPersistenceQueue.enqueue(storedSession)
+      }
     } catch (error) {
       sessionLog.error(`Failed to queue session ${managed.id} for persistence:`, error)
     }
   }
 
+  // ── Cloud workspace helpers ──
+
+  /** Check if a workspace uses cloud storage */
+  private isCloudWorkspace(workspace: Workspace): boolean {
+    return workspace.storageType === 'cloud' && !!workspace.cloudConfig
+  }
+
+  /** Get the CloudStorageProvider for a cloud workspace, or null for local */
+  private async getCloudProvider(workspace: Workspace): Promise<CloudStorageProvider | null> {
+    if (!this.isCloudWorkspace(workspace)) return null
+    try {
+      const { getCloudSyncManager } = await import('./cloud-sync')
+      return await getCloudSyncManager().getProvider(workspace)
+    } catch (err) {
+      sessionLog.error(`Failed to get cloud provider for workspace "${workspace.name}":`, err)
+      return null
+    }
+  }
+
+  /** Update session metadata via cloud provider (for cloud workspaces) */
+  private async cloudUpdateMetadata(
+    workspace: Workspace,
+    sessionId: string,
+    updates: Record<string, unknown>,
+  ): Promise<void> {
+    const provider = await this.getCloudProvider(workspace)
+    if (!provider) return
+    await provider.sessions.updateSessionMetadata(sessionId, updates as Parameters<typeof provider.sessions.updateSessionMetadata>[1])
+  }
+
+  /** Load all sources for a workspace (cloud or local), including built-ins */
+  private async resolveAllSources(workspace: Workspace): Promise<LoadedSource[]> {
+    const provider = await this.getCloudProvider(workspace)
+    if (provider) return provider.sources.loadWorkspaceSources()
+    return loadAllSources(workspace.rootPath)
+  }
+
+  /** Load specific sources by slugs for a workspace (cloud or local) */
+  private async resolveSourcesBySlugs(workspace: Workspace, slugs: string[]): Promise<LoadedSource[]> {
+    const provider = await this.getCloudProvider(workspace)
+    if (provider) {
+      const allSources = await provider.sources.loadWorkspaceSources()
+      return allSources.filter(s => slugs.includes(s.config.slug))
+    }
+    return getSourcesBySlugs(workspace.rootPath, slugs)
+  }
+
+  /** Load workspace sources list (cloud or local), not including built-ins */
+  private async resolveWorkspaceSources(workspace: Workspace): Promise<LoadedSource[]> {
+    const provider = await this.getCloudProvider(workspace)
+    if (provider) return provider.sources.loadWorkspaceSources()
+    return loadWorkspaceSources(workspace.rootPath)
+  }
+
+  /** Load labels for a workspace (cloud or local) */
+  private async resolveLabels(workspace: Workspace): Promise<import('@craft-agent/shared/labels').LabelConfig[]> {
+    const provider = await this.getCloudProvider(workspace)
+    if (provider) return provider.labels.listLabels()
+    return listLabels(workspace.rootPath)
+  }
+
   // Flush a specific session immediately (call on session close/switch)
+  // No-op for cloud workspace sessions (they save directly via WebSocket).
   async flushSession(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (managed && this.isCloudWorkspace(managed.workspace)) return
     await sessionPersistenceQueue.flush(sessionId)
   }
 
   // Flush all pending sessions (call on app quit)
   async flushAllSessions(): Promise<void> {
     await sessionPersistenceQueue.flushAll()
+  }
+
+  /**
+   * Handle remote session changes from cloud sync.
+   * Updates the in-memory sessions map so getSessions() returns fresh data.
+   * Called by CloudSyncManager BEFORE broadcasting to renderer.
+   */
+  async handleRemoteSessionChange(workspaceId: string, event: RemoteChangeEvent): Promise<void> {
+    if (event.entity !== 'session') return
+
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace || !this.isCloudWorkspace(workspace)) return
+
+    const provider = await this.getCloudProvider(workspace)
+    if (!provider) return
+
+    const sessionMeta = event.data
+    // For delete events, the worker sends { sessionId } instead of { id }
+    const sessionId = sessionMeta?.id ?? (sessionMeta as { sessionId?: string })?.sessionId
+    if (!sessionId) return
+
+    switch (event.action) {
+      case 'created':
+      case 'updated': {
+        // Check if we already have this session in-memory
+        const now = Date.now()
+        const existing = this.sessions.get(sessionId)
+        if (existing) {
+          // Update metadata fields from the remote event
+          existing.name = sessionMeta.name
+          existing.preview = sessionMeta.preview
+          existing.lastMessageAt = sessionMeta.lastMessageAt ?? sessionMeta.lastUsedAt ?? now
+          existing.messageCount = sessionMeta.messageCount
+          existing.isFlagged = sessionMeta.isFlagged ?? false
+          existing.permissionMode = sessionMeta.permissionMode
+          existing.todoState = sessionMeta.todoState
+          existing.labels = sessionMeta.labels
+          existing.workingDirectory = sessionMeta.workingDirectory
+          existing.model = sessionMeta.model
+          existing.thinkingLevel = sessionMeta.thinkingLevel
+          existing.lastMessageRole = sessionMeta.lastMessageRole
+          existing.sharedUrl = sessionMeta.sharedUrl
+          existing.sharedId = sessionMeta.sharedId
+          existing.hidden = sessionMeta.hidden
+          // Mark messages as stale so next load fetches fresh data
+          existing.messagesLoaded = false
+          sessionLog.info(`Updated in-memory session ${sessionId} from remote change`)
+        } else {
+          // Create new ManagedSession entry from the metadata
+          const managed: ManagedSession = {
+            id: sessionMeta.id,
+            workspace,
+            agent: null,
+            messages: [],
+            isProcessing: false,
+            lastMessageAt: sessionMeta.lastMessageAt ?? sessionMeta.lastUsedAt ?? now,
+            streamingText: '',
+            processingGeneration: 0,
+            name: sessionMeta.name,
+            preview: sessionMeta.preview,
+            createdAt: sessionMeta.createdAt ?? now,
+            messageCount: sessionMeta.messageCount,
+            isFlagged: sessionMeta.isFlagged ?? false,
+            permissionMode: sessionMeta.permissionMode,
+            sdkSessionId: sessionMeta.sdkSessionId,
+            tokenUsage: sessionMeta.tokenUsage,
+            todoState: sessionMeta.todoState,
+            lastReadMessageId: sessionMeta.lastReadMessageId,
+            lastFinalMessageId: sessionMeta.lastFinalMessageId,
+            hasUnread: sessionMeta.hasUnread,
+            enabledSourceSlugs: undefined,
+            labels: sessionMeta.labels,
+            workingDirectory: sessionMeta.workingDirectory,
+            sdkCwd: sessionMeta.sdkCwd,
+            model: sessionMeta.model,
+            thinkingLevel: sessionMeta.thinkingLevel,
+            lastMessageRole: sessionMeta.lastMessageRole,
+            messageQueue: [],
+            backgroundShellCommands: new Map(),
+            messagesLoaded: false,
+            sharedUrl: sessionMeta.sharedUrl,
+            sharedId: sessionMeta.sharedId,
+            hidden: sessionMeta.hidden,
+          }
+          this.sessions.set(sessionId, managed)
+          sessionLog.info(`Added new session ${sessionId} from remote change`)
+        }
+        break
+      }
+
+      case 'deleted': {
+        if (this.sessions.has(sessionId)) {
+          this.sessions.delete(sessionId)
+          sessionLog.info(`Removed session ${sessionId} from remote delete`)
+        }
+        break
+      }
+    }
   }
 
   // ============================================
@@ -1011,8 +1238,8 @@ export class SessionManager {
 
     sessionLog.info(`Running OAuth flow for ${request.sourceSlug} (type: ${request.type})`)
 
-    // Find the source in workspace sources
-    const sources = loadWorkspaceSources(managed.workspace.rootPath)
+    // Find the source in workspace sources (cloud or local)
+    const sources = await this.resolveWorkspaceSources(managed.workspace)
     const source = sources.find(s => s.config.slug === request.sourceSlug)
 
     if (!source) {
@@ -1326,7 +1553,7 @@ export class SessionManager {
       return existingPromise
     }
 
-    const loadPromise = this.loadMessagesFromDisk(managed)
+    const loadPromise = this.loadMessages(managed)
     this.messageLoadingPromises.set(managed.id, loadPromise)
 
     try {
@@ -1337,19 +1564,35 @@ export class SessionManager {
   }
 
   /**
-   * Internal: Load messages from disk storage into the managed session.
+   * Internal: Load messages for a managed session.
+   * For cloud workspaces, fetches from cloud API. For local, reads from disk.
    */
-  private async loadMessagesFromDisk(managed: ManagedSession): Promise<void> {
-    const storedSession = loadStoredSession(managed.workspace.rootPath, managed.id)
+  private async loadMessages(managed: ManagedSession): Promise<void> {
+    let storedSession: StoredSession | null = null
+
+    if (this.isCloudWorkspace(managed.workspace)) {
+      // Cloud workspace: fetch full session (with messages) from cloud
+      try {
+        const provider = await this.getCloudProvider(managed.workspace)
+        if (provider) {
+          storedSession = await provider.sessions.loadSession(managed.id)
+        }
+      } catch (err) {
+        sessionLog.error(`Failed to load cloud messages for session ${managed.id}:`, err)
+      }
+    } else {
+      // Local workspace: read from disk
+      storedSession = loadStoredSession(managed.workspace.rootPath, managed.id)
+    }
+
     if (storedSession) {
       managed.messages = (storedSession.messages || []).map(storedToMessage)
       managed.tokenUsage = storedSession.tokenUsage
       managed.lastReadMessageId = storedSession.lastReadMessageId
-      managed.hasUnread = storedSession.hasUnread  // Explicit unread flag for NEW badge state machine
+      managed.hasUnread = storedSession.hasUnread
       managed.enabledSourceSlugs = storedSession.enabledSourceSlugs
       managed.sharedUrl = storedSession.sharedUrl
       managed.sharedId = storedSession.sharedId
-      // Sync name from disk - ensures title persistence across lazy loading
       managed.name = storedSession.name
       sessionLog.debug(`Lazy-loaded ${managed.messages.length} messages for session ${managed.id}`)
     }
@@ -1357,11 +1600,13 @@ export class SessionManager {
   }
 
   /**
-   * Get the filesystem path to a session's folder
+   * Get the filesystem path to a session's folder.
+   * Returns null for cloud workspaces (no local path).
    */
   getSessionPath(sessionId: string): string | null {
     const managed = this.sessions.get(sessionId)
     if (!managed) return null
+    if (this.isCloudWorkspace(managed.workspace)) return null
     return getSessionStoragePath(managed.workspace.rootPath, sessionId)
   }
 
@@ -1401,15 +1646,36 @@ export class SessionManager {
       resolvedWorkingDir = options.workingDirectory
     }
 
-    // Use storage layer to create and persist the session
-    const storedSession = await createStoredSession(workspaceRootPath, {
-      permissionMode: defaultPermissionMode,
-      workingDirectory: resolvedWorkingDir,
-      hidden: options?.hidden,
-    })
+    let sessionId: string
+    let lastMessageAt: number
+    let sdkCwd: string | undefined
 
-    // Model priority: options.model > storedSession.model > workspace default
-    const resolvedModel = options?.model || storedSession.model || defaultModel
+    if (this.isCloudWorkspace(workspace)) {
+      // Cloud workspace: create session via cloud provider (no local disk)
+      const provider = await this.getCloudProvider(workspace)
+      if (!provider) throw new Error(`Cloud provider unavailable for workspace ${workspace.name}`)
+      const cloudConfig = await provider.sessions.createSession({
+        permissionMode: defaultPermissionMode,
+        workingDirectory: resolvedWorkingDir,
+        hidden: options?.hidden,
+      })
+      sessionId = cloudConfig.id
+      lastMessageAt = cloudConfig.lastUsedAt ?? Date.now()
+      sdkCwd = undefined // No local SDK cwd for cloud sessions
+    } else {
+      // Local workspace: use storage layer to create and persist on disk
+      const storedSession = await createStoredSession(workspaceRootPath, {
+        permissionMode: defaultPermissionMode,
+        workingDirectory: resolvedWorkingDir,
+        hidden: options?.hidden,
+      })
+      sessionId = storedSession.id
+      lastMessageAt = storedSession.lastMessageAt ?? storedSession.lastUsedAt
+      sdkCwd = storedSession.sdkCwd
+    }
+
+    // Model priority: options.model > workspace default
+    const resolvedModel = options?.model || defaultModel
 
     // Log mini agent session creation
     if (options?.systemPromptPreset === 'mini' || options?.model) {
@@ -1417,18 +1683,18 @@ export class SessionManager {
     }
 
     const managed: ManagedSession = {
-      id: storedSession.id,
+      id: sessionId,
       workspace,
       agent: null,  // Lazy-load agent on first message
       messages: [],
       isProcessing: false,
-      lastMessageAt: storedSession.lastMessageAt ?? storedSession.lastUsedAt,  // Fallback for sessions saved before lastMessageAt was persisted
+      lastMessageAt,
       streamingText: '',
       processingGeneration: 0,
       isFlagged: false,
       permissionMode: defaultPermissionMode,
       workingDirectory: resolvedWorkingDir,
-      sdkCwd: storedSession.sdkCwd,
+      sdkCwd,
       // Session-specific model takes priority, then workspace default
       model: resolvedModel,
       thinkingLevel: defaultThinkingLevel,
@@ -1436,14 +1702,14 @@ export class SessionManager {
       systemPromptPreset: options?.systemPromptPreset,
       messageQueue: [],
       backgroundShellCommands: new Map(),
-      messagesLoaded: true,  // New sessions don't need to load messages from disk
+      messagesLoaded: true,  // New sessions don't need to load messages
       hidden: options?.hidden,
     }
 
-    this.sessions.set(storedSession.id, managed)
+    this.sessions.set(sessionId, managed)
 
     return {
-      id: storedSession.id,
+      id: sessionId,
       workspaceId: workspace.id,
       workspaceName: workspace.name,
       lastMessageAt: managed.lastMessageAt,
@@ -1455,7 +1721,7 @@ export class SessionManager {
       workingDirectory: resolvedWorkingDir,
       model: managed.model,
       thinkingLevel: defaultThinkingLevel,
-      sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
+      sessionFolderPath: this.isCloudWorkspace(workspace) ? undefined : getSessionStoragePath(workspaceRootPath, sessionId),
       hidden: options?.hidden,
     }
   }
@@ -1673,8 +1939,8 @@ export class SessionManager {
           // Source is in the list but server might not be active (e.g., build failed previously)
         }
 
-        // Load the source to check if it exists and is ready
-        const sources = getSourcesBySlugs(workspaceRootPath, [sourceSlug])
+        // Load the source to check if it exists and is ready (cloud or local)
+        const sources = await this.resolveSourcesBySlugs(managed.workspace, [sourceSlug])
         if (sources.length === 0) {
           sessionLog.warn(`Source ${sourceSlug} not found in workspace`)
           return false
@@ -1705,10 +1971,10 @@ export class SessionManager {
           sessionLog.info(`Added source ${sourceSlug} to session enabled sources`)
         }
 
-        // Build server configs for all enabled sources
-        const allEnabledSources = getSourcesBySlugs(workspaceRootPath, managed.enabledSourceSlugs || [])
+        // Build server configs for all enabled sources (cloud or local)
+        const allEnabledSources = await this.resolveSourcesBySlugs(managed.workspace, managed.enabledSourceSlugs || [])
         // Pass session path so large API responses can be saved to session folder
-        const sessionPath = getSessionStoragePath(workspaceRootPath, managed.id)
+        const sessionPath = this.isCloudWorkspace(managed.workspace) ? undefined : getSessionStoragePath(workspaceRootPath, managed.id)
         const { mcpServers, apiServers, errors } = await buildServersFromSources(allEnabledSources, sessionPath)
 
         if (errors.length > 0) {
@@ -1811,6 +2077,7 @@ export class SessionManager {
   async setPendingPlanExecution(sessionId: string, planPath: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
+      if (this.isCloudWorkspace(managed.workspace)) return // Plan execution state is local-only for now
       await setStoredPendingPlanExecution(managed.workspace.rootPath, sessionId, planPath)
       sessionLog.info(`Session ${sessionId}: set pending plan execution for ${planPath}`)
     }
@@ -1824,6 +2091,7 @@ export class SessionManager {
   async markCompactionComplete(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
+      if (this.isCloudWorkspace(managed.workspace)) return
       await markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
       sessionLog.info(`Session ${sessionId}: compaction marked complete for pending plan`)
     }
@@ -1837,6 +2105,7 @@ export class SessionManager {
   async clearPendingPlanExecution(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
+      if (this.isCloudWorkspace(managed.workspace)) return
       await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
       sessionLog.info(`Session ${sessionId}: cleared pending plan execution`)
     }
@@ -1849,6 +2118,7 @@ export class SessionManager {
   getPendingPlanExecution(sessionId: string): { planPath: string; awaitingCompaction: boolean } | null {
     const managed = this.sessions.get(sessionId)
     if (!managed) return null
+    if (this.isCloudWorkspace(managed.workspace)) return null
     return getStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
   }
 
@@ -1871,8 +2141,14 @@ export class SessionManager {
     this.sendEvent({ type: 'async_operation', sessionId, isOngoing: true }, managed.workspace.id)
 
     try {
-      // Load session directly from disk (already in correct format)
-      const storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
+      // Load session data (from cloud for cloud workspaces, from disk for local)
+      let storedSession: StoredSession | null = null
+      if (this.isCloudWorkspace(managed.workspace)) {
+        const provider = await this.getCloudProvider(managed.workspace)
+        if (provider) storedSession = await provider.sessions.loadSession(sessionId)
+      } else {
+        storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
+      }
       if (!storedSession) {
         return { success: false, error: 'Session file not found' }
       }
@@ -1897,11 +2173,12 @@ export class SessionManager {
       // Store shared info in session
       managed.sharedUrl = data.url
       managed.sharedId = data.id
-      const workspaceRootPath = managed.workspace.rootPath
-      await updateSessionMetadata(workspaceRootPath, sessionId, {
-        sharedUrl: data.url,
-        sharedId: data.id,
-      })
+      const shareUpdates = { sharedUrl: data.url, sharedId: data.id }
+      if (this.isCloudWorkspace(managed.workspace)) {
+        await this.cloudUpdateMetadata(managed.workspace, sessionId, shareUpdates)
+      } else {
+        await updateSessionMetadata(managed.workspace.rootPath, sessionId, shareUpdates)
+      }
 
       sessionLog.info(`Session ${sessionId} shared at ${data.url}`)
       // Notify all windows for this workspace
@@ -1935,8 +2212,14 @@ export class SessionManager {
     this.sendEvent({ type: 'async_operation', sessionId, isOngoing: true }, managed.workspace.id)
 
     try {
-      // Load session directly from disk (already in correct format)
-      const storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
+      // Load session data (from cloud for cloud workspaces, from disk for local)
+      let storedSession: StoredSession | null = null
+      if (this.isCloudWorkspace(managed.workspace)) {
+        const provider = await this.getCloudProvider(managed.workspace)
+        if (provider) storedSession = await provider.sessions.loadSession(sessionId)
+      } else {
+        storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
+      }
       if (!storedSession) {
         return { success: false, error: 'Session file not found' }
       }
@@ -2000,11 +2283,12 @@ export class SessionManager {
       // Clear shared info
       delete managed.sharedUrl
       delete managed.sharedId
-      const workspaceRootPath = managed.workspace.rootPath
-      await updateSessionMetadata(workspaceRootPath, sessionId, {
-        sharedUrl: undefined,
-        sharedId: undefined,
-      })
+      const revokeUpdates = { sharedUrl: undefined, sharedId: undefined }
+      if (this.isCloudWorkspace(managed.workspace)) {
+        await this.cloudUpdateMetadata(managed.workspace, sessionId, revokeUpdates)
+      } else {
+        await updateSessionMetadata(managed.workspace.rootPath, sessionId, revokeUpdates)
+      }
 
       sessionLog.info(`Session ${sessionId} share revoked`)
       // Notify all windows for this workspace
@@ -2043,16 +2327,16 @@ export class SessionManager {
 
     // If agent exists, build and apply servers immediately
     if (managed.agent) {
-      const sources = getSourcesBySlugs(workspaceRootPath, sourceSlugs)
+      const sources = await this.resolveSourcesBySlugs(managed.workspace, sourceSlugs)
       // Pass session path so large API responses can be saved to session folder
-      const sessionPath = getSessionStoragePath(workspaceRootPath, sessionId)
+      const sessionPath = this.isCloudWorkspace(managed.workspace) ? undefined : getSessionStoragePath(workspaceRootPath, sessionId)
       const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath)
       if (errors.length > 0) {
         sessionLog.warn(`Source build errors:`, errors)
       }
 
       // Set all sources for context (agent sees full list with descriptions, including built-ins)
-      const allSources = loadAllSources(workspaceRootPath)
+      const allSources = await this.resolveAllSources(managed.workspace)
       managed.agent.setAllSources(allSources)
 
       // Set active source servers (tools are only available from these)
@@ -2159,8 +2443,11 @@ export class SessionManager {
 
     // Persist changes
     if (needsPersist) {
-      const workspaceRootPath = managed.workspace.rootPath
-      await updateSessionMetadata(workspaceRootPath, sessionId, updates)
+      if (this.isCloudWorkspace(managed.workspace)) {
+        await this.cloudUpdateMetadata(managed.workspace, sessionId, updates)
+      } else {
+        await updateSessionMetadata(managed.workspace.rootPath, sessionId, updates)
+      }
     }
   }
 
@@ -2173,9 +2460,12 @@ export class SessionManager {
     if (managed) {
       managed.hasUnread = true
       managed.lastReadMessageId = undefined
-      // Persist to disk
-      const workspaceRootPath = managed.workspace.rootPath
-      await updateSessionMetadata(workspaceRootPath, sessionId, { hasUnread: true, lastReadMessageId: undefined })
+      const metaUpdates = { hasUnread: true, lastReadMessageId: undefined }
+      if (this.isCloudWorkspace(managed.workspace)) {
+        await this.cloudUpdateMetadata(managed.workspace, sessionId, metaUpdates)
+      } else {
+        await updateSessionMetadata(managed.workspace.rootPath, sessionId, metaUpdates)
+      }
     }
   }
 
@@ -2280,8 +2570,12 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (managed) {
       managed.model = model ?? undefined
-      // Persist to disk
-      await updateSessionMetadata(managed.workspace.rootPath, sessionId, { model: model ?? undefined })
+      // Persist metadata
+      if (this.isCloudWorkspace(managed.workspace)) {
+        await this.cloudUpdateMetadata(managed.workspace, sessionId, { model: model ?? undefined })
+      } else {
+        await updateSessionMetadata(managed.workspace.rootPath, sessionId, { model: model ?? undefined })
+      }
       // Update agent model if it already exists (takes effect on next query)
       if (managed.agent) {
         // Fallback chain: session model > workspace default > global config > DEFAULT_MODEL
@@ -2359,8 +2653,24 @@ export class SessionManager {
 
     this.sessions.delete(sessionId)
 
-    // Delete from disk too
-    deleteStoredSession(workspaceRootPath, sessionId)
+    if (this.isCloudWorkspace(managed.workspace)) {
+      // Cloud workspace: delete from cloud only (fire-and-forget)
+      void (async () => {
+        try {
+          const provider = await this.getCloudProvider(managed.workspace)
+          if (provider) {
+            // Delete files from R2 first, then session data from SQLite
+            await provider.files.deleteAllForSession(sessionId)
+            await provider.sessions.deleteSession(sessionId)
+          }
+        } catch (err) {
+          sessionLog.error(`Cloud delete failed for session ${sessionId}:`, err)
+        }
+      })()
+    } else {
+      // Local workspace: delete from disk
+      deleteStoredSession(workspaceRootPath, sessionId)
+    }
 
     // Notify all windows for this workspace that the session was deleted
     this.sendEvent({ type: 'session_deleted', sessionId }, managed.workspace.id)
@@ -2378,7 +2688,9 @@ export class SessionManager {
     // Clear any pending plan execution state when a new user message is sent.
     // This acts as a safety valve - if the user moves on, we don't want to
     // auto-execute an old plan later.
-    await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+    if (!this.isCloudWorkspace(managed.workspace)) {
+      await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+    }
 
     // Ensure messages are loaded before we try to add new ones
     await this.ensureMessagesLoaded(managed)
@@ -2478,7 +2790,7 @@ export class SessionManager {
     // fresh and queued messages). Scans regex patterns configured on labels,
     // then merges any new matches into the session's label array.
     try {
-      const labelTree = listLabels(managed.workspace.rootPath)
+      const labelTree = await this.resolveLabels(managed.workspace)
       const autoMatches = evaluateAutoLabels(message, labelTree)
 
       if (autoMatches.length > 0) {
@@ -2535,16 +2847,16 @@ export class SessionManager {
 
     // Always set all sources for context (even if none are enabled), including built-ins
     const workspaceRootPath = managed.workspace.rootPath
-    const allSources = loadAllSources(workspaceRootPath)
+    const allSources = await this.resolveAllSources(managed.workspace)
     agent.setAllSources(allSources)
     sendSpan.mark('sources.loaded')
 
     // Apply source servers if any are enabled
     if (managed.enabledSourceSlugs?.length) {
       // Always build server configs fresh (no caching - single source of truth)
-      const sources = getSourcesBySlugs(workspaceRootPath, managed.enabledSourceSlugs)
+      const sources = await this.resolveSourcesBySlugs(managed.workspace, managed.enabledSourceSlugs)
       // Pass session path so large API responses can be saved to session folder
-      const sessionPath = getSessionStoragePath(workspaceRootPath, sessionId)
+      const sessionPath = this.isCloudWorkspace(managed.workspace) ? undefined : getSessionStoragePath(workspaceRootPath, sessionId)
       const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath)
       if (errors.length > 0) {
         sessionLog.warn(`Source build errors:`, errors)
@@ -2798,7 +3110,11 @@ export class SessionManager {
         // User is not watching - mark as unread for NEW badge
         if (!managed.hasUnread) {
           managed.hasUnread = true
-          await updateSessionMetadata(managed.workspace.rootPath, sessionId, { hasUnread: true })
+          if (this.isCloudWorkspace(managed.workspace)) {
+            await this.cloudUpdateMetadata(managed.workspace, sessionId, { hasUnread: true })
+          } else {
+            await updateSessionMetadata(managed.workspace.rootPath, sessionId, { hasUnread: true })
+          }
         }
       }
     }
@@ -3114,7 +3430,7 @@ To view this task's output:
     }
   }
 
-  private processEvent(managed: ManagedSession, event: AgentEvent): void {
+  private async processEvent(managed: ManagedSession, event: AgentEvent): Promise<void> {
     const sessionId = managed.id
     const workspaceId = managed.workspace.id
 
@@ -3168,7 +3484,7 @@ To view this task's output:
         const workspaceRootPath = managed.workspace.rootPath
         let toolDisplayMeta: ToolDisplayMeta | undefined
         if (formattedToolInput && Object.keys(formattedToolInput).length > 0) {
-          const allSources = loadAllSources(workspaceRootPath)
+          const allSources = await this.resolveAllSources(managed.workspace)
           toolDisplayMeta = resolveToolDisplayMeta(event.toolName, formattedToolInput, workspaceRootPath, allSources)
         }
 
@@ -3285,7 +3601,7 @@ To view this task's output:
           // locate this message by toolUseId and update it with input/intent/displayMeta.
           sessionLog.info(`RESULT WITHOUT START: toolUseId=${event.toolUseId}, toolName=${toolName} (creating message from result)`)
           const fallbackWorkspaceRootPath = managed.workspace.rootPath
-          const fallbackSources = loadAllSources(fallbackWorkspaceRootPath)
+          const fallbackSources = await this.resolveAllSources(managed.workspace)
           const fallbackToolDisplayMeta = resolveToolDisplayMeta(toolName, undefined, fallbackWorkspaceRootPath, fallbackSources)
 
           const toolMessage: Message = {
@@ -3379,7 +3695,9 @@ To view this task's output:
           // This is done here (backend) rather than in the renderer so it's
           // not affected by CMD+R during compaction. The frontend reload
           // recovery will see awaitingCompaction=false and trigger execution.
-          void markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
+          if (!this.isCloudWorkspace(managed.workspace)) {
+            void markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
+          }
           sessionLog.info(`Session ${sessionId}: compaction complete, marked pending plan ready`)
 
           // Emit usage_update so the context count badge refreshes immediately

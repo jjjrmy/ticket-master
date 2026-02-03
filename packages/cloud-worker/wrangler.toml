@@ -1,0 +1,19 @@
+name = "craft-agent-cloud"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+account_id = "ab7347813b21ea6079df4cb18c4bb9e8"
+
+# API_KEY is set via `wrangler secret put API_KEY`
+
+[[durable_objects.bindings]]
+name = "WORKSPACE"
+class_name = "WorkspaceDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkspaceDO"]
+
+# R2 bucket for file storage (attachments, downloads, long_responses)
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "craft-agent-files-prod"

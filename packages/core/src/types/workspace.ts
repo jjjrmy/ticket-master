@@ -8,15 +8,38 @@
  */
 export type McpAuthType = 'workspace_oauth' | 'workspace_bearer' | 'public';
 
+/**
+ * Workspace storage type
+ * - 'local': Filesystem-based storage (default, existing behavior)
+ * - 'cloud': Cloud-synced via Cloudflare Worker + Durable Object
+ */
+export type WorkspaceStorageType = 'local' | 'cloud';
+
 export interface Workspace {
   id: string;
   name: string;            // Read from workspace folder config (not stored in global config)
-  rootPath: string;        // Absolute path to workspace folder (e.g., ~/Projects/my-app/craft-agent)
+  rootPath: string;        // Absolute path to workspace folder (also used for local config cache in cloud mode)
   createdAt: number;
   lastAccessedAt?: number; // For sorting recent workspaces
   iconUrl?: string;
   mcpUrl?: string;
   mcpAuthType?: McpAuthType;
+
+  /** Storage backend type. Defaults to 'local' if not set. */
+  storageType?: WorkspaceStorageType;
+
+  /**
+   * Cloud workspace configuration (only present when storageType is 'cloud').
+   * API key is stored separately in CredentialManager, NOT in this config.
+   */
+  cloudConfig?: {
+    /** Remote Worker URL, e.g., "https://my-craft-cloud.workers.dev" */
+    remoteUrl: string;
+    /** Workspace slug used as the Durable Object identity (derived from name) */
+    workspaceSlug: string;
+    /** Last time data was synced from the cloud */
+    lastSyncedAt?: number;
+  };
 }
 
 export type AuthType = 'api_key' | 'oauth_token';

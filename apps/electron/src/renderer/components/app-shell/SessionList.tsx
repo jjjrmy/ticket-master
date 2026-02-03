@@ -1351,7 +1351,7 @@ export function SessionList({
                           onSessionSelect?.(item)
                         }}
                         onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
-                        permissionMode={sessionOptions?.get(item.id)?.permissionMode}
+                        permissionMode={sessionOptions?.get(item.id)?.permissionMode ?? item.permissionMode as PermissionMode}
                         searchQuery={searchQuery}
                         todoStates={todoStates}
                         flatLabels={flatLabels}
@@ -1398,7 +1398,7 @@ export function SessionList({
                           onSessionSelect?.(item)
                         }}
                         onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
-                        permissionMode={sessionOptions?.get(item.id)?.permissionMode}
+                        permissionMode={sessionOptions?.get(item.id)?.permissionMode ?? item.permissionMode as PermissionMode}
                         searchQuery={searchQuery}
                         todoStates={todoStates}
                         flatLabels={flatLabels}
@@ -1446,7 +1446,7 @@ export function SessionList({
                         onSessionSelect?.(item)
                       }}
                       onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
-                      permissionMode={sessionOptions?.get(item.id)?.permissionMode}
+                      permissionMode={sessionOptions?.get(item.id)?.permissionMode ?? item.permissionMode as PermissionMode}
                       searchQuery={searchQuery}
                       todoStates={todoStates}
                       flatLabels={flatLabels}

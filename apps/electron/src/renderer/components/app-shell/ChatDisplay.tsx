@@ -1121,16 +1121,18 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
 
   // Handle message submission from InputContainer
   // Backend handles interruption and queueing if currently processing
-  const handleSubmit = (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => {
+  const handleSubmit = async (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => {
     // Force stick-to-bottom when user sends a message
     isStickToBottomRef.current = true
-    onSendMessage(message, attachments, skillSlugs)
 
     // Immediately scroll to bottom after sending - use requestAnimationFrame
     // to ensure the DOM has updated with the new message
     requestAnimationFrame(() => {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     })
+
+    // Await the send (may include cloud upload for cloud workspaces)
+    await onSendMessage(message, attachments, skillSlugs)
   }
 
   // Handle stop request from InputContainer

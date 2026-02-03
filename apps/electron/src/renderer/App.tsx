@@ -717,15 +717,31 @@ export default function App() {
   const handleSendMessage = useCallback(async (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[], externalBadges?: ContentBadge[]) => {
     try {
       // Step 1: Store attachments and get persistent metadata
+      // If attachment already has storedData (from background upload in FreeFormInput),
+      // use it directly. Otherwise, upload now (fallback for edge cases).
       let storedAttachments: StoredAttachment[] | undefined
       let processedAttachments: FileAttachment[] | undefined
 
       if (attachments?.length) {
-        // Store each attachment to disk (generates thumbnails, converts Office→markdown)
-        // Use allSettled so one failure doesn't kill all attachments
-        const storeResults = await Promise.allSettled(
-          attachments.map(a => window.electronAPI.storeAttachment(sessionId, a))
-        )
+        // Check which attachments need uploading vs already uploaded
+        type AttachmentWithStoredData = FileAttachment & { storedData?: StoredAttachment }
+        const attachmentsWithState = attachments as AttachmentWithStoredData[]
+
+        const storePromises = attachmentsWithState.map(async (a) => {
+          // If already uploaded in background, use the stored data
+          if (a.storedData) {
+            return { status: 'fulfilled' as const, value: a.storedData }
+          }
+          // Otherwise, upload now (fallback)
+          try {
+            const result = await window.electronAPI.storeAttachment(sessionId, a)
+            return { status: 'fulfilled' as const, value: result }
+          } catch (error) {
+            return { status: 'rejected' as const, reason: error }
+          }
+        })
+
+        const storeResults = await Promise.all(storePromises)
 
         // Filter successful stores, warn about failures
         storedAttachments = []

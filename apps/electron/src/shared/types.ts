@@ -517,6 +517,7 @@ export const IPC_CHANNELS = {
   // Workspace management
   GET_WORKSPACES: 'workspaces:get',
   CREATE_WORKSPACE: 'workspaces:create',
+  CREATE_CLOUD_WORKSPACE: 'workspaces:createCloud',
   CHECK_WORKSPACE_SLUG: 'workspaces:checkSlug',
 
   // Window management
@@ -728,6 +729,9 @@ export const IPC_CHANNELS = {
   GITBASH_BROWSE: 'gitbash:browse',
   GITBASH_SET_PATH: 'gitbash:setPath',
 
+  // Cloud sync (remote change events from cloud-worker WebSocket)
+  CLOUD_SYNC_EVENT: 'cloud:syncEvent',
+
   // Menu actions (renderer → main for window/app control)
   MENU_QUIT: 'menu:quit',
   MENU_MINIMIZE: 'menu:minimize',
@@ -756,6 +760,13 @@ export interface ToolIconMapping {
   commands: string[]
 }
 
+/** Cloud sync event — broadcasted when a remote change arrives via WebSocket */
+export interface CloudSyncEvent {
+  workspaceId: string
+  entity: 'session' | 'source' | 'statuses' | 'labels' | 'skill'
+  action: 'created' | 'updated' | 'deleted'
+}
+
 // Type-safe IPC API exposed to renderer
 export interface ElectronAPI {
   // Session management
@@ -779,6 +790,7 @@ export interface ElectronAPI {
   // Workspace management
   getWorkspaces(): Promise<Workspace[]>
   createWorkspace(folderPath: string, name: string): Promise<Workspace>
+  createCloudWorkspace(name: string, remoteUrl: string, apiKey: string): Promise<Workspace>
   checkWorkspaceSlug(slug: string): Promise<{ exists: boolean; path: string }>
 
   // Window management
@@ -1002,6 +1014,9 @@ export interface ElectronAPI {
   checkGitBash(): Promise<GitBashStatus>
   browseForGitBash(): Promise<string | null>
   setGitBashPath(path: string): Promise<{ success: boolean; error?: string }>
+
+  // Cloud sync (remote change events from cloud-worker WebSocket)
+  onCloudSyncEvent(callback: (event: CloudSyncEvent) => void): () => void
 
   // Menu actions (from renderer to main)
   menuQuit(): Promise<void>
