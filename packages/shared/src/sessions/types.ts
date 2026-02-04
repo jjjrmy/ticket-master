@@ -108,6 +108,8 @@ export interface SessionConfig {
   };
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean;
+  /** Whether remote sandbox execution is enabled (cloud workspaces only) */
+  isRemoteSandbox?: boolean;
 }
 
 /**
@@ -245,4 +247,6 @@ export interface SessionMetadata {
   tokenUsage?: SessionTokenUsage;
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean;
+  /** Whether remote sandbox execution is enabled (cloud workspaces only) */
+  isRemoteSandbox?: boolean;
 }

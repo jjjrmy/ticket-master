@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@craft-agent/core": "workspace:*",
+    "@cloudflare/sandbox": "^0.7.0",
     "hono": "^4.7.0"
   },
   "devDependencies": {

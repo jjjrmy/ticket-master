@@ -68,6 +68,10 @@ export interface SessionMeta {
   messageCount?: number
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean
+  /** Whether remote sandbox execution is enabled for this session (cloud workspaces only) */
+  isRemoteSandbox?: boolean
+  /** Cloud sandbox session ID (for matching with sandbox status API) */
+  sandboxSessionId?: string
 }
 
 /**
@@ -122,6 +126,10 @@ export function extractSessionMeta(session: Session): SessionMeta {
     tokenUsage: session.tokenUsage,
     // Hidden sessions (e.g., mini edit sessions in EditPopover)
     hidden: session.hidden,
+    // Remote sandbox execution flag (cloud workspaces only)
+    isRemoteSandbox: session.isRemoteSandbox,
+    // Cloud sandbox session ID (for matching with sandbox status API)
+    sandboxSessionId: session.sandboxSessionId,
   }
 }
 

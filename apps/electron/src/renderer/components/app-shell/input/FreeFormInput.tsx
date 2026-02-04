@@ -58,6 +58,7 @@ import { useOptionalAppShellContext } from '@/context/AppShellContext'
 import { EditPopover, getEditConfig } from '@/components/ui/EditPopover'
 import { SourceAvatar } from '@/components/ui/source-avatar'
 import { FreeFormInputContextBadge } from './FreeFormInputContextBadge'
+import { SandboxToggle } from './SandboxToggle'
 import type { FileAttachment, LoadedSource, LoadedSkill, StoredAttachment } from '../../../../shared/types'
 
 /**
@@ -120,7 +121,7 @@ export interface FreeFormInputProps {
   /** Whether the session is currently processing */
   isProcessing?: boolean
   /** Callback when message is submitted (skillSlugs from @mentions). Returns Promise so caller can show loading state during upload. */
-  onSubmit: (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => void | Promise<void>
+  onSubmit: (message: string, attachments?: FileAttachment[], skillSlugs?: string[], isRemoteSandbox?: boolean) => void | Promise<void>
   /** Callback to stop processing. Pass silent=true to skip "Response interrupted" message */
   onStop?: (silent?: boolean) => void
   /** External ref for the input */
@@ -196,6 +197,15 @@ export interface FreeFormInputProps {
   }
   /** Enable compact mode - hides attach, sources, working directory for popover embedding */
   compactMode?: boolean
+  // Remote sandbox options (cloud workspaces only)
+  /** Whether this is a cloud workspace (shows sandbox toggle) */
+  isCloudWorkspace?: boolean
+  /** Whether remote sandbox mode is enabled */
+  isRemoteSandbox?: boolean
+  /** Callback when remote sandbox mode is toggled */
+  onRemoteSandboxToggle?: (enabled: boolean) => void
+  /** Whether this is the first message (can only toggle sandbox before first message) */
+  isFirstMessage?: boolean
 }
 
 /**
@@ -246,6 +256,11 @@ export function FreeFormInput({
   isEmptySession = false,
   contextStatus,
   compactMode = false,
+  // Remote sandbox props
+  isCloudWorkspace = false,
+  isRemoteSandbox = false,
+  onRemoteSandboxToggle,
+  isFirstMessage = true,
 }: FreeFormInputProps) {
   // Read custom model and workspace info from context.
   // Uses optional variant so playground (no provider) doesn't crash.
@@ -1071,7 +1086,8 @@ export function FreeFormInput({
       await onSubmit(
         input.trim(),
         currentAttachments.length > 0 ? currentAttachments : undefined,
-        mentions.skills.length > 0 ? mentions.skills : undefined
+        mentions.skills.length > 0 ? mentions.skills : undefined,
+        isRemoteSandbox
       )
 
       // Only clear AFTER successful send
@@ -1095,7 +1111,7 @@ export function FreeFormInput({
     })
 
     return true
-  }, [input, attachments, disabled, disableSend, isUploading, onInputChange, onSubmit, skills, sources, optimisticSourceSlugs, onSourcesChange])
+  }, [input, attachments, disabled, disableSend, isUploading, onInputChange, onSubmit, skills, sources, optimisticSourceSlugs, onSourcesChange, isRemoteSandbox])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -1618,6 +1634,19 @@ export function FreeFormInput({
               onWorkingDirectoryChange={onWorkingDirectoryChange}
               sessionFolderPath={sessionFolderPath}
               isEmptySession={isEmptySession}
+            />
+          )}
+
+          {/* 4. Remote Sandbox Toggle (cloud workspaces only) */}
+          {isCloudWorkspace && onRemoteSandboxToggle && (
+            <SandboxToggle
+              workspaceId={workspaceId || ''}
+              isCloudWorkspace={isCloudWorkspace}
+              workingDirectory={workingDirectory}
+              isRemote={isRemoteSandbox}
+              onRemoteToggle={onRemoteSandboxToggle}
+              isProcessing={isProcessing}
+              isFirstMessage={isFirstMessage}
             />
           )}
           </div>

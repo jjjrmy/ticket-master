@@ -62,6 +62,7 @@ export interface ISessionStorage {
       | 'sharedUrl'
       | 'sharedId'
       | 'model'
+      | 'isRemoteSandbox'
     >>
   ): Promise<void>;
 

@@ -92,6 +92,7 @@ export class CloudSessionStorage implements ISessionStorage {
       | 'sharedUrl'
       | 'sharedId'
       | 'model'
+      | 'isRemoteSandbox'
     >>
   ): Promise<void> {
     await this.connection.send({

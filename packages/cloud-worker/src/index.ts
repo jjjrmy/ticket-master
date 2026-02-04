@@ -15,8 +15,9 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { authMiddleware } from './middleware/auth.ts';
 import { validateSignedUrl, generateSignedUrl } from './middleware/signed-url.ts';
-import type { Env, FileMetadata } from './types.ts';
+import type { Env, FileMetadata, OAuthState } from './types.ts';
 import { isValidFileType } from './types.ts';
+import { encodeOAuthState, decodeOAuthState } from './utils/oauth-state.ts';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -27,7 +28,148 @@ app.use('*', cors({
   allowHeaders: ['Authorization', 'Content-Type'],
 }));
 
-// All routes require API key authentication
+// ============================================================
+// OAuth Routes (public - no auth required)
+// ============================================================
+
+// Initiate GitHub OAuth flow
+app.get('/oauth/github', async (c) => {
+  const workspaceSlug = c.req.query('workspaceSlug');
+  const repoKey = c.req.query('repoKey');
+  const redirectUri = c.req.query('redirectUri');
+
+  if (!workspaceSlug || !repoKey || !redirectUri) {
+    return c.json({ error: 'Missing required parameters: workspaceSlug, repoKey, redirectUri' }, 400);
+  }
+
+  // Create state for CSRF protection
+  const state: OAuthState = {
+    workspaceSlug,
+    repoKey,
+    redirectUri,
+    nonce: crypto.randomUUID(),
+  };
+
+  const encodedState = encodeOAuthState(state);
+
+  const githubAuthUrl = new URL('https://github.com/login/oauth/authorize');
+  githubAuthUrl.searchParams.set('client_id', c.env.GITHUB_CLIENT_ID);
+  // Use request origin so OAuth works regardless of which URL is used to access the worker
+  const workerOrigin = new URL(c.req.url).origin;
+  githubAuthUrl.searchParams.set('redirect_uri', `${workerOrigin}/oauth/github/callback`);
+  githubAuthUrl.searchParams.set('scope', 'repo');
+  githubAuthUrl.searchParams.set('state', encodedState);
+
+  return c.redirect(githubAuthUrl.toString());
+});
+
+// Handle GitHub OAuth callback
+app.get('/oauth/github/callback', async (c) => {
+  const code = c.req.query('code');
+  const stateParam = c.req.query('state');
+  const error = c.req.query('error');
+
+  if (error) {
+    const state = stateParam ? decodeOAuthState(stateParam) : null;
+    const redirectUri = state?.redirectUri || 'craft-agent://oauth/callback';
+    return c.redirect(`${redirectUri}?error=${error}`);
+  }
+
+  if (!code || !stateParam) {
+    return c.json({ error: 'Missing code or state parameter' }, 400);
+  }
+
+  const state = decodeOAuthState(stateParam);
+  if (!state) {
+    return c.json({ error: 'Invalid state parameter' }, 400);
+  }
+
+  try {
+    // Exchange code for access token
+    const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: c.env.GITHUB_CLIENT_ID,
+        client_secret: c.env.GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+
+    const tokenData = await tokenResponse.json<{
+      access_token?: string;
+      scope?: string;
+      token_type?: string;
+      error?: string;
+      error_description?: string;
+    }>();
+
+    if (tokenData.error || !tokenData.access_token) {
+      return c.redirect(`${state.redirectUri}?error=${tokenData.error || 'token_exchange_failed'}&repo=${state.repoKey}`);
+    }
+
+    // Get user info
+    const userResponse = await fetch('https://api.github.com/user', {
+      headers: {
+        'Authorization': `Bearer ${tokenData.access_token}`,
+        'User-Agent': 'Craft-Agent-Cloud',
+      },
+    });
+
+    if (!userResponse.ok) {
+      return c.redirect(`${state.redirectUri}?error=user_fetch_failed&repo=${state.repoKey}`);
+    }
+
+    const user = await userResponse.json<{ login: string; id: number }>();
+
+    // Verify access to the repo
+    const repoResponse = await fetch(`https://api.github.com/repos/${state.repoKey}`, {
+      headers: {
+        'Authorization': `Bearer ${tokenData.access_token}`,
+        'User-Agent': 'Craft-Agent-Cloud',
+      },
+    });
+
+    if (!repoResponse.ok) {
+      return c.redirect(`${state.redirectUri}?error=no_repo_access&repo=${state.repoKey}`);
+    }
+
+    // Store credential in Workspace DO
+    const workspaceDO = c.env.WORKSPACE.get(
+      c.env.WORKSPACE.idFromName(state.workspaceSlug)
+    );
+
+    // Call the DO to store the credential
+    const storeResponse = await workspaceDO.fetch(
+      new Request(`https://do/projects/${encodeURIComponent(state.repoKey)}/credential`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accessToken: tokenData.access_token,
+          username: user.login,
+          userId: user.id,
+          scope: tokenData.scope || 'repo',
+          authenticatedAt: Date.now(),
+        }),
+      })
+    );
+
+    if (!storeResponse.ok) {
+      return c.redirect(`${state.redirectUri}?error=store_failed&repo=${state.repoKey}`);
+    }
+
+    // Redirect back to app with success
+    return c.redirect(`${state.redirectUri}?success=true&repo=${state.repoKey}&username=${user.login}`);
+  } catch (err) {
+    console.error('OAuth callback error:', err);
+    return c.redirect(`${state.redirectUri}?error=internal_error&repo=${state.repoKey}`);
+  }
+});
+
+// All other routes require API key authentication
 app.use('*', authMiddleware);
 
 // Health check
@@ -183,6 +325,129 @@ app.delete('/files/:workspace/:session', async (c) => {
 });
 
 // ============================================================
+// Sandbox API Routes (convenience wrappers for DO operations)
+// ============================================================
+
+// Check if a repo has valid GitHub credentials
+app.post('/api/sandbox/check', async (c) => {
+  const { workspaceSlug, repoKey, repoUrl } = await c.req.json<{
+    workspaceSlug: string;
+    repoKey: string;
+    repoUrl: string;
+  }>();
+
+  if (!workspaceSlug || !repoKey || !repoUrl) {
+    return c.json({ error: 'Missing required parameters' }, 400);
+  }
+
+  const workspaceDO = c.env.WORKSPACE.get(
+    c.env.WORKSPACE.idFromName(workspaceSlug)
+  );
+
+  const response = await workspaceDO.fetch(
+    new Request('https://do/projects/check-auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repoKey, repoUrl }),
+    })
+  );
+
+  const result = await response.json<{ ready: boolean; needsAuth?: boolean }>();
+
+  // If auth is needed, add the auth URL using request origin
+  if (result.needsAuth) {
+    const workerOrigin = new URL(c.req.url).origin;
+    const authUrl = `${workerOrigin}/oauth/github?workspaceSlug=${encodeURIComponent(workspaceSlug)}&repoKey=${encodeURIComponent(repoKey)}&redirectUri=${encodeURIComponent('craft-agent://oauth/callback')}`;
+    return c.json({ ...result, authUrl });
+  }
+
+  return c.json(result);
+});
+
+// Create a new sandbox session
+// Note: Anthropic API key is sent per-WebSocket-message, not at session creation
+app.post('/api/sandbox/create', async (c) => {
+  const { workspaceSlug, repoKey, branch } = await c.req.json<{
+    workspaceSlug: string;
+    repoKey: string;
+    branch: string;
+  }>();
+
+  if (!workspaceSlug || !repoKey || !branch) {
+    return c.json({ error: 'Missing required parameters' }, 400);
+  }
+
+  const workspaceDO = c.env.WORKSPACE.get(
+    c.env.WORKSPACE.idFromName(workspaceSlug)
+  );
+
+  // Pass the worker origin so the DO can construct WebSocket URLs
+  const workerOrigin = new URL(c.req.url).origin;
+
+  const response = await workspaceDO.fetch(
+    new Request('https://do/sandbox/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repoKey, branch, workerOrigin }),
+    })
+  );
+
+  const result = await response.json() as Record<string, unknown>;
+
+  // Fix up the WebSocket URL with the actual workspace slug
+  if ('wsUrl' in result && typeof result.wsUrl === 'string') {
+    (result as { wsUrl: string }).wsUrl = result.wsUrl.replace('SLUG', workspaceSlug);
+  }
+
+  return c.json(result);
+});
+
+// Get sandbox session status
+app.get('/api/sandbox/:workspaceSlug/:sessionId/status', async (c) => {
+  const { workspaceSlug, sessionId } = c.req.param();
+
+  const workspaceDO = c.env.WORKSPACE.get(
+    c.env.WORKSPACE.idFromName(workspaceSlug)
+  );
+
+  return workspaceDO.fetch(
+    new Request(`https://do/sandbox/sessions/${sessionId}`, {
+      method: 'GET',
+    })
+  );
+});
+
+// Terminate a sandbox session
+app.delete('/api/sandbox/:workspaceSlug/:sessionId', async (c) => {
+  const { workspaceSlug, sessionId } = c.req.param();
+
+  const workspaceDO = c.env.WORKSPACE.get(
+    c.env.WORKSPACE.idFromName(workspaceSlug)
+  );
+
+  return workspaceDO.fetch(
+    new Request(`https://do/sandbox/sessions/${sessionId}`, {
+      method: 'DELETE',
+    })
+  );
+});
+
+// Sandbox heartbeat
+app.post('/api/sandbox/:workspaceSlug/:sessionId/heartbeat', async (c) => {
+  const { workspaceSlug, sessionId } = c.req.param();
+
+  const workspaceDO = c.env.WORKSPACE.get(
+    c.env.WORKSPACE.idFromName(workspaceSlug)
+  );
+
+  return workspaceDO.fetch(
+    new Request(`https://do/sandbox/sessions/${sessionId}/heartbeat`, {
+      method: 'POST',
+    })
+  );
+});
+
+// ============================================================
 // Workspace Routes (Durable Object)
 // ============================================================
 
@@ -197,7 +462,16 @@ app.all('/workspace/:slug/*', async (c) => {
   const prefix = `/workspace/${slug}`;
   url.pathname = url.pathname.slice(prefix.length) || '/';
 
-  return stub.fetch(new Request(url.toString(), c.req.raw));
+  // Clone request and add workspace metadata headers (for encryption key derivation)
+  const headers = new Headers(c.req.raw.headers);
+  headers.set('X-Workspace-Slug', slug);
+  headers.set('X-Api-Key', c.env.API_KEY);
+
+  return stub.fetch(new Request(url.toString(), {
+    method: c.req.method,
+    headers,
+    body: c.req.raw.body,
+  }));
 });
 
 // Also support /workspace/:slug (without trailing path) for WebSocket upgrade
@@ -214,3 +488,5 @@ app.all('/workspace/:slug', async (c) => {
 
 export default app;
 export { WorkspaceDO } from './durable-objects/workspace.ts';
+// Re-export Sandbox from the SDK for the container Durable Object binding
+export { Sandbox } from '@cloudflare/sandbox';

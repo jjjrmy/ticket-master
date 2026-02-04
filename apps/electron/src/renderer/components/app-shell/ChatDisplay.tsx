@@ -93,7 +93,7 @@ function isPlanFilePath(filePath: string | undefined): boolean {
 
 interface ChatDisplayProps {
   session: Session | null
-  onSendMessage: (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => void
+  onSendMessage: (message: string, attachments?: FileAttachment[], skillSlugs?: string[], isRemoteSandbox?: boolean) => void
   onOpenFile: (path: string) => void
   onOpenUrl: (url: string) => void
   // Model selection
@@ -179,6 +179,15 @@ interface ChatDisplayProps {
   placeholder?: string | string[]
   /** Label shown as empty state in compact mode (e.g., "Permission Settings") */
   emptyStateLabel?: string
+  // Remote sandbox options (cloud workspaces only)
+  /** Whether this is a cloud workspace (shows sandbox toggle) */
+  isCloudWorkspace?: boolean
+  /** Whether remote sandbox mode is enabled */
+  isRemoteSandbox?: boolean
+  /** Callback when remote sandbox mode is toggled */
+  onRemoteSandboxToggle?: (enabled: boolean) => void
+  /** Whether this is the first message (can only toggle sandbox before first message) */
+  isFirstMessage?: boolean
 }
 
 /**
@@ -420,6 +429,11 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   compactMode = false,
   placeholder,
   emptyStateLabel,
+  // Remote sandbox props
+  isCloudWorkspace = false,
+  isRemoteSandbox = false,
+  onRemoteSandboxToggle,
+  isFirstMessage = true,
 }, ref) {
   // Input is only disabled when explicitly disabled (e.g., agent needs activation)
   // User can type during streaming - submitting will stop the stream and send
@@ -1121,7 +1135,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
 
   // Handle message submission from InputContainer
   // Backend handles interruption and queueing if currently processing
-  const handleSubmit = async (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => {
+  const handleSubmit = async (message: string, attachments?: FileAttachment[], skillSlugs?: string[], isRemoteSandboxMsg?: boolean) => {
     // Force stick-to-bottom when user sends a message
     isStickToBottomRef.current = true
 
@@ -1132,7 +1146,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     })
 
     // Await the send (may include cloud upload for cloud workspaces)
-    await onSendMessage(message, attachments, skillSlugs)
+    await onSendMessage(message, attachments, skillSlugs, isRemoteSandboxMsg)
   }
 
   // Handle stop request from InputContainer
@@ -1581,6 +1595,11 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                 inputTokens: session.tokenUsage?.inputTokens,
                 contextWindow: session.tokenUsage?.contextWindow,
               }}
+              // Remote sandbox props (cloud workspaces only)
+              isCloudWorkspace={isCloudWorkspace}
+              isRemoteSandbox={isRemoteSandbox}
+              onRemoteSandboxToggle={onRemoteSandboxToggle}
+              isFirstMessage={isFirstMessage}
             />
           </div>
           </div>

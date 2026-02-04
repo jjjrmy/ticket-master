@@ -86,6 +86,7 @@ import { type TodoStateId, type TodoState, statusConfigsToTodoStates } from "@/c
 import { useStatuses } from "@/hooks/useStatuses"
 import { useLabels } from "@/hooks/useLabels"
 import { useCloudSync } from "@/hooks/useCloudSync"
+import { useSandboxStatus } from "@/hooks/useSandboxStatus"
 import { useViews } from "@/hooks/useViews"
 import { LabelIcon, LabelValueTypeIcon } from "@/components/ui/label-icon"
 import { filterItems as filterLabelMenuItems, filterStates as filterLabelMenuStates, type LabelMenuItem } from "@/components/ui/label-menu"
@@ -861,6 +862,13 @@ function AppShellContent({
 
   // Cloud sync: listen for remote changes from cloud-worker WebSocket
   useCloudSync({ workspaceId: activeWorkspaceId })
+
+  // Sandbox status: track active cloud sandboxes for this workspace
+  // Check for cloudConfig which is what the sandbox API actually requires
+  const { sandboxStatuses, terminateSandbox } = useSandboxStatus({
+    workspaceId: activeWorkspaceId,
+    isCloudWorkspace: !!(activeWorkspace?.storageType === 'cloud' || activeWorkspace?.cloudConfig),
+  })
 
   // Views: compiled once on config load, evaluated per session in list/chat
   const { evaluateSession: evaluateViews, viewConfigs } = useViews(activeWorkspace?.id || null)
@@ -2856,6 +2864,8 @@ function AppShellContent({
                   workspaceId={activeWorkspaceId ?? undefined}
                   statusFilter={listFilter}
                   labelFilterMap={labelFilter}
+                  sandboxStatuses={sandboxStatuses}
+                  onTerminateSandbox={terminateSandbox}
                 />
               </>
             )}

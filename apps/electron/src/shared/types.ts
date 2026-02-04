@@ -367,6 +367,10 @@ export interface Session {
   }
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean
+  /** Whether remote sandbox execution is enabled for this session (cloud workspaces only) */
+  isRemoteSandbox?: boolean
+  /** Cloud sandbox session ID (for matching with sandbox status API) */
+  sandboxSessionId?: string
 }
 
 /**
@@ -448,6 +452,8 @@ export interface SendMessageOptions {
   skillSlugs?: string[]
   /** Content badges for inline display (sources, skills with embedded icons) */
   badges?: import('@craft-agent/core').ContentBadge[]
+  /** Whether to execute tools in a remote sandbox (cloud workspaces only) */
+  isRemoteSandbox?: boolean
 }
 
 // =============================================================================
@@ -483,6 +489,8 @@ export type SessionCommand =
   | { type: 'setPendingPlanExecution'; planPath: string }
   | { type: 'markCompactionComplete' }
   | { type: 'clearPendingPlanExecution' }
+  // Remote sandbox execution (cloud workspaces only)
+  | { type: 'setRemoteSandbox'; enabled: boolean }
 
 /**
  * Parameters for opening a new chat session
@@ -518,6 +526,7 @@ export const IPC_CHANNELS = {
   GET_WORKSPACES: 'workspaces:get',
   CREATE_WORKSPACE: 'workspaces:create',
   CREATE_CLOUD_WORKSPACE: 'workspaces:createCloud',
+  SET_CLOUD_API_KEY: 'workspaces:setCloudApiKey',
   CHECK_WORKSPACE_SLUG: 'workspaces:checkSlug',
 
   // Window management
@@ -723,6 +732,19 @@ export const IPC_CHANNELS = {
 
   // Git operations
   GET_GIT_BRANCH: 'git:getBranch',
+  GET_GIT_INFO: 'git:getInfo',  // Full git info (repoKey, branch, remote URL)
+
+  // Remote sandbox operations
+  SANDBOX_CHECK_AUTH: 'sandbox:checkAuth',      // Check if repo has GitHub auth
+  SANDBOX_CREATE: 'sandbox:create',             // Create sandbox session
+  SANDBOX_GET_STATUS: 'sandbox:getStatus',      // Get sandbox session status
+  SANDBOX_TERMINATE: 'sandbox:terminate',       // Terminate sandbox session
+  SANDBOX_HEARTBEAT: 'sandbox:heartbeat',       // Send heartbeat to keep session alive
+  SANDBOX_LIST_SESSIONS: 'sandbox:listSessions', // List all active sandbox sessions
+  SANDBOX_ENCRYPT_API_KEY: 'sandbox:encryptApiKey', // Encrypt Anthropic API key for sandbox messages
+
+  // GitHub OAuth callback (main → renderer)
+  GITHUB_OAUTH_CALLBACK: 'github:oauthCallback',
 
   // Git Bash (Windows)
   GITBASH_CHECK: 'gitbash:check',
@@ -767,6 +789,62 @@ export interface CloudSyncEvent {
   action: 'created' | 'updated' | 'deleted'
 }
 
+/**
+ * Git repository information extracted from working directory
+ */
+export interface GitInfo {
+  /** Full remote URL (e.g., git@github.com:owner/repo.git) */
+  repoUrl: string
+  /** Normalized repo key (e.g., owner/repo) */
+  repoKey: string
+  /** Current branch name */
+  branch: string
+  /** Current commit SHA */
+  commit: string
+}
+
+/**
+ * Sandbox auth check result
+ */
+export interface SandboxAuthCheckResult {
+  ready: boolean
+  needsAuth?: boolean
+  authUrl?: string
+}
+
+/**
+ * Sandbox session creation result
+ */
+export interface SandboxCreateResult {
+  sessionId: string
+  sandboxId: string
+  wsUrl: string
+}
+
+/**
+ * Sandbox session status
+ */
+export interface SandboxStatus {
+  sessionId: string
+  repoKey: string
+  sandboxId: string
+  branch: string
+  status: 'provisioning' | 'cloning' | 'ready' | 'idle' | 'expired'
+  createdAt: number
+  lastActivityAt: number
+  expiresAt: number
+}
+
+/**
+ * GitHub OAuth callback result (from craft-agent:// deep link)
+ */
+export interface GitHubOAuthCallbackResult {
+  success: boolean
+  repo?: string
+  username?: string
+  error?: string
+}
+
 // Type-safe IPC API exposed to renderer
 export interface ElectronAPI {
   // Session management
@@ -791,6 +869,7 @@ export interface ElectronAPI {
   getWorkspaces(): Promise<Workspace[]>
   createWorkspace(folderPath: string, name: string): Promise<Workspace>
   createCloudWorkspace(name: string, remoteUrl: string, apiKey: string): Promise<Workspace>
+  setCloudApiKey(workspaceId: string, apiKey: string): Promise<{ success: boolean }>
   checkWorkspaceSlug(slug: string): Promise<{ exists: boolean; path: string }>
 
   // Window management
@@ -1009,6 +1088,19 @@ export interface ElectronAPI {
 
   // Git operations
   getGitBranch(dirPath: string): Promise<string | null>
+  getGitInfo(dirPath: string): Promise<GitInfo | null>
+
+  // Remote sandbox operations
+  sandboxCheckAuth(workspaceId: string, repoKey: string, repoUrl: string): Promise<SandboxAuthCheckResult>
+  sandboxCreate(workspaceId: string, repoKey: string, branch: string): Promise<SandboxCreateResult>
+  sandboxGetStatus(workspaceId: string, sessionId: string): Promise<SandboxStatus>
+  sandboxTerminate(workspaceId: string, sessionId: string): Promise<{ success: boolean }>
+  sandboxHeartbeat(workspaceId: string, sessionId: string): Promise<{ success: boolean }>
+  sandboxListSessions(workspaceId: string): Promise<SandboxStatus[]>
+  sandboxEncryptApiKey(workspaceId: string): Promise<{ encryptedKey: string }>
+
+  // GitHub OAuth callback event
+  onGitHubOAuthCallback(callback: (result: GitHubOAuthCallbackResult) => void): () => void
 
   // Git Bash (Windows)
   checkGitBash(): Promise<GitBashStatus>

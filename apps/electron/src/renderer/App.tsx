@@ -714,7 +714,7 @@ export default function App() {
     window.electronAPI.sessionCommand(sessionId, { type: 'rename', name })
   }, [updateSessionById])
 
-  const handleSendMessage = useCallback(async (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[], externalBadges?: ContentBadge[]) => {
+  const handleSendMessage = useCallback(async (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[], externalBadges?: ContentBadge[], isRemoteSandbox?: boolean) => {
     try {
       // Step 1: Store attachments and get persistent metadata
       // If attachment already has storedData (from background upload in FreeFormInput),
@@ -869,6 +869,7 @@ export default function App() {
         ultrathinkEnabled: isUltrathink,
         skillSlugs,
         badges: badges.length > 0 ? badges : undefined,
+        isRemoteSandbox,
       })
 
       // Auto-disable ultrathink after sending (single-shot activation)

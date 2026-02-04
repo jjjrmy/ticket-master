@@ -19,6 +19,7 @@ import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { getCloudSyncManager } from './cloud-sync'
 import type { CloudStorageProvider } from '@craft-agent/shared/storage'
 import { MarkItDown } from 'markitdown-js'
+import { encryptAnthropicApiKey } from './sandbox-encryption'
 
 /**
  * Sanitizes a filename to prevent path traversal and filesystem issues.
@@ -201,8 +202,34 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
     // Make it active
     setActiveWorkspace(workspace.id)
+
+    // Load sessions for the new workspace immediately (so they appear without restart)
+    await sessionManager.loadSessionsForWorkspace(workspace)
+
     ipcLog.info(`Created cloud workspace "${name}" (slug: ${slug}) → ${remoteUrl}`)
     return workspace
+  })
+
+  // Set/update API key for an existing cloud workspace
+  // Useful when workspace was created before credential storage, or key needs to be updated
+  ipcMain.handle(IPC_CHANNELS.SET_CLOUD_API_KEY, async (_event, workspaceId: string, apiKey: string) => {
+    const workspace = getWorkspaceOrThrow(workspaceId)
+    if (workspace.storageType !== 'cloud') {
+      throw new Error(`Workspace "${workspace.name}" is not a cloud workspace`)
+    }
+
+    // Store/update the API key securely via CredentialManager
+    const credManager = getCredentialManager()
+    await credManager.set(
+      { type: 'cloud_apikey', workspaceId: workspace.id },
+      { value: apiKey }
+    )
+
+    // Disconnect existing provider so it reconnects with the new key
+    await getCloudSyncManager().disconnect(workspace.id)
+
+    ipcLog.info(`Updated API key for cloud workspace "${workspace.name}"`)
+    return { success: true }
   })
 
   // Check if a workspace slug already exists (for validation before creation)
@@ -441,6 +468,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         return sessionManager.markCompactionComplete(sessionId)
       case 'clearPendingPlanExecution':
         return sessionManager.clearPendingPlanExecution(sessionId)
+      case 'setRemoteSandbox':
+        return sessionManager.setSessionRemoteSandbox(sessionId, command.enabled)
       default: {
         const _exhaustive: never = command
         throw new Error(`Unknown session command: ${JSON.stringify(command)}`)
@@ -864,6 +893,207 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       // Not a git repo, git not installed, or other error
       return null
     }
+  })
+
+  // Get full git info for a directory (remote URL, repo key, branch, commit)
+  ipcMain.handle(IPC_CHANNELS.GET_GIT_INFO, (_event, dirPath: string) => {
+    try {
+      const remoteUrl = execSync('git remote get-url origin', {
+        cwd: dirPath,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      }).trim()
+
+      const branch = execSync('git branch --show-current', {
+        cwd: dirPath,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      }).trim()
+
+      const commit = execSync('git rev-parse HEAD', {
+        cwd: dirPath,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      }).trim()
+
+      // Parse remote URL to get owner/repo
+      // Handles: git@github.com:owner/repo.git and https://github.com/owner/repo.git
+      const match = remoteUrl.match(/github\.com[:/]([^/]+)\/([^/.]+)/)
+      if (!match) {
+        return null // Not a GitHub repo
+      }
+
+      return {
+        repoUrl: remoteUrl,
+        repoKey: `${match[1]}/${match[2]}`,
+        branch: branch || 'main',
+        commit,
+      }
+    } catch {
+      // Not a git repo, git not installed, or other error
+      return null
+    }
+  })
+
+  // Helper to get cloud workspace config with API key
+  async function getCloudConfig(workspaceId: string) {
+    const workspace = getWorkspaceOrThrow(workspaceId)
+    if (workspace.storageType !== 'cloud' || !workspace.cloudConfig) {
+      throw new Error('Sandbox operations require a cloud workspace')
+    }
+
+    const credManager = getCredentialManager()
+    const credential = await credManager.get({ type: 'cloud_apikey', workspaceId: workspace.id })
+    if (!credential) {
+      throw new Error(`No API key found for cloud workspace "${workspace.name}"`)
+    }
+
+    return {
+      remoteUrl: workspace.cloudConfig.remoteUrl,
+      workspaceSlug: workspace.cloudConfig.workspaceSlug,
+      apiKey: credential.value,
+    }
+  }
+
+  // Sandbox operations (require cloud workspace)
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_CHECK_AUTH, async (_event, workspaceId: string, repoKey: string, repoUrl: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    const response = await fetch(`${config.remoteUrl}/api/sandbox/check`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        workspaceSlug: config.workspaceSlug,
+        repoKey,
+        repoUrl,
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to check sandbox auth: ${response.statusText}`)
+    }
+
+    return response.json()
+  })
+
+  // Note: Anthropic API key is sent per-WebSocket-message, not at session creation
+  // This ensures each user's execution uses their own key for billing isolation
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_CREATE, async (_event, workspaceId: string, repoKey: string, branch: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    const response = await fetch(`${config.remoteUrl}/api/sandbox/create`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        workspaceSlug: config.workspaceSlug,
+        repoKey,
+        branch,
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to create sandbox: ${response.statusText}`)
+    }
+
+    return response.json()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_GET_STATUS, async (_event, workspaceId: string, sessionId: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    const response = await fetch(`${config.remoteUrl}/api/sandbox/${config.workspaceSlug}/${sessionId}/status`, {
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to get sandbox status: ${response.statusText}`)
+    }
+
+    return response.json()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_TERMINATE, async (_event, workspaceId: string, sessionId: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    const response = await fetch(`${config.remoteUrl}/api/sandbox/${config.workspaceSlug}/${sessionId}`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to terminate sandbox: ${response.statusText}`)
+    }
+
+    return response.json()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_HEARTBEAT, async (_event, workspaceId: string, sessionId: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    const response = await fetch(`${config.remoteUrl}/api/sandbox/${config.workspaceSlug}/${sessionId}/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to send sandbox heartbeat: ${response.statusText}`)
+    }
+
+    return response.json()
+  })
+
+  // List all active sandbox sessions for a workspace
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_LIST_SESSIONS, async (_event, workspaceId: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    const response = await fetch(`${config.remoteUrl}/workspace/${config.workspaceSlug}/sandbox/sessions`, {
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to list sandbox sessions: ${response.statusText}`)
+    }
+
+    return response.json()
+  })
+
+  // Encrypt Anthropic API key for sending to sandbox WebSocket
+  // This ensures the API key is encrypted in transit with a key derived from the workspace API key
+  ipcMain.handle(IPC_CHANNELS.SANDBOX_ENCRYPT_API_KEY, async (_event, workspaceId: string) => {
+    const config = await getCloudConfig(workspaceId)
+
+    // Get user's Anthropic API key
+    const credManager = getCredentialManager()
+    const anthropicCred = await credManager.get({ type: 'anthropic_api_key' })
+    if (!anthropicCred?.value) {
+      throw new Error('No Anthropic API key configured')
+    }
+
+    // Encrypt the API key using a key derived from the workspace API key
+    const encryptedKey = await encryptAnthropicApiKey(
+      anthropicCred.value,
+      config.apiKey,
+      config.workspaceSlug
+    )
+
+    return { encryptedKey }
   })
 
   // Git Bash detection and configuration (Windows only)
