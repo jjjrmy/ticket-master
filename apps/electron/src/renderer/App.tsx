@@ -34,6 +34,7 @@ import {
   updateSessionAtom,
   sessionAtomFamily,
   sessionMetaMapAtom,
+  sessionIdsAtom,
   backgroundTasksAtomFamily,
   extractSessionMeta,
   type SessionMeta,
@@ -217,6 +218,16 @@ export default function App() {
 
   // Compute if app is fully ready (all data loaded)
   const isFullyReady = appState === 'ready' && sessionsLoaded
+
+  // Compute workspace slug from rootPath for SDK skill qualification
+  // SDK expects "workspaceSlug:skillSlug" format, NOT UUID
+  const windowWorkspaceSlug = useMemo(() => {
+    if (!windowWorkspaceId) return null
+    const workspace = workspaces.find(w => w.id === windowWorkspaceId)
+    if (!workspace?.rootPath) return windowWorkspaceId // Fallback to ID
+    const pathParts = workspace.rootPath.split('/').filter(Boolean)
+    return pathParts[pathParts.length - 1] || windowWorkspaceId
+  }, [windowWorkspaceId, workspaces])
 
   // Trigger splash exit animation when fully ready
   useEffect(() => {
@@ -806,8 +817,9 @@ export default function App() {
       // Step 4: Extract badges from mentions (sources/skills) with embedded icons
       // Badges are self-contained for display in UserMessageBubble and viewer
       // Merge with any externally provided badges (e.g., from EditPopover context badges)
-      const mentionBadges: ContentBadge[] = windowWorkspaceId
-        ? extractBadges(message, skills, sources, windowWorkspaceId)
+      // Use workspace slug (not UUID) for skill qualification - SDK expects "workspaceSlug:skillSlug"
+      const mentionBadges: ContentBadge[] = windowWorkspaceSlug
+        ? extractBadges(message, skills, sources, windowWorkspaceSlug)
         : []
       const badges: ContentBadge[] = [...(externalBadges || []), ...mentionBadges]
 
@@ -1156,10 +1168,31 @@ export default function App() {
       setPendingPermissions(new Map())
       setPendingCredentials(new Map())
 
+      // 6. Clear session options from previous workspace
+      // (session IDs are unique UUIDs, but clearing prevents unbounded memory growth
+      // and ensures no stale state from old workspace persists)
+      setSessionOptions(new Map())
+
+      // 7. Clear message drafts from previous workspace
+      // (prevents memory growth on repeated workspace switches)
+      sessionDraftsRef.current.clear()
+
+      // 8. Reset sources and skills atoms to empty
+      // (prevents stale data flash during workspace switch - AppShell will reload)
+      store.set(sourcesAtom, [])
+      store.set(skillsAtom, [])
+
+      // 9. Clear session atoms BEFORE navigating
+      // This prevents applyNavigationState from auto-selecting a session from the old workspace.
+      // Without this, getFirstSessionId() would return a session ID from the previous workspace,
+      // causing the detail panel to show a stale chat until sessions reload.
+      store.set(sessionMetaMapAtom, new Map())
+      store.set(sessionIdsAtom, [])
+
       // Note: Sessions and theme will reload automatically due to windowWorkspaceId dependency
       // in useEffect hooks
     }
-  }, [windowWorkspaceId, setSession])
+  }, [windowWorkspaceId, setSession, store])
 
   // Handle workspace refresh (e.g., after icon upload)
   const handleRefreshWorkspaces = useCallback(() => {
@@ -1180,6 +1213,7 @@ export default function App() {
     // and useSession(id) hook for individual sessions. This prevents memory leaks.
     workspaces,
     activeWorkspaceId: windowWorkspaceId,
+    activeWorkspaceSlug: windowWorkspaceSlug,
     currentModel,
     customModel,
     pendingPermissions,
@@ -1222,6 +1256,7 @@ export default function App() {
     // NOTE: sessions removed to prevent memory leaks - components use atoms instead
     workspaces,
     windowWorkspaceId,
+    windowWorkspaceSlug,
     currentModel,
     customModel,
     pendingPermissions,

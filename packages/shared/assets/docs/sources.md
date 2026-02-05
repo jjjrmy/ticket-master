@@ -245,7 +245,8 @@ Each source folder contains:
   "api": {
     "baseUrl": "https://api.example.com/",  // MUST have trailing slash
     "authType": "bearer" | "header" | "query" | "basic" | "none",
-    "headerName": "X-API-Key",      // For header auth
+    "headerName": "X-API-Key",      // For single-header auth
+    "headerNames": ["Header-1", "Header-2"],  // For multi-header auth (e.g., Datadog)
     "queryParam": "api_key",         // For query auth
     "authScheme": "Bearer"           // For bearer auth (default: "Bearer")
   },
@@ -390,6 +391,31 @@ REST APIs become flexible tools that Claude can call.
 }
 ```
 
+**Multi-header authentication (multiple API keys):**
+
+Some APIs require multiple authentication headers (e.g., Datadog, Algolia, Cloudflare). Use `headerNames` instead of `headerName` to specify an array of header names:
+
+```json
+{
+  "type": "api",
+  "provider": "datadog",
+  "api": {
+    "baseUrl": "https://api.datadoghq.com/",
+    "authType": "header",
+    "headerNames": ["DD-API-KEY", "DD-APPLICATION-KEY"],
+    "testEndpoint": {
+      "method": "GET",
+      "path": "api/v1/validate"
+    }
+  }
+}
+```
+
+When `headerNames` is present:
+- The credential prompt shows multiple input fields, one per header
+- All headers are included in every API request
+- Credentials are stored as a JSON object mapping header names to values
+
 **Bearer token (Authorization header):**
 ```json
 {
@@ -438,6 +464,27 @@ REST APIs become flexible tools that Claude can call.
   }
 }
 ```
+
+**Basic auth with optional password:**
+
+Some APIs use HTTP Basic Auth but only require the username field (API key), leaving the password empty. For these APIs, use `passwordRequired: false` when prompting for credentials:
+
+```typescript
+source_credential_prompt({
+  sourceSlug: "ashby",
+  mode: "basic",
+  passwordRequired: false,  // Password field becomes optional
+  labels: { username: "API Key" },
+  description: "Enter your Ashby API key"
+})
+```
+
+When `passwordRequired: false`:
+- The password field shows "(optional)" label and "Optional - leave blank" placeholder
+- The Save button enables with just a username
+- Empty string is submitted for password (per HTTP Basic Auth spec: `base64(username:)`)
+
+**Note:** `passwordRequired` only applies to `mode: "basic"`. It defaults to `true` for backward compatibility with services like Jira or Amplitude that require both username and password.
 
 ### testEndpoint Configuration
 
@@ -613,9 +660,14 @@ For favicon resolution, a cache maps provider names to their canonical domains a
 
 ## Common Providers
 
-### Gmail
-Provider: `gmail`, Type: `api`
-Uses OAuth via `source_gmail_oauth_trigger`.
+### Gmail (and other Google services)
+Provider: `google`, Type: `api`
+Requires user-provided OAuth credentials in the source config:
+- `googleOAuthClientId`: Your Google OAuth Client ID
+- `googleOAuthClientSecret`: Your Google OAuth Client Secret
+
+Create credentials at [Google Cloud Console](https://console.cloud.google.com/apis/credentials) (Desktop app type).
+Uses OAuth via `source_google_oauth_trigger`.
 
 ### Linear
 Provider: `linear`, Type: `mcp`
@@ -628,6 +680,11 @@ URL: `https://api.githubcopilot.com/mcp/`, **bearer auth** (PAT required - OAuth
 ### Exa (Search)
 Provider: `exa`, Type: `api`
 Base URL: `https://api.exa.ai`, header auth with `x-api-key`.
+
+### Datadog
+Provider: `datadog`, Type: `api`
+Base URL: `https://api.datadoghq.com/`, **multi-header auth** with `DD-API-KEY` and `DD-APPLICATION-KEY`.
+Get keys from [Datadog Organization Settings](https://app.datadoghq.com/organization-settings/api-keys).
 
 ### Brave Search
 Provider: `brave`, Type: `mcp`
@@ -665,8 +722,11 @@ Technical steps:
 
 6. If auth is required, trigger the appropriate flow:
    - `source_oauth_trigger` for MCP OAuth
-   - `source_gmail_oauth_trigger` for Gmail
+   - `source_google_oauth_trigger` for Google services (Gmail, Calendar, Drive, Docs, Sheets)
+   - `source_microsoft_oauth_trigger` for Microsoft services
+   - `source_slack_oauth_trigger` for Slack
    - `source_credential_prompt` for API keys/tokens
+   - For basic auth with optional password: `source_credential_prompt({ mode: "basic", passwordRequired: false })`
 
 7. Confirm with user that the source is working as expected
 

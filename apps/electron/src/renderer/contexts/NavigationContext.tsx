@@ -668,6 +668,38 @@ export function NavigationProvider({
   // Track whether initial route restoration has been attempted
   const initialRouteRestoredRef = useRef(false)
 
+  // Track previous workspace to detect switches
+  const previousWorkspaceIdRef = useRef<string | null>(null)
+
+  // Reset navigation state when workspace changes
+  // This prevents back/forward navigating to sessions from the wrong workspace
+  // and ensures sidebar doesn't show stale context
+  useEffect(() => {
+    if (!workspaceId) return
+
+    // Skip on initial mount (no previous workspace)
+    if (previousWorkspaceIdRef.current !== null && previousWorkspaceIdRef.current !== workspaceId) {
+      console.log('[Navigation] Workspace changed, resetting navigation state')
+
+      // Clear history stack - old routes belong to previous workspace
+      historyStackRef.current = []
+      historyIndexRef.current = -1
+      setCanGoBack(false)
+      setCanGoForward(false)
+
+      // Close right sidebar - its context is workspace-specific
+      setNavigationState(prev => ({
+        ...prev,
+        rightSidebar: undefined,
+      }))
+
+      // Reset initial route restoration flag so new workspace can restore its route
+      initialRouteRestoredRef.current = false
+    }
+
+    previousWorkspaceIdRef.current = workspaceId
+  }, [workspaceId])
+
   // Initialize history stack on first load
   useEffect(() => {
     if (!isReady || !workspaceId) return

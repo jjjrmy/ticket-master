@@ -113,10 +113,10 @@ export const FreeFormInputContextBadge = React.forwardRef<HTMLButtonElement, Fre
       </button>
     )
 
-    // Wrap with tooltip if provided
-    if (tooltip) {
+    // Wrap with tooltip if provided (skip when dropdown is open to avoid showing tooltip)
+    if (tooltip && !isOpen) {
       return (
-        <Tooltip open={isOpen ? false : undefined}>
+        <Tooltip>
           <TooltipTrigger asChild>
             {button}
           </TooltipTrigger>

@@ -27,6 +27,7 @@ export class CloudSkillStorage implements ISkillStorage {
       metadata: skill.metadata,
       content: skill.content,
       path: '',
+      source: 'workspace',
     };
   }
 
@@ -39,6 +40,7 @@ export class CloudSkillStorage implements ISkillStorage {
         metadata: s.metadata!,
         content: s.content,
         path: '',
+        source: 'workspace' as const,
       }));
   }
 

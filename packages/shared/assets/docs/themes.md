@@ -4,12 +4,43 @@ This guide explains how to customize the visual theme of Craft Agent.
 
 ## Overview
 
-Craft Agent uses a 6-color theme system. You can override specific colors or install preset themes with complete visual styles.
+Craft Agent uses a 6-color theme system with support for both app-level defaults and per-workspace overrides.
 
-- **Theme overrides**: `~/.craft-agent/theme.json` - Override specific colors
-- **Preset themes**: `~/.craft-agent/themes/{name}.json` - Complete theme packages
+### Theme Hierarchy
 
-Both are optional - the app has sensible built-in defaults.
+1. **App default**: Selected in Settings → Appearance → Default Theme
+2. **Workspace override**: Per-workspace theme in Settings → Appearance → Workspace Themes
+3. **Preset themes**: `~/.craft-agent/themes/{name}.json` - Complete theme packages
+4. **Theme overrides**: `~/.craft-agent/theme.json` - Override specific colors (app-level)
+
+Workspaces without a custom theme inherit the app default. All settings are optional - the app has sensible built-in defaults.
+
+## Workspace Themes
+
+Each workspace can have its own color theme that overrides the app default. Configure in Settings → Appearance:
+
+- **Default Theme**: Sets the app-wide default (used by all workspaces without an override)
+- **Workspace Themes**: Per-workspace overrides, choose "Use Default" or select a specific theme
+
+### Storage Location
+
+Workspace theme preferences are stored in the workspace config:
+
+```
+~/.craft-agent/workspaces/{id}/config.json
+```
+
+```json
+{
+  "id": "ws_abc123",
+  "name": "My Project",
+  "defaults": {
+    "colorTheme": "nord"
+  }
+}
+```
+
+When `colorTheme` is omitted or undefined, the workspace inherits the app default.
 
 ## 6-Color System
 

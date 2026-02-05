@@ -1,7 +1,24 @@
-import { existsSync, readFileSync, statSync, writeFileSync, unlinkSync, mkdtempSync } from 'fs';
+import { existsSync, readFileSync, statSync, writeFileSync, unlinkSync, mkdtempSync, renameSync } from 'fs';
 import { extname, basename, resolve, join, relative } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
+
+/**
+ * Atomically write a file by writing to a temp file then renaming.
+ * This prevents partial writes from corrupting the file on crash/interrupt.
+ * Uses write-to-temp-then-rename pattern which is atomic on POSIX systems.
+ */
+export function atomicWriteFileSync(filePath: string, data: string): void {
+  const tmpPath = filePath + '.tmp';
+  try {
+    writeFileSync(tmpPath, data);
+    renameSync(tmpPath, filePath);
+  } catch (error) {
+    // Clean up temp file if rename failed
+    try { unlinkSync(tmpPath); } catch {}
+    throw error;
+  }
+}
 
 export interface FileAttachment {
   type: 'image' | 'text' | 'pdf' | 'office' | 'unknown';

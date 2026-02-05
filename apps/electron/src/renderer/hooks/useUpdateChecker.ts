@@ -22,8 +22,12 @@ interface UseUpdateCheckerResult {
   isDownloading: boolean
   /** Whether update is ready to install */
   isReadyToInstall: boolean
-  /** Download progress (0-100) */
+  /** Download progress (0-100, or -1 for indeterminate on macOS) */
   downloadProgress: number
+  /** Whether progress is indeterminate (macOS doesn't report download progress) */
+  isIndeterminate: boolean
+  /** Whether this platform supports progress events */
+  supportsProgress: boolean
   /** Check for updates manually */
   checkForUpdates: () => Promise<void>
   /** Install the downloaded update and restart */
@@ -134,6 +138,12 @@ export function useUpdateChecker(): UseUpdateCheckerResult {
         // If already ready, show toast (clear any previous dismissal since user explicitly checked)
         shownToastVersionRef.current = null // Reset so toast can show again
         showUpdateToast(info.latestVersion, installUpdate)
+      } else if (info.downloadState === 'downloading' && info.latestVersion) {
+        // Update is available and downloading
+        toast.info(`Downloading v${info.latestVersion}`, {
+          description: 'The update will be ready to install shortly.',
+          duration: 4000,
+        })
       }
     } catch (error) {
       console.error('[useUpdateChecker] Check failed:', error)
@@ -143,12 +153,18 @@ export function useUpdateChecker(): UseUpdateCheckerResult {
     }
   }, [showUpdateToast, installUpdate])
 
+  const downloadProgress = updateInfo?.downloadProgress ?? 0
+  const supportsProgress = updateInfo?.supportsProgress ?? true
+
   return {
     updateInfo,
     updateAvailable: updateInfo?.available ?? false,
     isDownloading: updateInfo?.downloadState === 'downloading',
     isReadyToInstall: updateInfo?.downloadState === 'ready',
-    downloadProgress: updateInfo?.downloadProgress ?? 0,
+    downloadProgress,
+    // Progress is indeterminate if downloading and either platform doesn't support it OR progress is -1
+    isIndeterminate: updateInfo?.downloadState === 'downloading' && (!supportsProgress || downloadProgress < 0),
+    supportsProgress,
     checkForUpdates,
     installUpdate,
   }

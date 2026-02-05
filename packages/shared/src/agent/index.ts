@@ -102,3 +102,6 @@ export {
   type MergedPermissionsConfig,
   type PermissionsContext,
 } from './permissions-config.ts';
+
+// Export LLM tool - secondary Claude calls for subtasks
+export { createLLMTool, type LLMToolOptions } from './llm-tool.ts';

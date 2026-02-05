@@ -1220,9 +1220,11 @@ export class CraftAgent {
               if (input.tool_name === 'Skill') {
                 const toolInput = input.tool_input as { skill?: string; args?: string };
                 if (toolInput.skill && !toolInput.skill.includes(':')) {
-                  // Short name detected - prepend workspaceId
-                  const workspaceId = this.config.workspace.id;
-                  const qualifiedSkill = `${workspaceId}:${toolInput.skill}`;
+                  // Short name detected - prepend workspace slug (folder name)
+                  // SDK expects: "workspaceSlug:skillSlug" format, NOT UUID
+                  const pathParts = this.workspaceRootPath.split('/').filter(Boolean);
+                  const workspaceSlug = pathParts[pathParts.length - 1] || this.config.workspace.id;
+                  const qualifiedSkill = `${workspaceSlug}:${toolInput.skill}`;
                   this.onDebug?.(`Skill tool: qualified "${toolInput.skill}" → "${qualifiedSkill}"`);
                   return {
                     continue: true,
@@ -2558,7 +2560,39 @@ Please continue the conversation naturally from where we left off.
       },
     };
 
-    const error = errorMap[errorCode];
+    let error = errorMap[errorCode];
+
+    // Check if this is an API provider error (internal server error, api_error, overloaded, etc.)
+    // These indicate issues on the provider side, not the user's side
+    if (errorCode === 'unknown' && actualError) {
+      const isProviderError =
+        actualError.errorType === 'api_error' ||
+        actualError.errorType === 'overloaded_error' ||
+        actualError.message.toLowerCase().includes('internal server error') ||
+        actualError.message.toLowerCase().includes('overloaded') ||
+        actualError.message.toLowerCase().includes('service unavailable');
+
+      if (isProviderError) {
+        error = {
+          code: 'provider_error',
+          title: 'AI Provider Error',
+          message: 'The AI provider is experiencing issues. This is not a problem with your setup.',
+          details: [
+            ...(actualError.requestId ? [`Request ID: ${actualError.requestId}`] : []),
+            'Check the provider status page for outages',
+            'Try again in a few minutes',
+            'Consider switching to a different AI provider in settings',
+          ],
+          actions: [
+            { key: 'r', label: 'Retry', action: 'retry' },
+            { key: 's', label: 'Settings', action: 'settings' },
+          ],
+          canRetry: true,
+          retryDelayMs: 5000,
+        };
+      }
+    }
+
     return {
       type: 'typed_error',
       error,

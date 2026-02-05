@@ -11,8 +11,8 @@ import { WindowManager } from './window-manager'
 import { registerOnboardingHandlers } from './onboarding'
 import { IPC_CHANNELS, type FileAttachment, type StoredAttachment, type AuthType, type ApiSetupInfo, type SendMessageOptions } from '../shared/types'
 import { readFileAttachment, perf, validateImageForClaudeAPI, IMAGE_LIMITS } from '@craft-agent/shared/utils'
-import { getAuthType, setAuthType, getPreferencesPath, getCustomModel, setCustomModel, getModel, setModel, getSessionDraft, setSessionDraft, deleteSessionDraft, getAllSessionDrafts, getWorkspaceByNameOrId, getWorkspaces, addWorkspace, setActiveWorkspace, getAnthropicBaseUrl, setAnthropicBaseUrl, loadStoredConfig, saveConfig, type Workspace, SUMMARIZATION_MODEL } from '@craft-agent/shared/config'
-import { getSessionAttachmentsPath } from '@craft-agent/shared/sessions'
+import { getAuthType, setAuthType, getPreferencesPath, getCustomModel, setCustomModel, getModel, setModel, getSessionDraft, setSessionDraft, deleteSessionDraft, getAllSessionDrafts, getWorkspaceByNameOrId, getWorkspaces, addWorkspace, setActiveWorkspace, getAnthropicBaseUrl, setAnthropicBaseUrl, loadStoredConfig, saveConfig, resolveModelId, type Workspace, SUMMARIZATION_MODEL } from '@craft-agent/shared/config'
+import { getSessionAttachmentsPath, validateSessionId } from '@craft-agent/shared/sessions'
 import { loadWorkspaceSources, getSourcesBySlugs, type LoadedSource } from '@craft-agent/shared/sources'
 import { isValidThinkingLevel } from '@craft-agent/shared/agent/thinking-levels'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
@@ -298,6 +298,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.SWITCH_WORKSPACE, async (event, workspaceId: string) => {
     const end = perf.start('ipc.switchWorkspace', { workspaceId })
 
+    // Get the old workspace ID before updating
+    const oldWorkspaceId = windowManager.getWorkspaceForWindow(event.sender.id)
+
     // Update the window's workspace mapping
     const updated = windowManager.updateWindowWorkspace(event.sender.id, workspaceId)
 
@@ -308,6 +311,15 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       if (win) {
         windowManager.registerWindow(win, workspaceId)
         windowLog.info(`Re-registered window ${event.sender.id} for workspace ${workspaceId}`)
+      }
+    }
+
+    // Clear activeViewingSession for old workspace if no other windows are viewing it
+    // This ensures read/unread state is correct after workspace switch
+    if (oldWorkspaceId && oldWorkspaceId !== workspaceId) {
+      const otherWindows = windowManager.getAllWindowsForWorkspace(oldWorkspaceId)
+      if (otherWindows.length === 0) {
+        sessionManager.clearActiveViewingSession(oldWorkspaceId)
       }
     }
 
@@ -643,6 +655,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       if (!workspace) {
         throw new Error(`Workspace not found: ${workspaceId}`)
       }
+
+      // SECURITY: Validate sessionId to prevent path traversal attacks
+      // This must happen before using sessionId in any file path operations
+      validateSessionId(sessionId)
 
       // Check if this is a cloud workspace
       const isCloud = workspace.storageType === 'cloud' && !!workspace.cloudConfig
@@ -1578,21 +1594,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       if (authType === 'api_key') {
         await manager.setApiKey(credential)
       } else if (authType === 'oauth_token') {
-        // Import full credentials including refresh token and expiry from Claude CLI
-        const { getExistingClaudeCredentials } = await import('@craft-agent/shared/auth')
-        const cliCreds = getExistingClaudeCredentials()
-        if (cliCreds) {
-          await manager.setClaudeOAuthCredentials({
-            accessToken: cliCreds.accessToken,
-            refreshToken: cliCreds.refreshToken,
-            expiresAt: cliCreds.expiresAt,
-          })
-          ipcLog.info('Saved Claude OAuth credentials with refresh token')
-        } else {
-          // Fallback to just saving the access token
-          await manager.setClaudeOAuth(credential)
-          ipcLog.info('Saved Claude OAuth access token only')
-        }
+        // Save the access token (refresh token and expiry are managed by the OAuth flow)
+        await manager.setClaudeOAuth(credential)
+        ipcLog.info('Saved Claude OAuth access token')
       }
     } else if (credential === '') {
       // Empty string means user explicitly cleared the credential
@@ -1655,7 +1659,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         testModel = userModel
       } else if (!trimmedUrl || trimmedUrl.includes('openrouter.ai') || trimmedUrl.includes('ai-gateway.vercel.sh')) {
         // Anthropic, OpenRouter, and Vercel are all Anthropic-compatible — same model IDs
-        testModel = SUMMARIZATION_MODEL
+        testModel = resolveModelId(SUMMARIZATION_MODEL)
       } else {
         // Custom endpoint with no model specified — can't test without knowing the model
         return { success: false, error: 'Please specify a model for custom endpoints' }
@@ -1713,7 +1717,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         lowerMsg.includes('tool use is not supported') ||
         (lowerMsg.includes('tool') && lowerMsg.includes('not') && lowerMsg.includes('support'))
       if (isToolSupportError) {
-        const displayModel = modelName?.trim() || SUMMARIZATION_MODEL
+        const displayModel = modelName?.trim() || resolveModelId(SUMMARIZATION_MODEL)
         return { success: false, error: `Model "${displayModel}" does not support tool/function calling. Craft Agent requires a model with tool support (e.g. Claude, GPT-4, Gemini).` }
       }
 
@@ -2390,9 +2394,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // Skills (Workspace-scoped)
   // ============================================================
 
-  // Get all skills for a workspace
-  ipcMain.handle(IPC_CHANNELS.SKILLS_GET, async (_event, workspaceId: string) => {
-    ipcLog.info(`SKILLS_GET: Loading skills for workspace: ${workspaceId}`)
+  // Get all skills for a workspace (and optionally project-level skills from workingDirectory)
+  ipcMain.handle(IPC_CHANNELS.SKILLS_GET, async (_event, workspaceId: string, workingDirectory?: string) => {
+    ipcLog.info(`SKILLS_GET: Loading skills for workspace: ${workspaceId}${workingDirectory ? `, workingDirectory: ${workingDirectory}` : ''}`)
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) {
       ipcLog.error(`SKILLS_GET: Workspace not found: ${workspaceId}`)
@@ -2404,8 +2408,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       ipcLog.info(`SKILLS_GET: Loaded ${skills.length} cloud skills for workspace: ${workspaceId}`)
       return skills
     }
-    const { loadWorkspaceSkills } = await import('@craft-agent/shared/skills')
-    const skills = loadWorkspaceSkills(workspace.rootPath)
+    const { loadAllSkills } = await import('@craft-agent/shared/skills')
+    const skills = loadAllSkills(workspace.rootPath, workingDirectory)
     ipcLog.info(`SKILLS_GET: Loaded ${skills.length} skills from ${workspace.rootPath}`)
     return skills
   })
@@ -2839,6 +2843,50 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
           managed.window.webContents.mainFrame &&
           managed.window.webContents.id !== senderId) {
         managed.window.webContents.send(IPC_CHANNELS.THEME_PREFERENCES_CHANGED, preferences)
+      }
+    }
+  })
+
+  // Workspace-level theme overrides
+  ipcMain.handle(IPC_CHANNELS.THEME_GET_WORKSPACE_COLOR_THEME, async (_event, workspaceId: string) => {
+    const { getWorkspaces } = await import('@craft-agent/shared/config/storage')
+    const { getWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
+    const workspaces = getWorkspaces()
+    const workspace = workspaces.find(w => w.id === workspaceId)
+    if (!workspace) return null
+    return getWorkspaceColorTheme(workspace.rootPath) ?? null
+  })
+
+  ipcMain.handle(IPC_CHANNELS.THEME_SET_WORKSPACE_COLOR_THEME, async (_event, workspaceId: string, themeId: string | null) => {
+    const { getWorkspaces } = await import('@craft-agent/shared/config/storage')
+    const { setWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
+    const workspaces = getWorkspaces()
+    const workspace = workspaces.find(w => w.id === workspaceId)
+    if (!workspace) return
+    setWorkspaceColorTheme(workspace.rootPath, themeId ?? undefined)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.THEME_GET_ALL_WORKSPACE_THEMES, async () => {
+    const { getWorkspaces } = await import('@craft-agent/shared/config/storage')
+    const { getWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
+    const workspaces = getWorkspaces()
+    const themes: Record<string, string | undefined> = {}
+    for (const ws of workspaces) {
+      themes[ws.id] = getWorkspaceColorTheme(ws.rootPath)
+    }
+    return themes
+  })
+
+  // Broadcast workspace theme change to all other windows (for cross-window sync)
+  ipcMain.handle(IPC_CHANNELS.THEME_BROADCAST_WORKSPACE_THEME, async (event, workspaceId: string, themeId: string | null) => {
+    const senderId = event.sender.id
+    // Broadcast to all windows except the sender
+    for (const managed of windowManager.getAllWindows()) {
+      if (!managed.window.isDestroyed() &&
+          !managed.window.webContents.isDestroyed() &&
+          managed.window.webContents.mainFrame &&
+          managed.window.webContents.id !== senderId) {
+        managed.window.webContents.send(IPC_CHANNELS.THEME_WORKSPACE_THEME_CHANGED, { workspaceId, themeId })
       }
     }
   })

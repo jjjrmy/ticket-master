@@ -19,6 +19,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { expandPath, toPortablePath } from '../utils/paths.ts';
+import { atomicWriteFileSync } from '../utils/files.ts';
 import { getDefaultStatusConfig, saveStatusConfig, ensureDefaultIconFiles } from '../statuses/storage.ts';
 import { getDefaultLabelConfig, saveLabelConfig } from '../labels/storage.ts';
 import { loadConfigDefaults } from '../config/storage.ts';
@@ -134,7 +135,8 @@ export function saveWorkspaceConfig(rootPath: string, config: WorkspaceConfig): 
     };
   }
 
-  writeFileSync(join(rootPath, 'config.json'), JSON.stringify(storageConfig, null, 2));
+  // Use atomic write to prevent corruption on crash/interrupt
+  atomicWriteFileSync(join(rootPath, 'config.json'), JSON.stringify(storageConfig, null, 2));
 }
 
 // ============================================================
@@ -384,6 +386,56 @@ export function discoverWorkspacesInDefaultLocation(): string[] {
   }
 
   return discovered;
+}
+
+// ============================================================
+// Workspace Color Theme
+// ============================================================
+
+/**
+ * Get the color theme setting for a workspace.
+ * Returns undefined if workspace uses the app default.
+ *
+ * @param rootPath - Absolute path to workspace root folder
+ * @returns Theme ID or undefined (inherit from app default)
+ */
+export function getWorkspaceColorTheme(rootPath: string): string | undefined {
+  const config = loadWorkspaceConfig(rootPath);
+  return config?.defaults?.colorTheme;
+}
+
+/**
+ * Set the color theme for a workspace.
+ * Pass undefined to clear and use app default.
+ *
+ * @param rootPath - Absolute path to workspace root folder
+ * @param themeId - Preset theme ID or undefined to inherit
+ */
+export function setWorkspaceColorTheme(rootPath: string, themeId: string | undefined): void {
+  const config = loadWorkspaceConfig(rootPath);
+  if (!config) return;
+
+  // Validate theme ID if provided (skip for undefined = inherit default)
+  // Only allow alphanumeric characters, hyphens, and underscores (max 64 chars)
+  if (themeId && themeId !== 'default') {
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(themeId)) {
+      console.warn(`[workspace-storage] Invalid theme ID rejected: ${themeId}`);
+      return;
+    }
+  }
+
+  // Initialize defaults if not present
+  if (!config.defaults) {
+    config.defaults = {};
+  }
+
+  if (themeId) {
+    config.defaults.colorTheme = themeId;
+  } else {
+    delete config.defaults.colorTheme;
+  }
+
+  saveWorkspaceConfig(rootPath, config);
 }
 
 // ============================================================

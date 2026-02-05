@@ -168,7 +168,6 @@ async function runEsbuild(
       format: "cjs",
       outfile: join(ROOT_DIR, outfile),
       external: ["electron"],
-      packages: "external", // Mark all node_modules as external
       define: defines,
       logLevel: "warning",
     });
@@ -350,7 +349,6 @@ async function main(): Promise<void> {
     format: "cjs",
     outfile: join(ROOT_DIR, "apps/electron/dist/main.cjs"),
     external: ["electron"],
-    packages: "external",
     define: oauthDefines,
     logLevel: "info",
   });
@@ -366,7 +364,6 @@ async function main(): Promise<void> {
     format: "cjs",
     outfile: join(ROOT_DIR, "apps/electron/dist/preload.cjs"),
     external: ["electron"],
-    packages: "external",
     logLevel: "info",
   });
   await preloadContext.watch();

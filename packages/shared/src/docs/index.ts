@@ -20,6 +20,11 @@ const DOCS_DIR = join(CONFIG_DIR, 'docs');
 // Track if docs have been initialized this session (prevents re-init on hot reload)
 let docsInitialized = false;
 
+// Lazily loaded bundled docs (populated on first initializeDocs call)
+// Must be lazy because getBundledAssetsDir() depends on setBundledAssetsRoot()
+// being called first, which happens in app.whenReady() — after module imports.
+let _bundledDocs: Record<string, string> | null = null;
+
 // Resolve the bundled docs assets directory using the shared asset resolver.
 // Handles all environments: dev (monorepo source), bundled (dist/assets/docs),
 // and packaged Electron (setBundledAssetsRoot sets the base path at startup).
@@ -60,8 +65,16 @@ function loadBundledDocs(): Record<string, string> {
   return docs;
 }
 
-// Load docs at module initialization (one-time read)
-const BUNDLED_DOCS = loadBundledDocs();
+/**
+ * Get bundled docs, loading lazily on first access.
+ * Must be called after setBundledAssetsRoot() for packaged builds.
+ */
+function getBundledDocs(): Record<string, string> {
+  if (!_bundledDocs) {
+    _bundledDocs = loadBundledDocs();
+  }
+  return _bundledDocs;
+}
 
 /**
  * Get the docs directory path
@@ -95,6 +108,7 @@ export const DOC_REFS = {
   labels: `${APP_ROOT}/docs/labels.md`,
   toolIcons: `${APP_ROOT}/docs/tool-icons.md`,
   mermaid: `${APP_ROOT}/docs/mermaid.md`,
+  llmTool: `${APP_ROOT}/docs/llm-tool.md`,
   docsDir: `${APP_ROOT}/docs/`,
 } as const;
 
@@ -128,18 +142,22 @@ export function initializeDocs(): void {
     mkdirSync(DOCS_DIR, { recursive: true });
   }
 
+  // Load bundled docs lazily (after setBundledAssetsRoot has been called)
+  const bundledDocs = getBundledDocs();
+
   // Always write bundled docs to disk on launch.
   // This ensures consistent behavior between debug and release modes —
   // docs are always up-to-date with the running version.
-  for (const [filename, content] of Object.entries(BUNDLED_DOCS)) {
+  for (const [filename, content] of Object.entries(bundledDocs)) {
     const docPath = join(DOCS_DIR, filename);
     writeFileSync(docPath, content, 'utf-8');
   }
 
-  debug(`[docs] Synced ${Object.keys(BUNDLED_DOCS).length} docs`);
+  debug(`[docs] Synced ${Object.keys(bundledDocs).length} docs`);
 }
 
-export { BUNDLED_DOCS };
+// Export getter for bundled docs (for any code that needs access)
+export { getBundledDocs };
 
 // Re-export source guides utilities (parsing only - bundled guides removed)
 export {

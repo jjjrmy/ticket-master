@@ -541,7 +541,7 @@ function SessionItem({
                   const displayValue = rawValue ? formatDisplayValue(rawValue, label.valueType) : undefined
                   return (
                     <LabelValuePopover
-                      key={label.id}
+                      key={`${label.id}-${labelIndex}`}
                       label={label}
                       value={rawValue}
                       open={openLabelIndex === labelIndex}
@@ -658,7 +658,7 @@ function SessionItem({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span className="shrink-0 text-[11px] text-foreground/40 whitespace-nowrap cursor-default">
-                      {formatDistanceToNowStrict(new Date(item.lastMessageAt), { locale: shortTimeLocale as Locale })}
+                      {formatDistanceToNowStrict(new Date(item.lastMessageAt), { locale: shortTimeLocale as Locale, roundingMethod: 'floor' })}
                     </span>
                   </TooltipTrigger>
                   <TooltipContent side="bottom" sideOffset={4}>
@@ -897,9 +897,17 @@ export function SessionList({
   // Track if search input has actual DOM focus (for proper keyboard navigation gating)
   const [isSearchInputFocused, setIsSearchInputFocused] = useState(false)
 
+  // Search mode is active when search is open AND query has 2+ characters
+  // This is the single source of truth for all search mode behavior:
+  // - Show results count, highlights, match badges, flat list with sections
+  const isSearchMode = searchActive && searchQuery.length >= 2
+
+  // Only highlight matches when in search mode
+  const highlightQuery = isSearchMode ? searchQuery : undefined
+
   // Content search - triggers immediately when search query changes (ripgrep cancels previous search)
   useEffect(() => {
-    if (!workspaceId || !searchActive || searchQuery.length < 2) {
+    if (!workspaceId || !isSearchMode) {
       setContentSearchResults(new Map())
       return
     }
@@ -958,7 +966,7 @@ export function SessionList({
       clearTimeout(timer)
       setIsSearchingContent(false)
     }
-  }, [workspaceId, searchActive, searchQuery])
+  }, [workspaceId, isSearchMode, searchQuery])
 
   // Focus search input when search becomes active
   useEffect(() => {
@@ -973,16 +981,16 @@ export function SessionList({
   )
 
   // Filter items by search query — ripgrep content search only for consistent results
-  // When query < 2 chars, apply current filter to maintain filtered view
+  // When not in search mode, apply current filter to maintain filtered view
   const searchFilteredItems = useMemo(() => {
-    // With short/no query, filter to current view (same as non-search mode)
-    if (searchQuery.length < 2) {
+    // Not in search mode: filter to current view (same as non-search mode)
+    if (!isSearchMode) {
       return sortedItems.filter(item =>
         sessionMatchesCurrentFilter(item, currentFilter, { evaluateViews, statusFilter, labelFilterMap })
       )
     }
 
-    // 2+ chars: show sessions with ripgrep content matches (from ALL sessions)
+    // Search mode (2+ chars): show sessions with ripgrep content matches (from ALL sessions)
     // Sort by: fuzzy title score first, then by match count
     return sortedItems
       .filter(item => contentSearchResults.has(item.id))
@@ -1000,7 +1008,7 @@ export function SessionList({
         const countB = contentSearchResults.get(b.id)?.matchCount || 0
         return countB - countA
       })
-  }, [sortedItems, searchQuery, contentSearchResults, currentFilter, evaluateViews, statusFilter, labelFilterMap])
+  }, [sortedItems, isSearchMode, searchQuery, contentSearchResults, currentFilter, evaluateViews, statusFilter, labelFilterMap])
 
   // Split search results: sessions matching current filter vs all others
   // Also limits total results to MAX_SEARCH_RESULTS (100)
@@ -1028,7 +1036,7 @@ export function SessionList({
     const totalCount = searchFilteredItems.length
     const exceeded = totalCount > MAX_SEARCH_RESULTS
 
-    if (searchQuery.length < 2 || !hasActiveFilters) {
+    if (!isSearchMode || !hasActiveFilters) {
       // No grouping needed - all results go to "matching", but limit to MAX_SEARCH_RESULTS
       const limitedItems = searchFilteredItems.slice(0, MAX_SEARCH_RESULTS)
       return { matchingFilterItems: limitedItems, otherResultItems: [] as SessionMeta[], exceededSearchLimit: exceeded }
@@ -1059,7 +1067,7 @@ export function SessionList({
     }
 
     return { matchingFilterItems: matching, otherResultItems: others, exceededSearchLimit: exceeded }
-  }, [searchFilteredItems, currentFilter, evaluateViews, searchQuery, statusFilter, labelFilterMap])
+  }, [searchFilteredItems, currentFilter, evaluateViews, isSearchMode, statusFilter, labelFilterMap])
 
   // Reset display limit when search query changes
   useEffect(() => {
@@ -1101,13 +1109,13 @@ export function SessionList({
 
   // Create flat list for keyboard navigation (maintains order across groups/sections)
   const flatItems = useMemo(() => {
-    if (searchActive && searchQuery.length >= 2) {
+    if (isSearchMode) {
       // Search mode: flat list of matching + other results (no date grouping)
       return [...matchingFilterItems, ...otherResultItems]
     }
     // Normal mode: flatten date groups
     return dateGroups.flatMap(group => group.sessions)
-  }, [searchActive, searchQuery, matchingFilterItems, otherResultItems, dateGroups])
+  }, [isSearchMode, matchingFilterItems, otherResultItems, dateGroups])
 
   // Create a lookup map for session ID -> flat index
   const sessionIndexMap = useMemo(() => {
@@ -1337,8 +1345,8 @@ export function SessionList({
           role="listbox"
           aria-label="Sessions"
         >
-          {/* No results message when searching */}
-          {searchActive && searchQuery && flatItems.length === 0 && !isSearchingContent && (
+          {/* No results message when in search mode */}
+          {isSearchMode && flatItems.length === 0 && !isSearchingContent && (
             <div className="flex flex-col items-center justify-center py-12 px-4">
               <p className="text-sm text-muted-foreground">No conversations found</p>
               <p className="text-xs text-muted-foreground/60 mt-0.5">
@@ -1354,7 +1362,7 @@ export function SessionList({
           )}
 
           {/* Search mode: flat list with two sections (In Current View + Other Conversations) */}
-          {searchActive && searchQuery.length >= 2 ? (
+          {isSearchMode ? (
             <>
               {/* No results in current filter message */}
               {matchingFilterItems.length === 0 && otherResultItems.length > 0 && (
@@ -1398,12 +1406,12 @@ export function SessionList({
                         }}
                         onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
                         permissionMode={sessionOptions?.get(item.id)?.permissionMode ?? item.permissionMode as PermissionMode}
-                        searchQuery={searchQuery}
+                        searchQuery={highlightQuery}
                         todoStates={todoStates}
                         flatLabels={flatLabels}
                         labels={labels}
                         onLabelsChange={onLabelsChange}
-                        chatMatchCount={contentSearchResults.get(item.id)?.matchCount}
+                        chatMatchCount={isSearchMode ? contentSearchResults.get(item.id)?.matchCount : undefined}
                         sandboxStatus={sandboxStatuses?.get(item.sandboxSessionId || item.id)}
                         onTerminateSandbox={onTerminateSandbox}
                       />
@@ -1447,12 +1455,12 @@ export function SessionList({
                         }}
                         onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
                         permissionMode={sessionOptions?.get(item.id)?.permissionMode ?? item.permissionMode as PermissionMode}
-                        searchQuery={searchQuery}
+                        searchQuery={highlightQuery}
                         todoStates={todoStates}
                         flatLabels={flatLabels}
                         labels={labels}
                         onLabelsChange={onLabelsChange}
-                        chatMatchCount={contentSearchResults.get(item.id)?.matchCount}
+                        chatMatchCount={isSearchMode ? contentSearchResults.get(item.id)?.matchCount : undefined}
                         sandboxStatus={sandboxStatuses?.get(item.sandboxSessionId || item.id)}
                         onTerminateSandbox={onTerminateSandbox}
                       />

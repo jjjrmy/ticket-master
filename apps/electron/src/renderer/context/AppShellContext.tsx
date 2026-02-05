@@ -36,6 +36,8 @@ export interface AppShellContextType {
   // from retaining the full messages array and causing memory leaks.
   workspaces: Workspace[]
   activeWorkspaceId: string | null
+  /** Workspace slug (folder name) for SDK skill qualification - NOT the UUID */
+  activeWorkspaceSlug: string | null
   currentModel: string
   /** When set, a custom model overrides the Anthropic model selector (e.g. OpenRouter) */
   customModel: string | null

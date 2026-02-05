@@ -90,3 +90,13 @@ export {
   getBuiltinSources,
   isBuiltinSource,
 } from './builtin-sources.ts';
+
+// Token Refresh Manager (handles OAuth token refresh with rate limiting)
+export {
+  TokenRefreshManager,
+  createTokenGetter,
+} from './token-refresh-manager.ts';
+export type {
+  TokenRefreshResult,
+  RefreshManagerOptions,
+} from './token-refresh-manager.ts';

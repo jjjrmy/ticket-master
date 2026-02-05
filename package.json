@@ -1,6 +1,6 @@
 {
   "name": "craft-agent",
-  "version": "0.3.1",
+  "version": "0.3.4",
   "description": "Claude Code-like agent for Craft documents",
   "type": "module",
   "private": true,
@@ -102,6 +102,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
+    "glob": "^11.0.0",
     "gray-matter": "^4.0.3",
     "jotai": "^2.16.0",
     "js-yaml": "^4.1.1",

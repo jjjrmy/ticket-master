@@ -12,14 +12,16 @@ import { join } from 'path';
 import type { ApiConfig } from './types.ts';
 import { debug } from '../utils/debug.ts';
 import { estimateTokens, summarizeLargeResult, TOKEN_LIMIT, MAX_SUMMARIZATION_INPUT } from '../utils/summarize.ts';
-import type { ApiCredential, BasicAuthCredential } from './credential-manager.ts';
+import type { ApiCredential, BasicAuthCredential, MultiHeaderCredential } from './credential-manager.ts';
+import { isMultiHeaderCredential } from './credential-manager.ts';
 
 // Maximum file size for binary downloads (500MB)
 // Prevents memory exhaustion from malicious or unexpectedly large API responses
 const MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024;
 
 // Re-export for convenience
-export type { ApiCredential, BasicAuthCredential } from './credential-manager.ts';
+export type { ApiCredential, BasicAuthCredential, MultiHeaderCredential } from './credential-manager.ts';
+export { isMultiHeaderCredential } from './credential-manager.ts';
 
 /**
  * Build an Authorization header value for bearer-style authentication.
@@ -441,11 +443,16 @@ function isGmailAttachment(json: unknown): json is { size: number; data: string 
 /**
  * Build headers for an API request, injecting authentication and default headers
  */
-function buildHeaders(
+export function buildHeaders(
   auth: ApiConfig['auth'],
   credential: ApiCredential,
   defaultHeaders?: Record<string, string>
 ): Record<string, string> {
+  debug(`[api-tools] buildHeaders called: auth.type=${auth?.type}, credential type=${typeof credential}, isMultiHeader=${isMultiHeaderCredential(credential)}`);
+  if (typeof credential === 'object' && credential !== null) {
+    debug(`[api-tools] credential keys: ${Object.keys(credential).join(', ')}`);
+  }
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     // Merge default headers (e.g., beta feature flags)
@@ -466,15 +473,29 @@ function buildHeaders(
     return headers;
   }
 
+  // Handle header auth (supports both single and multi-header)
+  if (auth.type === 'header') {
+    debug(`[api-tools] header auth: isMultiHeaderCredential=${isMultiHeaderCredential(credential)}`);
+    // Multi-header: credential is { headerName: value, ... }
+    if (isMultiHeaderCredential(credential)) {
+      debug(`[api-tools] Applying multi-header credentials to request`);
+      Object.assign(headers, credential);
+    }
+    // Single header: existing behavior
+    else if (typeof credential === 'string' && credential) {
+      headers[auth.headerName || 'x-api-key'] = credential;
+    }
+    debug(`[api-tools] Final headers (keys only): ${Object.keys(headers).join(', ')}`);
+    return headers;
+  }
+
   // Other types use string credential (API key/token)
   const apiKey = typeof credential === 'string' ? credential : '';
   if (!apiKey) {
     return headers;
   }
 
-  if (auth.type === 'header') {
-    headers[auth.headerName || 'x-api-key'] = apiKey;
-  } else if (auth.type === 'bearer') {
+  if (auth.type === 'bearer') {
     headers['Authorization'] = buildAuthorizationHeader(auth.authScheme, apiKey);
   }
   // Query type is handled in buildUrl

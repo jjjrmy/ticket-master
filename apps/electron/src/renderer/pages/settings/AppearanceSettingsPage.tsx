@@ -2,16 +2,17 @@
  * AppearanceSettingsPage
  *
  * Visual customization settings: theme mode, color theme, font,
- * and an editable reference table of CLI tool icon mappings.
+ * workspace-specific theme overrides, and CLI tool icon mappings.
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import type { ColumnDef } from '@tanstack/react-table'
 import { PanelHeader } from '@/components/app-shell/PanelHeader'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { HeaderMenu } from '@/components/ui/HeaderMenu'
 import { EditPopover, EditButton, getEditConfig } from '@/components/ui/EditPopover'
 import { useTheme } from '@/context/ThemeContext'
+import { useAppShellContext } from '@/context/AppShellContext'
 import { routes } from '@/lib/navigate'
 import { Monitor, Sun, Moon } from 'lucide-react'
 import type { DetailsPageMeta } from '@/lib/navigation-registry'
@@ -89,9 +90,14 @@ const toolIconColumns: ColumnDef<ToolIconMapping>[] = [
 // ============================================
 
 export default function AppearanceSettingsPage() {
-  const { mode, setMode, colorTheme, setColorTheme, font, setFont } = useTheme()
+  const { mode, setMode, colorTheme, setColorTheme, font, setFont, activeWorkspaceId, setWorkspaceColorTheme } = useTheme()
+  const { workspaces } = useAppShellContext()
+
   // Preset themes for the color theme dropdown
   const [presetThemes, setPresetThemes] = useState<PresetTheme[]>([])
+
+  // Per-workspace theme overrides (workspaceId -> themeId or undefined)
+  const [workspaceThemes, setWorkspaceThemes] = useState<Record<string, string | undefined>>({})
 
   // Tool icon mappings loaded from main process
   const [toolIcons, setToolIcons] = useState<ToolIconMapping[]>([])
@@ -117,6 +123,20 @@ export default function AppearanceSettingsPage() {
     loadThemes()
   }, [])
 
+  // Load workspace themes on mount
+  useEffect(() => {
+    const loadWorkspaceThemes = async () => {
+      if (!window.electronAPI?.getAllWorkspaceThemes) return
+      try {
+        const themes = await window.electronAPI.getAllWorkspaceThemes()
+        setWorkspaceThemes(themes)
+      } catch (error) {
+        console.error('Failed to load workspace themes:', error)
+      }
+    }
+    loadWorkspaceThemes()
+  }, [])
+
   // Load tool icon mappings and resolve the config file path on mount
   useEffect(() => {
     const load = async () => {
@@ -135,19 +155,61 @@ export default function AppearanceSettingsPage() {
     load()
   }, [])
 
+  // Handler for workspace theme change
+  // Uses ThemeContext for the active workspace (immediate visual update) and IPC for other workspaces
+  const handleWorkspaceThemeChange = useCallback(
+    async (workspaceId: string, value: string) => {
+      // 'default' means inherit from app default (null in storage)
+      const themeId = value === 'default' ? null : value
+
+      // If changing the current workspace, use context for immediate update
+      if (workspaceId === activeWorkspaceId) {
+        setWorkspaceColorTheme(themeId)
+      } else {
+        // For other workspaces, just persist via IPC
+        await window.electronAPI?.setWorkspaceColorTheme?.(workspaceId, themeId)
+      }
+
+      // Update local state for UI
+      setWorkspaceThemes(prev => ({
+        ...prev,
+        [workspaceId]: themeId ?? undefined
+      }))
+    },
+    [activeWorkspaceId, setWorkspaceColorTheme]
+  )
+
+  // Theme options for dropdowns
+  const themeOptions = useMemo(() => [
+    { value: 'default', label: 'Default' },
+    ...presetThemes
+      .filter(t => t.id !== 'default')
+      .map(t => ({
+        value: t.id,
+        label: t.theme.name || t.id,
+      })),
+  ], [presetThemes])
+
+  // Get current app default theme label for display (null when using 'default' to avoid redundant "Use Default (Default)")
+  const appDefaultLabel = useMemo(() => {
+    if (colorTheme === 'default') return null
+    const preset = presetThemes.find(t => t.id === colorTheme)
+    return preset?.theme.name || colorTheme
+  }, [colorTheme, presetThemes])
+
   return (
     <div className="h-full flex flex-col">
       <PanelHeader
         title="Appearance"
-        actions={<HeaderMenu route={routes.view.settings('appearance')} helpFeature="appearance" />}
+        actions={<HeaderMenu route={routes.view.settings('appearance')} helpFeature="themes" />}
       />
       <div className="flex-1 min-h-0 mask-fade-y">
         <ScrollArea className="h-full">
           <div className="px-5 py-7 max-w-3xl mx-auto">
             <div className="space-y-8">
 
-              {/* Theme & Font */}
-              <SettingsSection title="Theme">
+              {/* Default Theme */}
+              <SettingsSection title="Default Theme">
                 <SettingsCard>
                   <SettingsRow label="Mode">
                     <SettingsSegmentedControl
@@ -164,15 +226,7 @@ export default function AppearanceSettingsPage() {
                     <SettingsMenuSelect
                       value={colorTheme}
                       onValueChange={setColorTheme}
-                      options={[
-                        { value: 'default', label: 'Default' },
-                        ...presetThemes
-                          .filter(t => t.id !== 'default')
-                          .map(t => ({
-                            value: t.id,
-                            label: t.theme.name || t.id,
-                          })),
-                      ]}
+                      options={themeOptions}
                     />
                   </SettingsRow>
                   <SettingsRow label="Font">
@@ -187,6 +241,54 @@ export default function AppearanceSettingsPage() {
                   </SettingsRow>
                 </SettingsCard>
               </SettingsSection>
+
+              {/* Workspace Themes */}
+              {workspaces.length > 0 && (
+                <SettingsSection
+                  title="Workspace Themes"
+                  description="Override theme settings per workspace"
+                >
+                  <SettingsCard>
+                    {workspaces.map((workspace) => {
+                      const wsTheme = workspaceThemes[workspace.id]
+                      const hasCustomTheme = wsTheme !== undefined
+                      return (
+                        <SettingsRow
+                          key={workspace.id}
+                          label={
+                            <div className="flex items-center gap-2">
+                              {workspace.iconUrl ? (
+                                <img
+                                  src={workspace.iconUrl}
+                                  alt=""
+                                  className="w-4 h-4 rounded object-cover"
+                                />
+                              ) : (
+                                <div className="w-4 h-4 rounded bg-foreground/10" />
+                              )}
+                              <span>{workspace.name}</span>
+                            </div>
+                          }
+                        >
+                          <SettingsMenuSelect
+                            value={hasCustomTheme ? wsTheme : 'default'}
+                            onValueChange={(value) => handleWorkspaceThemeChange(workspace.id, value)}
+                            options={[
+                              { value: 'default', label: appDefaultLabel ? `Use Default (${appDefaultLabel})` : 'Use Default' },
+                              ...presetThemes
+                                .filter(t => t.id !== 'default')
+                                .map(t => ({
+                                  value: t.id,
+                                  label: t.theme.name || t.id,
+                                })),
+                            ]}
+                          />
+                        </SettingsRow>
+                      )
+                    })}
+                  </SettingsCard>
+                </SettingsSection>
+              )}
 
               {/* Tool Icons — shows the command → icon mapping used in turn cards */}
               <SettingsSection

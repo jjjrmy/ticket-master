@@ -1,5 +1,7 @@
 import { Menu, app, shell, BrowserWindow } from 'electron'
 import { IPC_CHANNELS } from '../shared/types'
+import { EDIT_MENU, VIEW_MENU, WINDOW_MENU } from '../shared/menu-schema'
+import type { MenuItem } from '../shared/menu-schema'
 import type { WindowManager } from './window-manager'
 import { mainLog } from './logger'
 
@@ -106,27 +108,17 @@ export async function rebuildMenu(): Promise<void> {
       ]
     },
 
-    // Edit menu (standard roles for text editing)
+    // Edit menu (from shared schema)
     {
-      label: 'Edit',
-      submenu: [
-        { role: 'undo' as const },
-        { role: 'redo' as const },
-        { type: 'separator' as const },
-        { role: 'cut' as const },
-        { role: 'copy' as const },
-        { role: 'paste' as const },
-        { role: 'selectAll' as const }
-      ]
+      label: EDIT_MENU.label,
+      submenu: EDIT_MENU.items.map(toElectronMenuItem),
     },
 
-    // View menu
+    // View menu (from shared schema + dev-only items)
     {
-      label: 'View',
+      label: VIEW_MENU.label,
       submenu: [
-        { role: 'zoomIn' as const },
-        { role: 'zoomOut' as const },
-        { role: 'resetZoom' as const },
+        ...VIEW_MENU.items.map(toElectronMenuItem),
         // Dev tools only in development
         ...(!app.isPackaged ? [
           { type: 'separator' as const },
@@ -138,12 +130,11 @@ export async function rebuildMenu(): Promise<void> {
       ]
     },
 
-    // Window menu
+    // Window menu (from shared schema + macOS-specific items)
     {
-      label: 'Window',
+      label: WINDOW_MENU.label,
       submenu: [
-        { role: 'minimize' as const },
-        { role: 'zoom' as const },
+        ...WINDOW_MENU.items.map(toElectronMenuItem),
         ...(isMac ? [
           { type: 'separator' as const },
           { role: 'front' as const }
@@ -219,4 +210,29 @@ function sendToRenderer(channel: string): void {
   if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
     win.webContents.send(channel)
   }
+}
+
+/**
+ * Converts a MenuItem from the shared schema to Electron MenuItemConstructorOptions.
+ */
+function toElectronMenuItem(item: MenuItem): Electron.MenuItemConstructorOptions {
+  if (item.type === 'separator') {
+    return { type: 'separator' }
+  }
+
+  if (item.type === 'role') {
+    // Use Electron's built-in role - it handles accelerators automatically
+    return { role: item.role as Electron.MenuItemConstructorOptions['role'] }
+  }
+
+  if (item.type === 'action') {
+    return {
+      label: item.label,
+      accelerator: item.shortcut,
+      click: () => sendToRenderer(item.ipcChannel),
+    }
+  }
+
+  // Should never reach here
+  return { type: 'separator' }
 }

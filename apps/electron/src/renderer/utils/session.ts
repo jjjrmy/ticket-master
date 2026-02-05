@@ -12,6 +12,10 @@ function sanitizePreview(content: string): string {
   return content
     .replace(/<edit_request>[\s\S]*?<\/edit_request>/g, '') // Strip entire edit_request blocks
     .replace(/<[^>]+>/g, '')     // Strip remaining XML/HTML tags
+    .replace(/\[skill:(?:[\w-]+:)?[\w-]+\]/g, '')   // Strip [skill:...] mentions
+    .replace(/\[source:[\w-]+\]/g, '')                // Strip [source:...] mentions
+    .replace(/\[file:[^\]]+\]/g, '')                  // Strip [file:...] mentions
+    .replace(/\[folder:[^\]]+\]/g, '')                // Strip [folder:...] mentions
     .replace(/\s+/g, ' ')        // Collapse whitespace
     .trim()
 }

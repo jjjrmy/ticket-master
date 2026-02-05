@@ -498,7 +498,7 @@ const SidebarButton = React.forwardRef<HTMLButtonElement, SidebarButtonProps & R
             {link.afterTitle}
           </span>
         )}
-        {/* Label Badge: Shows count or status on the right */}
+        {/* Label Badge: Shows count or status on the right, revealed on section hover */}
         {link.label && (
           <span className={cn(link.afterTitle ? 'ml-0' : 'ml-auto', 'text-xs text-foreground/30 opacity-0 group-hover/section:opacity-100 group-data-[state=open]:opacity-100 group-data-[edit-active=true]:opacity-100 transition-opacity')}>
             {link.label}

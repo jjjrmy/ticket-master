@@ -1,5 +1,3 @@
-
-
 # Craft Agents
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -181,23 +179,145 @@ bun run electron:start
 # Type checking
 bun run typecheck:all
 
-# Debug logging (writes to ~/Library/Logs/Craft Agents/)
+# Debug logging — see "Troubleshooting > Debug Logging" below
 # Logs are automatically enabled in development
 ```
 
 ### Environment Variables
 
-OAuth integrations (Google, Slack, Microsoft) require credentials. Create a `.env` file:
+OAuth integrations (Slack, Microsoft) require credentials baked into the build. Create a `.env` file:
 
 ```bash
 MICROSOFT_OAUTH_CLIENT_ID=your-client-id
-GOOGLE_OAUTH_CLIENT_SECRET=your-google-client-secret
-GOOGLE_OAUTH_CLIENT_ID=your-client-id.apps.googleusercontent.com
 SLACK_OAUTH_CLIENT_ID=your-slack-client-id
 SLACK_OAUTH_CLIENT_SECRET=your-slack-client-secret
 ```
 
-See [Google Cloud Console](https://console.cloud.google.com/apis/credentials) to create OAuth credentials.
+**Note:** Google OAuth credentials are NOT baked into the build. Users provide their own credentials via source configuration. See the [Google OAuth Setup](#google-oauth-setup-gmail-calendar-drive) section below.
+
+### Google OAuth Setup (Gmail, Calendar, Drive)
+
+Google integrations require you to create your own OAuth credentials. This is a one-time setup.
+
+#### 1. Create a Google Cloud Project
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com)
+2. Create a new project (or select an existing one)
+3. Note your Project ID
+
+#### 2. Enable Required APIs
+
+Go to **APIs & Services → Library** and enable the APIs you need:
+- **Gmail API** - for email integration
+- **Google Calendar API** - for calendar integration
+- **Google Drive API** - for file storage integration
+
+#### 3. Configure OAuth Consent Screen
+
+1. Go to **APIs & Services → OAuth consent screen**
+2. Select **External** user type (unless you have Google Workspace)
+3. Fill in required fields:
+   - App name: e.g., "My Craft Agent"
+   - User support email: your email
+   - Developer contact: your email
+4. Add scopes (optional - can leave default)
+5. Add yourself as a test user (required for External apps in testing mode)
+6. Complete the wizard
+
+#### 4. Create OAuth Credentials
+
+1. Go to **APIs & Services → Credentials**
+2. Click **Create Credentials → OAuth Client ID**
+3. Application type: **Desktop app**
+4. Name: e.g., "Craft Agent Desktop"
+5. Click **Create**
+6. Note the **Client ID** and **Client Secret**
+
+#### 5. Configure in Craft Agent
+
+When setting up a Google source (Gmail, Calendar, Drive), add these fields to your source's `config.json`:
+
+```json
+{
+  "api": {
+    "googleService": "gmail",
+    "googleOAuthClientId": "your-client-id.apps.googleusercontent.com",
+    "googleOAuthClientSecret": "your-client-secret"
+  }
+}
+```
+
+Or simply tell the agent you want to connect Gmail/Calendar/Drive - it will guide you through entering your credentials.
+
+#### Security Notes
+
+- Your OAuth credentials are stored encrypted alongside other source credentials
+- Never commit credentials to version control
+- For production use, consider getting your OAuth consent screen verified by Google
+
+## Troubleshooting
+
+### Debug Logging
+
+In development (`bun run electron:start` or `bun run electron:dev`),
+debug logging is enabled automatically.
+Logs are written to both the console and a log file.
+
+In packaged builds, logs are disabled by default.
+To enable them, launch the app with the `--debug` flag:
+
+```bash
+# macOS
+/Applications/Craft\ Agents.app/Contents/MacOS/Craft\ Agents --debug
+
+# Linux
+craft-agents --debug
+```
+
+```powershell
+# Windows (PowerShell) - from the install directory
+& ".\Craft Agents.exe" --debug
+```
+
+You can also set the `CRAFT_DEBUG=1` environment variable
+to enable debug output from the shared/SDK layer.
+(Note: in the desktop app, `--debug` also enables `CRAFT_DEBUG`.)
+
+Logs are written by `electron-log` to a platform-specific app logs directory.
+The most reliable way to find the exact path is to launch with `--debug`
+and look for the startup line:
+
+```text
+Debug mode enabled - logs at: /path/to/log/file.log
+```
+
+You can also search for a `Craft Agents` folder within your app-data directory.
+
+### WSL2 Notes
+
+On WSL2, OAuth login (Claude Max / Claude Pro) may fail because Electron's `shell.openExternal`
+cannot open a browser on the Windows host by default.
+
+**Fix: install `wslu`** to bridge `xdg-open` to the Windows side:
+
+```bash
+sudo apt install wslu
+```
+
+Also ensure WSL interop is enabled (it is by default on most distros).
+You can verify with:
+
+```bash
+cat /proc/sys/fs/binfmt_misc/WSLInterop
+```
+
+If you see output (not "No such file"), interop is working.
+
+**Alternative:** If you are running WSLg
+(GUI support built into recent Windows 11 builds),
+a Linux browser can handle the OAuth redirect directly.
+In that case `wslu` is not required,
+but you need a browser installed inside WSL.
 
 ## Configuration
 

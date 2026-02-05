@@ -24,6 +24,7 @@ import { RenameDialog } from '@/components/ui/rename-dialog'
 import type { PermissionMode, ThinkingLevel, WorkspaceSettings } from '../../../shared/types'
 import { PERMISSION_MODE_CONFIG } from '@craft-agent/shared/agent/mode-types'
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVELS } from '@craft-agent/shared/agent/thinking-levels'
+import { getModelSelectOptions } from '@craft-agent/shared/config/models'
 import type { DetailsPageMeta } from '@/lib/navigation-registry'
 
 import {
@@ -409,11 +410,7 @@ export default function WorkspaceSettingsPage() {
                     description="AI model for new chats"
                     value={wsModel}
                     onValueChange={handleModelChange}
-                    options={[
-                      { value: 'claude-opus-4-5-20251101', label: 'Opus 4.5', description: 'Most capable for complex work' },
-                      { value: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5', description: 'Best for everyday tasks' },
-                      { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', description: 'Fastest for quick answers' },
-                    ]}
+                    options={getModelSelectOptions()}
                   />
                 )}
                 <SettingsMenuSelectRow

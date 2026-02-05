@@ -21,6 +21,9 @@ export const KEYS = {
   expandedFolders: 'expanded-folders',
   collapsedSidebarItems: 'collapsed-sidebar-items',
 
+  // Focus mode
+  focusModeEnabled: 'focus-mode-enabled',
+
   // Right sidebar (chat page)
   rightSidebarVisible: 'right-sidebar-visible',
   rightSidebarWidth: 'right-sidebar-width',

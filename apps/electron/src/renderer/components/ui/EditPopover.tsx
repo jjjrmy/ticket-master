@@ -751,6 +751,7 @@ export function EditPopover({
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
   const dragStartRef = useRef({ x: 0, y: 0, offsetX: 0, offsetY: 0 })
+  const dragOffsetRef = useRef({ x: 0, y: 0 })
   const popoverRef = useRef<HTMLDivElement>(null)
 
   // Resize state for dynamic sizing
@@ -761,6 +762,7 @@ export function EditPopover({
   // Reset drag position and size when popover opens
   useEffect(() => {
     if (open) {
+      dragOffsetRef.current = { x: 0, y: 0 }
       setDragOffset({ x: 0, y: 0 })
       setContainerSize({ width: width || 400, height: 480 })
     }
@@ -782,12 +784,23 @@ export function EditPopover({
     if (!isDragging) return
 
     const handleMouseMove = (e: MouseEvent) => {
-      const deltaX = e.clientX - dragStartRef.current.x
-      const deltaY = e.clientY - dragStartRef.current.y
-      setDragOffset({
-        x: dragStartRef.current.offsetX + deltaX,
-        y: dragStartRef.current.offsetY + deltaY,
-      })
+      const rect = popoverRef.current?.getBoundingClientRect()
+      if (!rect) return
+
+      const MARGIN = 20
+      const MARGIN_TOP = 50 // Keep below header (chevrons, menu button)
+      const curr = dragOffsetRef.current
+      const baseX = rect.left - curr.x
+      const baseY = rect.top - curr.y
+
+      const newX = dragStartRef.current.offsetX + e.clientX - dragStartRef.current.x
+      const newY = dragStartRef.current.offsetY + e.clientY - dragStartRef.current.y
+
+      const clampedX = Math.max(MARGIN - baseX, Math.min(window.innerWidth - MARGIN - rect.width - baseX, newX))
+      const clampedY = Math.max(MARGIN_TOP - baseY, Math.min(window.innerHeight - MARGIN - rect.height - baseY, newY))
+
+      dragOffsetRef.current = { x: clampedX, y: clampedY }
+      setDragOffset({ x: clampedX, y: clampedY })
     }
 
     const handleMouseUp = () => {
@@ -912,18 +925,22 @@ export function EditPopover({
         <PopoverContent
             side={side}
             align={align}
-            className="p-0 overflow-visible"
-            style={{ background: 'transparent', border: 'none', boxShadow: 'none' }}
+            className="p-0"
+            style={{
+              width: containerSize.width,
+              height: containerSize.height,
+              background: 'transparent',
+              border: 'none',
+              boxShadow: 'none',
+            }}
             onInteractOutside={handleInteractOutside}
             onEscapeKeyDown={handleEscapeKeyDown}
           >
-            {/* Container */}
+            {/* Container - size inherited from PopoverContent for Radix collision detection */}
             <div
               ref={popoverRef}
-              className="relative bg-foreground-2 overflow-hidden"
+              className="relative bg-foreground-2 overflow-hidden w-full h-full"
               style={{
-                width: containerSize.width,
-                height: containerSize.height,
                 transform: `translate(${dragOffset.x}px, ${dragOffset.y}px)`,
                 borderRadius: 16,
                 boxShadow: '0 4px 24px rgba(0, 0, 0, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.05)',
@@ -933,7 +950,7 @@ export function EditPopover({
               <div
                 onMouseDown={handleDragStart}
                 className={cn(
-                  "absolute top-0 left-1/2 -translate-x-1/2 z-50 px-4 py-2 cursor-grab rounded pointer-events-auto",
+                  "absolute top-0 left-1/2 -translate-x-1/2 z-50 px-4 py-2 cursor-grab rounded pointer-events-auto titlebar-no-drag",
                   isDragging && "cursor-grabbing"
                 )}
               >

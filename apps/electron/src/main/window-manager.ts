@@ -53,6 +53,7 @@ export interface CreateWindowOptions {
 export class WindowManager {
   private windows: Map<number, ManagedWindow> = new Map()  // webContents.id → ManagedWindow
   private focusedModeWindows: Set<number> = new Set()  // webContents.id of windows in focused mode
+  private pendingCloseTimeouts: Map<number, NodeJS.Timeout> = new Map()  // Fallback timeouts for window close
 
   /**
    * Create a new window for a workspace
@@ -281,12 +282,30 @@ export class WindowManager {
         event.preventDefault()
         // Send close request to renderer - it will either close a modal or confirm close
         window.webContents.send(IPC_CHANNELS.WINDOW_CLOSE_REQUESTED)
+
+        // Fallback timeout: if IPC fails (e.g., on Hyprland/Wayland), force close after 3s.
+        // Reset timeout on each attempt so active users closing modals aren't interrupted.
+        const wcId = window.webContents.id
+        const existingTimeout = this.pendingCloseTimeouts.get(wcId)
+        if (existingTimeout) clearTimeout(existingTimeout)
+
+        this.pendingCloseTimeouts.set(wcId, setTimeout(() => {
+          this.pendingCloseTimeouts.delete(wcId)
+          if (!window.isDestroyed()) window.destroy()
+        }, 3000))
       }
       // If renderer not ready, allow default close behavior
     })
 
     // Handle window closed - clean up theme listener and internal state
     window.on('closed', () => {
+      // Clean up any pending close timeout to prevent memory leaks
+      const timeout = this.pendingCloseTimeouts.get(webContentsId)
+      if (timeout) {
+        clearTimeout(timeout)
+        this.pendingCloseTimeouts.delete(webContentsId)
+      }
+
       nativeTheme.removeListener('updated', themeHandler)
       this.windows.delete(webContentsId)
       this.focusedModeWindows.delete(webContentsId)
@@ -351,6 +370,13 @@ export class WindowManager {
    * Used when renderer confirms the close action (no modals to close).
    */
   forceCloseWindow(webContentsId: number): void {
+    // Clear any pending close timeout since renderer confirmed
+    const timeout = this.pendingCloseTimeouts.get(webContentsId)
+    if (timeout) {
+      clearTimeout(timeout)
+      this.pendingCloseTimeouts.delete(webContentsId)
+    }
+
     const managed = this.windows.get(webContentsId)
     if (managed && !managed.window.isDestroyed()) {
       // Remove close listener temporarily to avoid infinite loop,

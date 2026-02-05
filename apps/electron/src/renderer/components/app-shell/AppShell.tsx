@@ -503,6 +503,14 @@ function AppShellContent({
   })
   const [skipRightSidebarAnimation, setSkipRightSidebarAnimation] = React.useState(false)
 
+  // Focus mode state - hides both sidebars for distraction-free chat
+  // Can be enabled via prop (URL param for new windows) or toggled via Cmd+.
+  const [isFocusModeActive, setIsFocusModeActive] = React.useState(() => {
+    return storage.get(storage.KEYS.focusModeEnabled, false)
+  })
+  // Effective focus mode combines prop-based (immutable) and state-based (toggleable)
+  const effectiveFocusMode = isFocusedMode || isFocusModeActive
+
   // Window width tracking for responsive behavior
   const [windowWidth, setWindowWidth] = React.useState(window.innerWidth)
 
@@ -522,7 +530,7 @@ function AppShellContent({
   const sessionListHandleRef = React.useRef<HTMLDivElement>(null)
   const rightSidebarHandleRef = React.useRef<HTMLDivElement>(null)
   const [session, setSession] = useSession()
-  const { resolvedMode, isDark } = useTheme()
+  const { resolvedMode, isDark, setMode } = useTheme()
   const { canGoBack, canGoForward, goBack, goForward, navigateToSource } = useNavigation()
 
   // Double-Esc interrupt feature: first Esc shows warning, second Esc interrupts
@@ -757,6 +765,42 @@ function AppShellContent({
     })
   }, [activeWorkspaceId])
 
+  // Reset UI state when workspace changes
+  // This prevents stale search queries, focused items, and filter state from persisting
+  const previousWorkspaceRef = React.useRef<string | null>(null)
+  React.useEffect(() => {
+    if (!activeWorkspaceId) return
+
+    const previousWorkspaceId = previousWorkspaceRef.current
+
+    // Skip on initial mount
+    if (previousWorkspaceId !== null && previousWorkspaceId !== activeWorkspaceId) {
+      // Clear search state
+      setSearchActive(false)
+      setSearchQuery('')
+
+      // Clear filter dropdown state
+      setFilterDropdownQuery('')
+      setFilterDropdownSelectedIdx(0)
+
+      // Clear focused sidebar item
+      setFocusedSidebarItemId(null)
+
+      // Load workspace-scoped filter state from new workspace
+      // (viewFiltersMap, expandedFolders, collapsedItems)
+      const newViewFilters = storage.get<ViewFiltersMap>(storage.KEYS.viewFilters, {}, activeWorkspaceId)
+      setViewFiltersMap(newViewFilters)
+
+      const newExpandedFolders = storage.get<string[]>(storage.KEYS.expandedFolders, [], activeWorkspaceId)
+      setExpandedFolders(new Set(newExpandedFolders))
+
+      const newCollapsedItems = storage.get<string[] | null>(storage.KEYS.collapsedSidebarItems, null, activeWorkspaceId)
+      setCollapsedItems(newCollapsedItems !== null ? new Set(newCollapsedItems) : new Set(['nav:labels']))
+    }
+
+    previousWorkspaceRef.current = activeWorkspaceId
+  }, [activeWorkspaceId])
+
   // Load sources from backend on mount
   React.useEffect(() => {
     if (!activeWorkspaceId) return
@@ -776,16 +820,6 @@ function AppShellContent({
     })
     return cleanup
   }, [])
-
-  // Load skills from backend on mount
-  React.useEffect(() => {
-    if (!activeWorkspaceId) return
-    window.electronAPI.getSkills(activeWorkspaceId).then((loaded) => {
-      setSkills(loaded || [])
-    }).catch(err => {
-      console.error('[Chat] Failed to load skills:', err)
-    })
-  }, [activeWorkspaceId])
 
   // Subscribe to live skill updates (when skills are added/removed dynamically)
   React.useEffect(() => {
@@ -979,8 +1013,10 @@ function AppShellContent({
           contextValue.onSessionOptionsChange(session.selected, { permissionMode: nextMode })
         }
       }, when: () => !document.querySelector('[role="dialog"]') && document.activeElement?.tagName !== 'TEXTAREA' },
-      // Sidebar toggle (CMD+\ like VS Code, avoids conflict with CMD+B for bold)
-      { key: '\\', cmd: true, action: () => setIsSidebarVisible(v => !v) },
+      // Sidebar toggle (CMD+B)
+      { key: 'b', cmd: true, action: () => setIsSidebarVisible(v => !v) },
+      // Focus mode toggle (CMD+.) - hides both sidebars
+      { key: '.', cmd: true, action: () => setIsFocusModeActive(v => !v) },
       // New chat
       { key: 'n', cmd: true, action: () => handleNewChat(true) },
       // Settings
@@ -1014,6 +1050,8 @@ function AppShellContent({
         const meta = sessionMetaMap.get(session.selected)
         return meta?.isProcessing ?? false
       }},
+      // Theme toggle (CMD+SHIFT+A)
+      { key: 'a', cmd: true, shift: true, action: () => setMode(resolvedMode === 'dark' ? 'light' : 'dark') },
     ],
   })
 
@@ -1119,6 +1157,20 @@ function AppShellContent({
   // Use session metadata from Jotai atom (lightweight, no messages)
   // This prevents closures from retaining full message arrays
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
+
+  // Reload skills when active session's workingDirectory changes (for project-level skills)
+  // Skills are loaded from: global (~/.agents/skills/), workspace, and project ({workingDirectory}/.agents/skills/)
+  const activeSessionWorkingDirectory = session.selected
+    ? sessionMetaMap.get(session.selected)?.workingDirectory
+    : undefined
+  React.useEffect(() => {
+    if (!activeWorkspaceId) return
+    window.electronAPI.getSkills(activeWorkspaceId, activeSessionWorkingDirectory).then((loaded) => {
+      setSkills(loaded || [])
+    }).catch(err => {
+      console.error('[Chat] Failed to load skills:', err)
+    })
+  }, [activeWorkspaceId, activeSessionWorkingDirectory])
 
   // Filter session metadata by active workspace
   // Also exclude hidden sessions (mini-agent sessions) from all counts and lists
@@ -1318,9 +1370,9 @@ function AppShellContent({
     return onDeleteSession(sessionId, skipConfirmation)
   }, [session.selected, setSession, onDeleteSession])
 
-  // Right sidebar OPEN button (fades out when sidebar is open, hidden in focused mode or non-chat views)
+  // Right sidebar OPEN button (fades out when sidebar is open, hidden in non-chat views)
   const rightSidebarOpenButton = React.useMemo(() => {
-    if (isFocusedMode || !isChatsNavigation(navState) || !navState.details) return null
+    if (!isChatsNavigation(navState) || !navState.details) return null
 
     return (
       <motion.div
@@ -1337,11 +1389,11 @@ function AppShellContent({
         />
       </motion.div>
     )
-  }, [isFocusedMode, navState, isRightSidebarVisible])
+  }, [navState, isRightSidebarVisible])
 
   // Right sidebar CLOSE button (shown in sidebar header when open)
   const rightSidebarCloseButton = React.useMemo(() => {
-    if (isFocusedMode || !isRightSidebarVisible) return null
+    if (!isRightSidebarVisible) return null
 
     return (
       <HeaderIconButton
@@ -1351,7 +1403,7 @@ function AppShellContent({
         className="text-foreground"
       />
     )
-  }, [isFocusedMode, isRightSidebarVisible])
+  }, [isRightSidebarVisible])
 
   // Extend context value with local overrides (textareaRef, wrapped onDeleteSession, sources, skills, labels, enabledModes, rightSidebarOpenButton, effectiveTodoStates)
   const appShellContextValue = React.useMemo<AppShellContextType>(() => ({
@@ -1373,10 +1425,11 @@ function AppShellContent({
     onChatMatchInfoChange: handleChatMatchInfoChange,
   }), [contextValue, handleDeleteSession, sources, skills, labelConfigs, handleSessionLabelsChange, enabledModes, effectiveTodoStates, handleSessionSourcesChange, rightSidebarOpenButton, searchActive, searchQuery, handleChatMatchInfoChange])
 
-  // Persist expanded folders to localStorage
+  // Persist expanded folders to localStorage (workspace-scoped)
   React.useEffect(() => {
-    storage.set(storage.KEYS.expandedFolders, [...expandedFolders])
-  }, [expandedFolders])
+    if (!activeWorkspaceId) return
+    storage.set(storage.KEYS.expandedFolders, [...expandedFolders], activeWorkspaceId)
+  }, [expandedFolders, activeWorkspaceId])
 
   // Persist sidebar visibility to localStorage
   React.useEffect(() => {
@@ -1388,15 +1441,38 @@ function AppShellContent({
     storage.set(storage.KEYS.rightSidebarVisible, isRightSidebarVisible)
   }, [isRightSidebarVisible])
 
-  // Persist per-view filter map to localStorage
+  // Persist focus mode state to localStorage
   React.useEffect(() => {
-    storage.set(storage.KEYS.viewFilters, viewFiltersMap)
-  }, [viewFiltersMap])
+    storage.set(storage.KEYS.focusModeEnabled, isFocusModeActive)
+  }, [isFocusModeActive])
 
-  // Persist sidebar section collapsed states
+  // Listen for focus mode toggle from menu (View → Focus Mode)
   React.useEffect(() => {
-    storage.set(storage.KEYS.collapsedSidebarItems, [...collapsedItems])
-  }, [collapsedItems])
+    const cleanup = window.electronAPI.onMenuToggleFocusMode?.(() => {
+      setIsFocusModeActive(v => !v)
+    })
+    return cleanup
+  }, [])
+
+  // Listen for sidebar toggle from menu (View → Toggle Sidebar)
+  React.useEffect(() => {
+    const cleanup = window.electronAPI.onMenuToggleSidebar?.(() => {
+      setIsSidebarVisible(v => !v)
+    })
+    return cleanup
+  }, [])
+
+  // Persist per-view filter map to localStorage (workspace-scoped)
+  React.useEffect(() => {
+    if (!activeWorkspaceId) return
+    storage.set(storage.KEYS.viewFilters, viewFiltersMap, activeWorkspaceId)
+  }, [viewFiltersMap, activeWorkspaceId])
+
+  // Persist sidebar section collapsed states (workspace-scoped)
+  React.useEffect(() => {
+    if (!activeWorkspaceId) return
+    storage.set(storage.KEYS.collapsedSidebarItems, [...collapsedItems], activeWorkspaceId)
+  }, [collapsedItems, activeWorkspaceId])
 
   const handleAllChatsClick = useCallback(() => {
     navigate(routes.view.allChats())
@@ -1873,20 +1949,27 @@ function AppShellContent({
         */}
         <div className="titlebar-drag-region fixed top-0 left-0 right-0 h-[50px] z-titlebar" />
 
-      {/* App Menu - fixed position, always visible (hidden in focused mode)
+      {/* App Menu - fixed position, fades out in focused mode
           On macOS: offset 86px to avoid stoplight controls
           On Windows/Linux: offset 12px (no stoplight controls) */}
-      {!isFocusedMode && (() => {
+      {(() => {
         const menuLeftOffset = isMac ? 86 : 12
         return (
-          <div
-            className="fixed top-0 h-[50px] z-overlay flex items-center titlebar-no-drag pr-2"
+          <motion.div
+            initial={false}
+            animate={{ opacity: effectiveFocusMode ? 0 : 1 }}
+            transition={springTransition}
+            className={cn(
+              "fixed top-0 h-[50px] z-overlay flex items-center titlebar-no-drag pr-2",
+              effectiveFocusMode && "pointer-events-none"
+            )}
             style={{ left: menuLeftOffset, width: sidebarWidth - menuLeftOffset }}
           >
             <AppMenu
               onNewChat={() => handleNewChat(true)}
               onNewWindow={() => window.electronAPI.menuNewWindow()}
               onOpenSettings={onOpenSettings}
+              onOpenSettingsSubpage={handleSettingsClick}
               onOpenKeyboardShortcuts={onOpenKeyboardShortcuts}
               onOpenStoredUserPreferences={onOpenStoredUserPreferences}
               onBack={goBack}
@@ -1894,22 +1977,24 @@ function AppShellContent({
               canGoBack={canGoBack}
               canGoForward={canGoForward}
               onToggleSidebar={() => setIsSidebarVisible(prev => !prev)}
-              isSidebarVisible={isSidebarVisible}
+              onToggleFocusMode={() => setIsFocusModeActive(prev => !prev)}
             />
-          </div>
+          </motion.div>
         )
       })()}
 
       {/* === OUTER LAYOUT: Sidebar | Main Content === */}
       <div className="h-full flex items-stretch relative">
-        {/* === SIDEBAR (Left) === (hidden in focused mode)
+        {/* === SIDEBAR (Left) ===
             Animated width with spring physics for smooth 60-120fps transitions.
             Uses overflow-hidden to clip content during collapse animation.
             Resizable via drag handle on right edge (200-400px range). */}
-        {!isFocusedMode && (
         <motion.div
           initial={false}
-          animate={{ width: isSidebarVisible ? sidebarWidth : 0 }}
+          animate={{
+            width: effectiveFocusMode ? 0 : (isSidebarVisible ? sidebarWidth : 0),
+            opacity: effectiveFocusMode ? 0 : 1,
+          }}
           transition={isResizing ? { duration: 0 } : springTransition}
           className="h-full overflow-hidden shrink-0 relative"
         >
@@ -2172,10 +2257,9 @@ function AppShellContent({
             </div>
           </div>
         </motion.div>
-        )}
 
         {/* Sidebar Resize Handle (hidden in focused mode) */}
-        {!isFocusedMode && (
+        {!effectiveFocusMode && (
         <div
           ref={resizeHandleRef}
           onMouseDown={(e) => { e.preventDefault(); setIsResizing('sidebar') }}
@@ -2206,12 +2290,23 @@ function AppShellContent({
           className="flex-1 overflow-hidden min-w-0 flex h-full"
           style={{ padding: PANEL_WINDOW_EDGE_SPACING, gap: PANEL_PANEL_SPACING / 2 }}
         >
-          {/* === SESSION LIST PANEL === (hidden in focused mode) */}
-          {!isFocusedMode && (
-          <div
-            className="h-full flex flex-col min-w-0 bg-background shrink-0 shadow-middle overflow-hidden rounded-l-[14px] rounded-r-[10px]"
-            style={{ width: sessionListWidth }}
+          {/* === SESSION LIST PANEL ===
+              Animated width with spring physics for smooth 60-120fps transitions.
+              Outer motion.div animates width (clipping mask), inner div maintains fixed width
+              so content doesn't reflow during animation - same pattern as left sidebar. */}
+          <motion.div
+            initial={false}
+            animate={{
+              width: effectiveFocusMode ? 0 : sessionListWidth,
+              opacity: effectiveFocusMode ? 0 : 1,
+            }}
+            transition={isResizing ? { duration: 0 } : springTransition}
+            className="h-full shrink-0 overflow-hidden"
           >
+            <div
+              style={{ width: sessionListWidth }}
+              className="h-full flex flex-col min-w-0 bg-background shadow-middle rounded-l-[14px] rounded-r-[10px]"
+            >
             <PanelHeader
               title={isSidebarVisible ? listTitle : undefined}
               compensateForStoplight={!isSidebarVisible}
@@ -2869,11 +2964,11 @@ function AppShellContent({
                 />
               </>
             )}
-          </div>
-          )}
+            </div>
+          </motion.div>
 
           {/* Session List Resize Handle (hidden in focused mode) */}
-          {!isFocusedMode && (
+          {!effectiveFocusMode && (
           <div
             ref={sessionListHandleRef}
             onMouseDown={(e) => { e.preventDefault(); setIsResizing('session-list') }}
@@ -2899,13 +2994,14 @@ function AppShellContent({
           {/* === MAIN CONTENT PANEL === */}
           <div className={cn(
             "flex-1 overflow-hidden min-w-0 bg-foreground-2 shadow-middle",
-            isFocusedMode ? "rounded-[14px]" : (isRightSidebarVisible ? "rounded-l-[10px] rounded-r-[10px]" : "rounded-l-[10px] rounded-r-[14px]")
+            effectiveFocusMode ? "rounded-l-[14px]" : "rounded-l-[10px]",
+            isRightSidebarVisible ? "rounded-r-[10px]" : "rounded-r-[14px]"
           )}>
-            <MainContentPanel isFocusedMode={isFocusedMode} />
+            <MainContentPanel isFocusedMode={effectiveFocusMode} />
           </div>
 
           {/* Right Sidebar - Inline Mode (≥ 920px) */}
-          {!isFocusedMode && !shouldUseOverlay && (
+          {!shouldUseOverlay && (
             <>
               {/* Resize Handle */}
               {isRightSidebarVisible && (
@@ -2962,7 +3058,7 @@ function AppShellContent({
           )}
 
           {/* Right Sidebar - Overlay Mode (< 920px) */}
-          {!isFocusedMode && shouldUseOverlay && (
+          {shouldUseOverlay && (
             <AnimatePresence>
               {isRightSidebarVisible && (
                 <>

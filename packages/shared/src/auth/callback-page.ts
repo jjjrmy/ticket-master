@@ -115,6 +115,23 @@ export function generateCallbackPage(options: {
       color: rgba(0, 0, 0, 0.4);
     }
 
+    .return-link {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 500;
+      color: #fff;
+      background-color: #8b5fb3;
+      border-radius: 6px;
+      text-decoration: none;
+      transition: background-color 0.15s ease;
+    }
+
+    .return-link:hover {
+      background-color: #7a4fa3;
+    }
+
     @media (prefers-color-scheme: dark) {
       body {
         background-color: #1a1a1a;
@@ -148,6 +165,12 @@ export function generateCallbackPage(options: {
       .hint {
         color: rgba(255, 255, 255, 0.4);
       }
+      .return-link {
+        background-color: #a882c9;
+      }
+      .return-link:hover {
+        background-color: #9a72bb;
+      }
     }
   </style>
 </head>
@@ -158,6 +181,7 @@ export function generateCallbackPage(options: {
       <div class="status">${statusMessage}</div>
     </div>
     <div class="hint">You can now return to the application.</div>
+    ${isSuccess && deeplinkUrl ? `<a href="${deeplinkUrl}" class="return-link">Craft Agents</a>` : ''}
   </div>
   <script>${autoCloseScript}</script>
 </body>
