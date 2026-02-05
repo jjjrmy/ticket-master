@@ -8,6 +8,7 @@
 // @ts-expect-error - ws module works at runtime, types are not available
 import WebSocket from 'ws'
 import { encryptAnthropicApiKey } from './sandbox-encryption'
+import { parseSDKErrorText, type AgentError } from '@craft-agent/shared/agent/errors'
 
 export interface SandboxToolResult {
   success: boolean
@@ -21,7 +22,7 @@ export interface SandboxToolResult {
  * Maps to Claude Code's --output-format stream-json output.
  */
 export interface SandboxEvent {
-  type: 'text_delta' | 'text_complete' | 'tool_start' | 'tool_result' | 'usage' | 'error' | 'status'
+  type: 'text_delta' | 'text_complete' | 'tool_start' | 'tool_result' | 'usage' | 'error' | 'typed_error' | 'status'
   text?: string
   toolName?: string
   toolId?: string
@@ -31,6 +32,8 @@ export interface SandboxEvent {
   inputTokens?: number
   outputTokens?: number
   message?: string
+  /** Typed error data for user-friendly error display (matches non-remote behavior) */
+  errorData?: AgentError
 }
 
 /**
@@ -453,10 +456,19 @@ export class SandboxClient {
           const events: SandboxEvent[] = []
           for (const block of content) {
             if (block.type === 'text' && block.text) {
-              events.push({
-                type: 'text_delta',
-                text: block.text,
-              })
+              // Check if this text is an SDK error (e.g., "API Error: 500 {...}")
+              const typedError = parseSDKErrorText(block.text)
+              if (typedError) {
+                events.push({
+                  type: 'typed_error',
+                  errorData: typedError,
+                })
+              } else {
+                events.push({
+                  type: 'text_delta',
+                  text: block.text,
+                })
+              }
             } else if (block.type === 'tool_use') {
               events.push({
                 type: 'tool_start',
@@ -489,6 +501,18 @@ export class SandboxClient {
         }
 
         case 'result': {
+          // Check if the result text contains an SDK error
+          const resultText = parsed.result
+          if (resultText && typeof resultText === 'string') {
+            const typedError = parseSDKErrorText(resultText)
+            if (typedError) {
+              return {
+                type: 'typed_error',
+                errorData: typedError,
+              }
+            }
+          }
+
           // Final result with usage info
           const usage = parsed.usage || {}
           return {

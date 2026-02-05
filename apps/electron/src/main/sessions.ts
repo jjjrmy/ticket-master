@@ -2578,6 +2578,14 @@ export class SessionManager {
           message: event.message || 'Unknown error',
         }
 
+      case 'typed_error':
+        // Typed errors have structured error data - send as typed_error event for proper UI display
+        return {
+          type: 'typed_error',
+          sessionId,
+          error: event.errorData!,
+        }
+
       default:
         return {
           type: 'status',
@@ -2626,6 +2634,14 @@ export class SessionManager {
         return {
           type: 'error',
           message: event.message || 'Unknown error',
+        }
+
+      case 'typed_error':
+        // Convert sandbox typed error to AgentEvent typed_error
+        // This ensures API errors show in the red error box UI, matching non-remote behavior
+        return {
+          type: 'typed_error',
+          error: event.errorData!,
         }
 
       case 'status':
