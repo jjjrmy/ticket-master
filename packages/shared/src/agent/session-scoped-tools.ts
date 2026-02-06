@@ -1323,6 +1323,11 @@ A browser window will open for the user to complete authentication.
 - Once complete or cancelled, you'll receive a message with the result
 - Do NOT include any text or tool calls after this tool - they will not be executed
 
+**Advanced OAuth options:**
+Some MCP servers (e.g., Figma) restrict OAuth client registration to known client names or expect a specific callback path. Configure these in the source's config.json under \`mcp\`:
+- \`clientName\` — Override the client name sent during registration (default: "Craft Agent")
+- \`callbackPath\` — Override the OAuth callback path (default: "/oauth/callback")
+
 **Returns:**
 - Success message if already authenticated
 - Authentication request if OAuth flow is triggered`,

@@ -24,6 +24,8 @@ mcp__craft-agents-docs__SearchCraftAgents({ query: "{service} source setup" })
 
 **Why this matters:** Some services have important prerequisites or gotchas that MUST be checked before creating a source. Skipping this step can lead to failed setups or redundant configurations.
 
+**Also check the "Common Providers" section** at the bottom of this document — it contains service-specific configuration requirements (e.g., Figma needs `clientName` and `callbackPath` overrides, GitHub needs bearer auth instead of OAuth). These details won't appear in generic web search results.
+
 ### 1. Understand User Intent
 
 Before creating any configuration, ask questions to understand:
@@ -238,7 +240,9 @@ Each source folder contains:
   // For MCP sources:
   "mcp": {
     "url": "https://mcp.example.com",
-    "authType": "oauth" | "bearer" | "none"
+    "authType": "oauth" | "bearer" | "none",
+    "clientName": "Custom Name",      // Override OAuth client name (default: "Craft Agent")
+    "callbackPath": "/callback"       // Override OAuth callback path (default: "/oauth/callback")
   },
 
   // For API sources:
@@ -291,6 +295,25 @@ Model Context Protocol servers provide tools via HTTP/SSE.
 ```
 
 After creating, use `source_oauth_trigger` to authenticate.
+
+**OAuth overrides** — Some MCP servers restrict OAuth client registration to known client names or expect a specific callback path. Use these optional fields when OAuth registration fails with "Forbidden":
+- `clientName` — Override the client name sent during registration (default: `"Craft Agent"`)
+- `callbackPath` — Override the OAuth callback path (default: `"/oauth/callback"`)
+
+```json
+{
+  "type": "mcp",
+  "provider": "figma",
+  "mcp": {
+    "url": "https://mcp.figma.com/mcp",
+    "authType": "oauth",
+    "clientName": "Codex",
+    "callbackPath": "/callback"
+  }
+}
+```
+
+See the **Common Providers** section for service-specific requirements.
 
 **Bearer token authentication:**
 ```json
@@ -693,6 +716,11 @@ Transport: `stdio`, Command: `npx -y @modelcontextprotocol/server-brave-search`,
 ### Memory
 Provider: `memory`, Type: `mcp`
 Transport: `stdio`, Command: `npx -y @modelcontextprotocol/server-memory`, no auth.
+
+### Figma
+Provider: `figma`, Type: `mcp`
+URL: `https://mcp.figma.com/mcp`, OAuth auth.
+Requires `clientName: "Codex"` and `callbackPath: "/callback"` in the mcp config — Figma restricts OAuth registration to known client names and expects `/callback` as the redirect path.
 
 ## Workflow
 
