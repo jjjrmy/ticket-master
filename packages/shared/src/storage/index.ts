@@ -12,6 +12,7 @@ export type {
   IStatusStorage,
   ILabelStorage,
   ISkillStorage,
+  IAssetStorage,
   RemoteChangeEvent,
 } from './types.ts';
 

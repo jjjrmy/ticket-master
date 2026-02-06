@@ -111,6 +111,21 @@ export interface ISkillStorage {
 }
 
 // ============================================================
+// Asset Storage (workspace-scoped icons/images via R2)
+// ============================================================
+
+export interface IAssetStorage {
+  /** Upload an asset (icon, image) to workspace storage */
+  upload(relativePath: string, data: Buffer | string, mimeType: string): Promise<void>;
+  /** Download an asset. Returns SVG string for .svg, data URL for binary images, null if not found */
+  download(relativePath: string): Promise<string | null>;
+  /** Delete an asset. Returns true if deleted, false if not found */
+  delete(relativePath: string): Promise<boolean>;
+  /** Get a signed URL for direct asset access */
+  getSignedUrl(relativePath: string, expiresIn?: number): Promise<string>;
+}
+
+// ============================================================
 // File Storage (R2 for cloud, filesystem for local)
 // ============================================================
 
@@ -190,6 +205,7 @@ export interface IStorageProvider {
   labels: ILabelStorage;
   skills: ISkillStorage;
   files: IFileStorage;
+  assets?: IAssetStorage;
 
   /** Initialize the provider (ensure dirs for local, connect WS for cloud) */
   initialize(): Promise<void>;

@@ -337,6 +337,91 @@ export class WorkspaceDO extends DurableObject<Env> {
       return Response.json({ success: true });
     }
 
+    // ============================================================
+    // Deep Link Action Routes (REST parity for craftagents:// actions)
+    // ============================================================
+
+    // POST /actions/new-chat — create a new session
+    if (pathname === '/actions/new-chat') {
+      const body = await request.json<{ name?: string; input?: string; send?: boolean }>().catch(() => ({} as { name?: string; input?: string; send?: boolean }));
+      const now = Date.now();
+      const id = crypto.randomUUID();
+      const header: Record<string, unknown> = {
+        id,
+        createdAt: now,
+        lastUsedAt: now,
+        messageCount: 0,
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, contextTokens: 0, costUsd: 0 },
+      };
+      if (body.name) header.name = body.name;
+      if (body.input) header.preview = body.input;
+
+      this.sql.exec(
+        'INSERT INTO sessions (id, header, messages, updated_at) VALUES (?, ?, ?, ?)',
+        id, JSON.stringify(header), '[]', now,
+      );
+
+      this.broadcastToAll({ entity: 'session', action: 'created', data: header });
+      return Response.json(header, { status: 201 });
+    }
+
+    // POST /actions/flag-session — flag a session
+    if (pathname === '/actions/flag-session') {
+      const { sessionId } = await request.json<{ sessionId: string }>();
+      if (!sessionId) return Response.json({ error: 'Missing sessionId' }, { status: 400 });
+
+      const existing = this.sql.exec('SELECT header FROM sessions WHERE id = ?', sessionId).toArray()[0];
+      if (!existing) return Response.json({ error: 'Session not found' }, { status: 404 });
+
+      const header = { ...JSON.parse(existing.header as string), isFlagged: true };
+      this.sql.exec('UPDATE sessions SET header = ?, updated_at = ? WHERE id = ?', JSON.stringify(header), Date.now(), sessionId);
+
+      this.broadcastToAll({ entity: 'session', action: 'updated', data: header });
+      return Response.json(header);
+    }
+
+    // POST /actions/unflag-session — unflag a session
+    if (pathname === '/actions/unflag-session') {
+      const { sessionId } = await request.json<{ sessionId: string }>();
+      if (!sessionId) return Response.json({ error: 'Missing sessionId' }, { status: 400 });
+
+      const existing = this.sql.exec('SELECT header FROM sessions WHERE id = ?', sessionId).toArray()[0];
+      if (!existing) return Response.json({ error: 'Session not found' }, { status: 404 });
+
+      const header = { ...JSON.parse(existing.header as string), isFlagged: false };
+      this.sql.exec('UPDATE sessions SET header = ?, updated_at = ? WHERE id = ?', JSON.stringify(header), Date.now(), sessionId);
+
+      this.broadcastToAll({ entity: 'session', action: 'updated', data: header });
+      return Response.json(header);
+    }
+
+    // POST /actions/rename-session — rename a session
+    if (pathname === '/actions/rename-session') {
+      const { sessionId, name } = await request.json<{ sessionId: string; name: string }>();
+      if (!sessionId || !name) return Response.json({ error: 'Missing sessionId or name' }, { status: 400 });
+
+      const existing = this.sql.exec('SELECT header FROM sessions WHERE id = ?', sessionId).toArray()[0];
+      if (!existing) return Response.json({ error: 'Session not found' }, { status: 404 });
+
+      const header = { ...JSON.parse(existing.header as string), name };
+      this.sql.exec('UPDATE sessions SET header = ?, updated_at = ? WHERE id = ?', JSON.stringify(header), Date.now(), sessionId);
+
+      this.broadcastToAll({ entity: 'session', action: 'updated', data: header });
+      return Response.json(header);
+    }
+
+    // POST /actions/delete-session — delete a session
+    if (pathname === '/actions/delete-session') {
+      const { sessionId } = await request.json<{ sessionId: string }>();
+      if (!sessionId) return Response.json({ error: 'Missing sessionId' }, { status: 400 });
+
+      this.sql.exec('DELETE FROM sessions WHERE id = ?', sessionId);
+      this.sql.exec('DELETE FROM plans WHERE session_id = ?', sessionId);
+
+      this.broadcastToAll({ entity: 'session', action: 'deleted', data: { id: sessionId, sessionId } });
+      return Response.json({ success: true });
+    }
+
     return new Response('Not Found', { status: 404 });
   }
 
@@ -1266,6 +1351,20 @@ export class WorkspaceDO extends DurableObject<Env> {
       const tags = this.ctx.getTags(ws);
       if (tags.length > 0 && tags[0] === 'sandbox') continue;
 
+      try {
+        ws.send(payload);
+      } catch {
+        // Client disconnected — hibernation API will clean up
+      }
+    }
+  }
+
+  /** Broadcast a change event to ALL connected WebSocket clients (for REST-originated changes) */
+  private broadcastToAll(event: WSRemoteChangeEvent): void {
+    const payload = JSON.stringify({ type: 'broadcast', event } satisfies WSServerMessage);
+    for (const ws of this.ctx.getWebSockets()) {
+      const tags = this.ctx.getTags(ws);
+      if (tags.length > 0 && tags[0] === 'sandbox') continue;
       try {
         ws.send(payload);
       } catch {

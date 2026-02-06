@@ -154,6 +154,13 @@ export const sessionMetaMapAtom = atom<Map<string, SessionMeta>>(new Map())
 export const sessionIdsAtom = atom<string[]>([])
 
 /**
+ * Track whether the initial session list is still loading (e.g., from cloud API).
+ * Starts true so SessionList shows a spinner instead of the empty state
+ * until the first getSessions() call resolves.
+ */
+export const sessionsLoadingAtom = atom<boolean>(true)
+
+/**
  * Track which sessions have had their messages loaded (for lazy loading)
  * Sessions are loaded with empty messages initially, messages are fetched on-demand
  */

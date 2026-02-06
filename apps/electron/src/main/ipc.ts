@@ -16,10 +16,8 @@ import { getSessionAttachmentsPath, validateSessionId } from '@craft-agent/share
 import { loadWorkspaceSources, getSourcesBySlugs, type LoadedSource } from '@craft-agent/shared/sources'
 import { isValidThinkingLevel } from '@craft-agent/shared/agent/thinking-levels'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
-import { getCloudSyncManager } from './cloud-sync'
-import type { CloudStorageProvider } from '@craft-agent/shared/storage'
 import { MarkItDown } from 'markitdown-js'
-import { encryptAnthropicApiKey } from './sandbox-encryption'
+import { resolvePluginStorage, getPlugins } from './plugins'
 
 /**
  * Sanitizes a filename to prevent path traversal and filesystem issues.
@@ -56,12 +54,18 @@ function getWorkspaceOrThrow(workspaceId: string): Workspace {
 }
 
 /**
- * Returns the CloudStorageProvider for a cloud workspace, or null for local workspaces.
- * Uses CloudSyncManager to get/create providers lazily with caching.
+ * Resolve the storage provider for a workspace.
+ * Queries registered plugins (e.g., cloud plugin) first; falls back to local filesystem.
+ * This eliminates inline `if (isCloud)` branches throughout the IPC handlers.
  */
-async function getCloudProvider(workspace: Workspace): Promise<CloudStorageProvider | null> {
-  if (workspace.storageType !== 'cloud' || !workspace.cloudConfig) return null
-  return getCloudSyncManager().getProvider(workspace)
+async function getStorageProvider(workspace: Workspace): Promise<import('@craft-agent/shared/storage').IStorageProvider> {
+  const { LocalStorageProvider } = await import('@craft-agent/shared/storage')
+  const pluginProvider = await resolvePluginStorage(workspace)
+  if (pluginProvider) return pluginProvider
+  if (!workspace.rootPath) {
+    throw new Error(`Local storage provider requires rootPath (workspace: ${workspace.id})`)
+  }
+  return new LocalStorageProvider(workspace.id, workspace.rootPath)
 }
 
 /**
@@ -137,7 +141,6 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const allSessions = sessionManager.getSessions()
       .sort((a, b) => b.lastMessageAt - a.lastMessageAt)
     end()
-    ipcLog.info(`GET_SESSIONS returning ${allSessions.length} sessions:`, allSessions.map(s => ({ id: s.id, wsId: s.workspaceId })))
     return allSessions
   })
 
@@ -165,72 +168,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     return workspace
   })
 
-  // Create a cloud workspace (connects to a remote cloud-worker)
-  ipcMain.handle(IPC_CHANNELS.CREATE_CLOUD_WORKSPACE, async (_event, name: string, remoteUrl: string, apiKey: string) => {
-    // Derive slug from name (same logic as renderer slugify)
-    const slug = name
-      .toLowerCase()
-      .trim()
-      .replace(/[\s_]+/g, '-')
-      .replace(/[^a-z0-9-]/g, '')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '')
-
-    if (!slug) throw new Error('Invalid workspace name: cannot derive slug')
-
-    // Create local workspace folder at the default location
-    const defaultWorkspacesDir = join(homedir(), '.craft-agent', 'workspaces')
-    const rootPath = join(defaultWorkspacesDir, slug)
-
-    // Register workspace with cloud storage type
-    const workspace = addWorkspace({
-      name,
-      rootPath,
-      storageType: 'cloud',
-      cloudConfig: {
-        remoteUrl: remoteUrl.replace(/\/+$/, ''),
-        workspaceSlug: slug,
-      },
-    })
-
-    // Store the API key securely via CredentialManager
-    const credManager = getCredentialManager()
-    await credManager.set(
-      { type: 'cloud_apikey', workspaceId: workspace.id },
-      { value: apiKey }
-    )
-
-    // Make it active
-    setActiveWorkspace(workspace.id)
-
-    // Load sessions for the new workspace immediately (so they appear without restart)
-    await sessionManager.loadSessionsForWorkspace(workspace)
-
-    ipcLog.info(`Created cloud workspace "${name}" (slug: ${slug}) → ${remoteUrl}`)
-    return workspace
-  })
-
-  // Set/update API key for an existing cloud workspace
-  // Useful when workspace was created before credential storage, or key needs to be updated
-  ipcMain.handle(IPC_CHANNELS.SET_CLOUD_API_KEY, async (_event, workspaceId: string, apiKey: string) => {
-    const workspace = getWorkspaceOrThrow(workspaceId)
-    if (workspace.storageType !== 'cloud') {
-      throw new Error(`Workspace "${workspace.name}" is not a cloud workspace`)
-    }
-
-    // Store/update the API key securely via CredentialManager
-    const credManager = getCredentialManager()
-    await credManager.set(
-      { type: 'cloud_apikey', workspaceId: workspace.id },
-      { value: apiKey }
-    )
-
-    // Disconnect existing provider so it reconnects with the new key
-    await getCloudSyncManager().disconnect(workspace.id)
-
-    ipcLog.info(`Updated API key for cloud workspace "${workspace.name}"`)
-    return { success: true }
-  })
+  // Cloud workspace creation handlers are registered by the cloud plugin
+  // (see cloud-plugin/ipc-handlers.ts: CREATE_CLOUD_WORKSPACE, SET_CLOUD_API_KEY)
 
   // Check if a workspace slug already exists (for validation before creation)
   ipcMain.handle(IPC_CHANNELS.CHECK_WORKSPACE_SLUG, async (_event, slug: string) => {
@@ -248,9 +187,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.GET_WINDOW_WORKSPACE, (event) => {
     const workspaceId = windowManager.getWorkspaceForWindow(event.sender.id)
     // Set up ConfigWatcher for live updates (labels, statuses, sources, themes)
+    // Cloud workspaces don't have local config to watch
     if (workspaceId) {
       const workspace = getWorkspaceByNameOrId(workspaceId)
-      if (workspace) {
+      if (workspace?.rootPath) {
         sessionManager.setupConfigWatcher(workspace.rootPath, workspaceId)
       }
     }
@@ -323,9 +263,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       }
     }
 
-    // Set up ConfigWatcher for the new workspace
+    // Set up ConfigWatcher for the new workspace (local workspaces only)
     const workspace = getWorkspaceByNameOrId(workspaceId)
-    if (workspace) {
+    if (workspace?.rootPath) {
       sessionManager.setupConfigWatcher(workspace.rootPath, workspaceId)
     }
     end()
@@ -660,12 +600,13 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       // This must happen before using sessionId in any file path operations
       validateSessionId(sessionId)
 
-      // Check if this is a cloud workspace
-      const isCloud = workspace.storageType === 'cloud' && !!workspace.cloudConfig
+      // Resolve storage provider (cloud or local)
+      const provider = await getStorageProvider(workspace)
+      const isCloud = provider.type === 'cloud'
 
       // For cloud workspaces, we process in temp then upload to R2
       // For local workspaces, we process directly in the attachments folder
-      const workspaceRootPath = workspace.rootPath
+      const workspaceRootPath = workspace.rootPath!
       const attachmentsDir = isCloud
         ? join(tmpdir(), 'craft-agent-attachments', sessionId)
         : getSessionAttachmentsPath(workspaceRootPath, sessionId)
@@ -816,13 +757,6 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       let markdownPath: string | undefined
 
       if (isCloud) {
-        // Get cloud storage provider
-        const cloudSyncManager = getCloudSyncManager()
-        const provider = await cloudSyncManager.getProvider(workspace)
-        if (!provider) {
-          throw new Error('Failed to get cloud storage provider')
-        }
-
         // Upload main file and get signed URL (24 hour expiry for stored attachments)
         await provider.files.upload(sessionId, 'attachments', storedFileName, fileBuffer!, attachment.mimeType)
         storedPath = await provider.files.getFileUrl(sessionId, 'attachments', storedFileName, 86400)
@@ -911,206 +845,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     }
   })
 
-  // Get full git info for a directory (remote URL, repo key, branch, commit)
-  ipcMain.handle(IPC_CHANNELS.GET_GIT_INFO, (_event, dirPath: string) => {
-    try {
-      const remoteUrl = execSync('git remote get-url origin', {
-        cwd: dirPath,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 5000,
-      }).trim()
-
-      const branch = execSync('git branch --show-current', {
-        cwd: dirPath,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 5000,
-      }).trim()
-
-      const commit = execSync('git rev-parse HEAD', {
-        cwd: dirPath,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 5000,
-      }).trim()
-
-      // Parse remote URL to get owner/repo
-      // Handles: git@github.com:owner/repo.git and https://github.com/owner/repo.git
-      const match = remoteUrl.match(/github\.com[:/]([^/]+)\/([^/.]+)/)
-      if (!match) {
-        return null // Not a GitHub repo
-      }
-
-      return {
-        repoUrl: remoteUrl,
-        repoKey: `${match[1]}/${match[2]}`,
-        branch: branch || 'main',
-        commit,
-      }
-    } catch {
-      // Not a git repo, git not installed, or other error
-      return null
-    }
-  })
-
-  // Helper to get cloud workspace config with API key
-  async function getCloudConfig(workspaceId: string) {
-    const workspace = getWorkspaceOrThrow(workspaceId)
-    if (workspace.storageType !== 'cloud' || !workspace.cloudConfig) {
-      throw new Error('Sandbox operations require a cloud workspace')
-    }
-
-    const credManager = getCredentialManager()
-    const credential = await credManager.get({ type: 'cloud_apikey', workspaceId: workspace.id })
-    if (!credential) {
-      throw new Error(`No API key found for cloud workspace "${workspace.name}"`)
-    }
-
-    return {
-      remoteUrl: workspace.cloudConfig.remoteUrl,
-      workspaceSlug: workspace.cloudConfig.workspaceSlug,
-      apiKey: credential.value,
-    }
-  }
-
-  // Sandbox operations (require cloud workspace)
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_CHECK_AUTH, async (_event, workspaceId: string, repoKey: string, repoUrl: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    const response = await fetch(`${config.remoteUrl}/api/sandbox/check`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        workspaceSlug: config.workspaceSlug,
-        repoKey,
-        repoUrl,
-      }),
-    })
-
-    if (!response.ok) {
-      throw new Error(`Failed to check sandbox auth: ${response.statusText}`)
-    }
-
-    return response.json()
-  })
-
-  // Note: Anthropic API key is sent per-WebSocket-message, not at session creation
-  // This ensures each user's execution uses their own key for billing isolation
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_CREATE, async (_event, workspaceId: string, repoKey: string, branch: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    const response = await fetch(`${config.remoteUrl}/api/sandbox/create`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        workspaceSlug: config.workspaceSlug,
-        repoKey,
-        branch,
-      }),
-    })
-
-    if (!response.ok) {
-      throw new Error(`Failed to create sandbox: ${response.statusText}`)
-    }
-
-    return response.json()
-  })
-
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_GET_STATUS, async (_event, workspaceId: string, sessionId: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    const response = await fetch(`${config.remoteUrl}/api/sandbox/${config.workspaceSlug}/${sessionId}/status`, {
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-      },
-    })
-
-    if (!response.ok) {
-      throw new Error(`Failed to get sandbox status: ${response.statusText}`)
-    }
-
-    return response.json()
-  })
-
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_TERMINATE, async (_event, workspaceId: string, sessionId: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    const response = await fetch(`${config.remoteUrl}/api/sandbox/${config.workspaceSlug}/${sessionId}`, {
-      method: 'DELETE',
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-      },
-    })
-
-    if (!response.ok) {
-      throw new Error(`Failed to terminate sandbox: ${response.statusText}`)
-    }
-
-    return response.json()
-  })
-
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_HEARTBEAT, async (_event, workspaceId: string, sessionId: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    const response = await fetch(`${config.remoteUrl}/api/sandbox/${config.workspaceSlug}/${sessionId}/heartbeat`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-      },
-    })
-
-    if (!response.ok) {
-      throw new Error(`Failed to send sandbox heartbeat: ${response.statusText}`)
-    }
-
-    return response.json()
-  })
-
-  // List all active sandbox sessions for a workspace
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_LIST_SESSIONS, async (_event, workspaceId: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    const response = await fetch(`${config.remoteUrl}/workspace/${config.workspaceSlug}/sandbox/sessions`, {
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-      },
-    })
-
-    if (!response.ok) {
-      throw new Error(`Failed to list sandbox sessions: ${response.statusText}`)
-    }
-
-    return response.json()
-  })
-
-  // Encrypt Anthropic API key for sending to sandbox WebSocket
-  // This ensures the API key is encrypted in transit with a key derived from the workspace API key
-  ipcMain.handle(IPC_CHANNELS.SANDBOX_ENCRYPT_API_KEY, async (_event, workspaceId: string) => {
-    const config = await getCloudConfig(workspaceId)
-
-    // Get user's Anthropic API key
-    const credManager = getCredentialManager()
-    const anthropicCred = await credManager.get({ type: 'anthropic_api_key' })
-    if (!anthropicCred?.value) {
-      throw new Error('No Anthropic API key configured')
-    }
-
-    // Encrypt the API key using a key derived from the workspace API key
-    const encryptedKey = await encryptAnthropicApiKey(
-      anthropicCred.value,
-      config.apiKey,
-      config.workspaceSlug
-    )
-
-    return { encryptedKey }
-  })
+  // Cloud-specific IPC handlers (GET_GIT_INFO, SANDBOX_*, CREATE_CLOUD_WORKSPACE, SET_CLOUD_API_KEY)
+  // are registered by the cloud plugin via plugins.ts
 
   // Git Bash detection and configuration (Windows only)
   ipcMain.handle(IPC_CHANNELS.GITBASH_CHECK, async () => {
@@ -1793,9 +1529,22 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       return null
     }
 
-    // Load workspace config
+    // Cloud workspaces: settings stored inline in global config
+    if (workspace.storageType === 'cloud') {
+      return {
+        name: workspace.name,
+        model: workspace.defaults?.model,
+        permissionMode: workspace.defaults?.permissionMode,
+        cyclablePermissionModes: workspace.defaults?.cyclablePermissionModes,
+        thinkingLevel: workspace.defaults?.thinkingLevel,
+        workingDirectory: workspace.defaults?.workingDirectory,
+        localMcpEnabled: true,
+      }
+    }
+
+    // Local workspaces: load from local config file
     const { loadWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
-    const config = loadWorkspaceConfig(workspace.rootPath)
+    const config = workspace.rootPath ? loadWorkspaceConfig(workspace.rootPath) : null
 
     return {
       name: config?.name,
@@ -1817,6 +1566,32 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
+    }
+
+    // Cloud workspaces: store settings inline in global config
+    if (workspace.storageType === 'cloud') {
+      const globalConfig = loadStoredConfig()
+      if (!globalConfig) throw new Error('No config found')
+
+      const wsEntry = globalConfig.workspaces.find(w => w.id === workspaceId)
+      if (!wsEntry) throw new Error(`Workspace not found in config: ${workspaceId}`)
+
+      if (key === 'name') {
+        wsEntry.name = String(value).trim()
+      } else if (key !== 'localMcpEnabled') {
+        // Store in inline defaults (localMcpEnabled is not applicable for cloud)
+        wsEntry.defaults = wsEntry.defaults || {}
+        ;(wsEntry.defaults as Record<string, unknown>)[key] = value
+      }
+
+      saveConfig(globalConfig)
+      ipcLog.info(`Cloud workspace setting updated: ${key} = ${JSON.stringify(value)}`)
+      return
+    }
+
+    // Local workspaces: store in local config file
+    if (!workspace.rootPath) {
+      throw new Error(`Workspace has no rootPath: ${workspaceId}`)
     }
 
     const { loadWorkspaceConfig, saveWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
@@ -2064,31 +1839,16 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       ipcLog.error(`SOURCES_GET: Workspace not found: ${workspaceId}`)
       return []
     }
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      return provider.sources.loadWorkspaceSources()
-    }
-    return loadWorkspaceSources(workspace.rootPath)
+    const provider = await getStorageProvider(workspace)
+    return provider.sources.loadWorkspaceSources()
   })
 
   // Create a new source
   ipcMain.handle(IPC_CHANNELS.SOURCES_CREATE, async (_event, workspaceId: string, config: Partial<import('@craft-agent/shared/sources').CreateSourceInput>) => {
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`)
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      return provider.sources.createSource({
-        name: config.name || 'New Source',
-        provider: config.provider || 'custom',
-        type: config.type || 'mcp',
-        enabled: config.enabled ?? true,
-        mcp: config.mcp,
-        api: config.api,
-        local: config.local,
-      })
-    }
-    const { createSource } = await import('@craft-agent/shared/sources')
-    return createSource(workspace.rootPath, {
+    const provider = await getStorageProvider(workspace)
+    return provider.sources.createSource({
       name: config.name || 'New Source',
       provider: config.provider || 'custom',
       type: config.type || 'mcp',
@@ -2103,13 +1863,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.SOURCES_DELETE, async (_event, workspaceId: string, sourceSlug: string) => {
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`)
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      await provider.sources.deleteSource(sourceSlug)
-      return
-    }
-    const { deleteSource } = await import('@craft-agent/shared/sources')
-    deleteSource(workspace.rootPath, sourceSlug)
+    const provider = await getStorageProvider(workspace)
+    await provider.sources.deleteSource(sourceSlug)
   })
 
   // Start OAuth flow for a source
@@ -2119,13 +1874,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       if (!workspace) {
         return { success: false, error: `Workspace not found: ${workspaceId}` }
       }
-      const { loadSource, getSourceCredentialManager } = await import('@craft-agent/shared/sources')
+      const { getSourceCredentialManager } = await import('@craft-agent/shared/sources')
 
-      // Load source from cloud or local
-      const provider = await getCloudProvider(workspace)
-      const source = provider
-        ? await provider.sources.loadSource(sourceSlug)
-        : loadSource(workspace.rootPath, sourceSlug)
+      // Load source via storage provider (handles both cloud and local)
+      const provider = await getStorageProvider(workspace)
+      const source = await provider.sources.loadSource(sourceSlug)
       if (!source || source.config.type !== 'mcp' || !source.config.mcp?.url) {
         return { success: false, error: 'Source not found or not an MCP source' }
       }
@@ -2158,13 +1911,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.SOURCES_SAVE_CREDENTIALS, async (_event, workspaceId: string, sourceSlug: string, credential: string) => {
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`)
-    const { loadSource, getSourceCredentialManager } = await import('@craft-agent/shared/sources')
+    const { getSourceCredentialManager } = await import('@craft-agent/shared/sources')
 
-    // Load source from cloud or local
-    const provider = await getCloudProvider(workspace)
-    const source = provider
-      ? await provider.sources.loadSource(sourceSlug)
-      : loadSource(workspace.rootPath, sourceSlug)
+    // Load source via storage provider (handles both cloud and local)
+    const provider = await getStorageProvider(workspace)
+    const source = await provider.sources.loadSource(sourceSlug)
     if (!source) {
       throw new Error(`Source not found: ${sourceSlug}`)
     }
@@ -2186,7 +1937,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     // Load raw JSON file (not normalized) for UI display
     const { existsSync, readFileSync } = await import('fs')
     const { getSourcePermissionsPath } = await import('@craft-agent/shared/agent')
-    const path = getSourcePermissionsPath(workspace.rootPath, sourceSlug)
+    const path = getSourcePermissionsPath(workspace.rootPath!, sourceSlug)
 
     if (!existsSync(path)) return null
 
@@ -2208,7 +1959,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     // Load raw JSON file (not normalized) for UI display
     const { existsSync, readFileSync } = await import('fs')
     const { getWorkspacePermissionsPath } = await import('@craft-agent/shared/agent')
-    const path = getWorkspacePermissionsPath(workspace.rootPath)
+    const path = getWorkspacePermissionsPath(workspace.rootPath!)
 
     if (!existsSync(path)) return null
 
@@ -2246,11 +1997,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     if (!workspace) return { success: false, error: 'Workspace not found' }
 
     try {
-      // Load source config (cloud or local)
-      const provider = await getCloudProvider(workspace)
-      const sources = provider
-        ? await provider.sources.loadWorkspaceSources()
-        : await loadWorkspaceSources(workspace.rootPath)
+      // Load source config via storage provider (handles both cloud and local)
+      const provider = await getStorageProvider(workspace)
+      const sources = await provider.sources.loadWorkspaceSources()
       const source = sources.find(s => s.config.slug === sourceSlug)
       if (!source) return { success: false, error: 'Source not found' }
       if (source.config.type !== 'mcp') return { success: false, error: 'Source is not an MCP server' }
@@ -2313,11 +2062,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
       // Load permissions patterns
       const { loadSourcePermissionsConfig, permissionsConfigCache } = await import('@craft-agent/shared/agent')
-      const permissionsConfig = loadSourcePermissionsConfig(workspace.rootPath, sourceSlug)
+      const permissionsConfig = loadSourcePermissionsConfig(workspace.rootPath!, sourceSlug)
 
       // Get merged permissions config
       const mergedConfig = permissionsConfigCache.getMergedConfig({
-        workspaceRootPath: workspace.rootPath,
+        workspaceRootPath: workspace.rootPath!,
         activeSourceSlugs: [sourceSlug],
       })
 
@@ -2369,7 +2118,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const { searchSessions } = await import('./search')
     const { getWorkspaceSessionsPath } = await import('@craft-agent/shared/workspaces')
 
-    const sessionsDir = getWorkspaceSessionsPath(workspace.rootPath)
+    const sessionsDir = getWorkspaceSessionsPath(workspace.rootPath!)
     ipcLog.debug(`SEARCH_SESSIONS: Searching "${query}" in ${sessionsDir}`)
 
     const results = await searchSessions(query, sessionsDir, {
@@ -2402,15 +2151,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       ipcLog.error(`SKILLS_GET: Workspace not found: ${workspaceId}`)
       return []
     }
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      const skills = await provider.skills.loadWorkspaceSkills()
-      ipcLog.info(`SKILLS_GET: Loaded ${skills.length} cloud skills for workspace: ${workspaceId}`)
-      return skills
-    }
-    const { loadAllSkills } = await import('@craft-agent/shared/skills')
-    const skills = loadAllSkills(workspace.rootPath, workingDirectory)
-    ipcLog.info(`SKILLS_GET: Loaded ${skills.length} skills from ${workspace.rootPath}`)
+    const provider = await getStorageProvider(workspace)
+    const skills = await provider.skills.loadWorkspaceSkills()
+    ipcLog.info(`SKILLS_GET: Loaded ${skills.length} skills for workspace: ${workspaceId}`)
     return skills
   })
 
@@ -2421,6 +2164,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       ipcLog.error(`SKILLS_GET_FILES: Workspace not found: ${workspaceId}`)
       return []
     }
+
+    // Cloud workspaces: skill files are on the cloud, not local
+    if (workspace.storageType === 'cloud' || !workspace.rootPath) return []
 
     const { join } = await import('path')
     const { readdirSync, statSync } = await import('fs')
@@ -2477,14 +2223,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      await provider.skills.deleteSkill(skillSlug)
-      ipcLog.info(`Deleted cloud skill: ${skillSlug}`)
-      return
-    }
-    const { deleteSkill } = await import('@craft-agent/shared/skills')
-    deleteSkill(workspace.rootPath, skillSlug)
+    const provider = await getStorageProvider(workspace)
+    await provider.skills.deleteSkill(skillSlug)
     ipcLog.info(`Deleted skill: ${skillSlug}`)
   })
 
@@ -2497,7 +2237,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const { shell } = await import('electron')
     const { getWorkspaceSkillsPath } = await import('@craft-agent/shared/workspaces')
 
-    const skillsDir = getWorkspaceSkillsPath(workspace.rootPath)
+    const skillsDir = getWorkspaceSkillsPath(workspace.rootPath!)
     const skillFile = join(skillsDir, skillSlug, 'SKILL.md')
     await shell.openPath(skillFile)
   })
@@ -2511,7 +2251,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const { shell } = await import('electron')
     const { getWorkspaceSkillsPath } = await import('@craft-agent/shared/workspaces')
 
-    const skillsDir = getWorkspaceSkillsPath(workspace.rootPath)
+    const skillsDir = getWorkspaceSkillsPath(workspace.rootPath!)
     const skillDir = join(skillsDir, skillSlug)
     await shell.showItemInFolder(skillDir)
   })
@@ -2525,12 +2265,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      return provider.statuses.listStatuses()
-    }
-    const { listStatuses } = await import('@craft-agent/shared/statuses')
-    return listStatuses(workspace.rootPath)
+    const provider = await getStorageProvider(workspace)
+    return provider.statuses.listStatuses()
   })
 
   // Reorder statuses (drag-and-drop). Receives new ordered array of status IDs.
@@ -2539,17 +2275,68 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      // Cloud: load current config, reorder, save back
-      const config = await provider.statuses.loadStatusConfig()
-      const statusMap = new Map(config.statuses.map(s => [s.id, s]))
-      config.statuses = orderedIds.map(id => statusMap.get(id)).filter(Boolean) as typeof config.statuses
-      await provider.statuses.saveStatusConfig(config)
-      return
-    }
-    const { reorderStatuses } = await import('@craft-agent/shared/statuses')
-    reorderStatuses(workspace.rootPath, orderedIds)
+    const provider = await getStorageProvider(workspace)
+    const config = await provider.statuses.loadStatusConfig()
+    const statusMap = new Map(config.statuses.map(s => [s.id, s]))
+    config.statuses = orderedIds.map(id => statusMap.get(id)).filter(Boolean) as typeof config.statuses
+    await provider.statuses.saveStatusConfig(config)
+  })
+
+  // Create a new status in a workspace
+  ipcMain.handle(IPC_CHANNELS.STATUSES_CREATE, async (_event, workspaceId: string, input: import('@craft-agent/shared/statuses').CreateStatusInput) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const provider = await getStorageProvider(workspace)
+    const { createStatus } = await import('@craft-agent/shared/statuses')
+    const status = await createStatus(provider.statuses, input)
+    windowManager.broadcastToAll(IPC_CHANNELS.STATUSES_CHANGED, workspaceId)
+    return status
+  })
+
+  // Update an existing status
+  ipcMain.handle(IPC_CHANNELS.STATUSES_UPDATE, async (_event, workspaceId: string, statusId: string, updates: import('@craft-agent/shared/statuses').UpdateStatusInput) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const provider = await getStorageProvider(workspace)
+    const { updateStatus } = await import('@craft-agent/shared/statuses')
+    const status = await updateStatus(provider.statuses, statusId, updates)
+    windowManager.broadcastToAll(IPC_CHANNELS.STATUSES_CHANGED, workspaceId)
+    return status
+  })
+
+  // Delete a status (migrates sessions to 'todo')
+  ipcMain.handle(IPC_CHANNELS.STATUSES_DELETE, async (_event, workspaceId: string, statusId: string) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const provider = await getStorageProvider(workspace)
+    const { deleteStatus } = await import('@craft-agent/shared/statuses')
+    const result = await deleteStatus(provider.statuses, provider.sessions, statusId)
+    windowManager.broadcastToAll(IPC_CHANNELS.STATUSES_CHANGED, workspaceId)
+    return result
+  })
+
+  // Reset statuses to defaults
+  ipcMain.handle(IPC_CHANNELS.STATUSES_RESET, async (_event, workspaceId: string) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const provider = await getStorageProvider(workspace)
+    const { resetToDefaults } = await import('@craft-agent/shared/statuses')
+    await resetToDefaults(provider.statuses, provider.sessions)
+    windowManager.broadcastToAll(IPC_CHANNELS.STATUSES_CHANGED, workspaceId)
+  })
+
+  // Bulk save entire status config (for agent Write-style operations)
+  ipcMain.handle(IPC_CHANNELS.STATUSES_SAVE_CONFIG, async (_event, workspaceId: string, config: import('@craft-agent/shared/statuses').WorkspaceStatusConfig) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const provider = await getStorageProvider(workspace)
+    await provider.statuses.saveStatusConfig(config)
+    windowManager.broadcastToAll(IPC_CHANNELS.STATUSES_CHANGED, workspaceId)
   })
 
   // ============================================================
@@ -2561,12 +2348,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      return provider.labels.listLabels()
-    }
-    const { listLabels } = await import('@craft-agent/shared/labels/storage')
-    return listLabels(workspace.rootPath)
+    const provider = await getStorageProvider(workspace)
+    return provider.labels.listLabels()
   })
 
   // Create a new label in a workspace
@@ -2574,45 +2357,36 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      // Cloud: load config, add label, save back
-      const config = await provider.labels.loadLabelConfig()
-      const newLabel = {
-        id: crypto.randomUUID().slice(0, 8),
-        name: input.name,
-        color: input.color,
-        icon: input.icon,
-        parentId: input.parentId,
-        autoPattern: input.autoPattern,
-        children: [],
-      }
-      if (input.parentId) {
-        // Find parent and add as child
-        const addToParent = (labels: typeof config.labels): boolean => {
-          for (const label of labels) {
-            if (label.id === input.parentId) {
-              if (!label.children) label.children = []
-              label.children.push(newLabel)
-              return true
-            }
-            if (label.children && addToParent(label.children)) return true
-          }
-          return false
-        }
-        addToParent(config.labels)
-      } else {
-        config.labels.push(newLabel)
-      }
-      await provider.labels.saveLabelConfig(config)
-      windowManager.broadcastToAll(IPC_CHANNELS.LABELS_CHANGED, workspaceId)
-      return newLabel
+    const provider = await getStorageProvider(workspace)
+    const config = await provider.labels.loadLabelConfig()
+    const newLabel = {
+      id: crypto.randomUUID().slice(0, 8),
+      name: input.name,
+      color: input.color,
+      icon: input.icon,
+      parentId: input.parentId,
+      autoPattern: input.autoPattern,
+      children: [],
     }
-
-    const { createLabel } = await import('@craft-agent/shared/labels/crud')
-    const label = createLabel(workspace.rootPath, input)
+    if (input.parentId) {
+      const addToParent = (labels: typeof config.labels): boolean => {
+        for (const label of labels) {
+          if (label.id === input.parentId) {
+            if (!label.children) label.children = []
+            label.children.push(newLabel)
+            return true
+          }
+          if (label.children && addToParent(label.children)) return true
+        }
+        return false
+      }
+      addToParent(config.labels)
+    } else {
+      config.labels.push(newLabel)
+    }
+    await provider.labels.saveLabelConfig(config)
     windowManager.broadcastToAll(IPC_CHANNELS.LABELS_CHANGED, workspaceId)
-    return label
+    return newLabel
   })
 
   // Delete a label (and descendants) from a workspace
@@ -2620,33 +2394,25 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
-    const provider = await getCloudProvider(workspace)
-    if (provider) {
-      // Cloud: load config, remove label recursively, save back
-      const config = await provider.labels.loadLabelConfig()
-      let stripped = 0
-      const removeLabel = (labels: typeof config.labels): typeof config.labels => {
-        return labels.filter(label => {
-          if (label.id === labelId) {
-            stripped++
-            return false
-          }
-          if (label.children) {
-            label.children = removeLabel(label.children)
-          }
-          return true
-        })
-      }
-      config.labels = removeLabel(config.labels)
-      await provider.labels.saveLabelConfig(config)
-      windowManager.broadcastToAll(IPC_CHANNELS.LABELS_CHANGED, workspaceId)
-      return { stripped }
+    const provider = await getStorageProvider(workspace)
+    const config = await provider.labels.loadLabelConfig()
+    let stripped = 0
+    const removeLabel = (labels: typeof config.labels): typeof config.labels => {
+      return labels.filter(label => {
+        if (label.id === labelId) {
+          stripped++
+          return false
+        }
+        if (label.children) {
+          label.children = removeLabel(label.children)
+        }
+        return true
+      })
     }
-
-    const { deleteLabel } = await import('@craft-agent/shared/labels/crud')
-    const result = deleteLabel(workspace.rootPath, labelId)
+    config.labels = removeLabel(config.labels)
+    await provider.labels.saveLabelConfig(config)
     windowManager.broadcastToAll(IPC_CHANNELS.LABELS_CHANGED, workspaceId)
-    return result
+    return { stripped }
   })
 
   // List views for a workspace (dynamic expression-based filters stored in views.json)
@@ -2657,7 +2423,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
     if (workspace.storageType === 'cloud') return [] // Views not yet supported in cloud
     const { listViews } = await import('@craft-agent/shared/views/storage')
-    return listViews(workspace.rootPath)
+    return listViews(workspace.rootPath!)
   })
 
   // Save views (replaces full array)
@@ -2667,7 +2433,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
     if (workspace.storageType === 'cloud') return // Views not yet supported in cloud
     const { saveViews } = await import('@craft-agent/shared/views/storage')
-    saveViews(workspace.rootPath, views)
+    saveViews(workspace.rootPath!, views)
     // Broadcast labels changed since views are used alongside labels in sidebar
     windowManager.broadcastToAll(IPC_CHANNELS.LABELS_CHANGED, workspaceId)
   })
@@ -2676,6 +2442,15 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_READ_IMAGE, async (_event, workspaceId: string, relativePath: string) => {
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
+
+    // Cloud workspaces: fetch from R2 via cloud asset storage
+    if (workspace.storageType === 'cloud' || !workspace.rootPath) {
+      const provider = await getStorageProvider(workspace)
+      if (provider?.assets) {
+        return await provider.assets.download(relativePath)
+      }
+      return null
+    }
 
     const { readFileSync, existsSync } = await import('fs')
     const { join, normalize } = await import('path')
@@ -2732,6 +2507,36 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_WRITE_IMAGE, async (_event, workspaceId: string, relativePath: string, base64: string, mimeType: string) => {
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) throw new Error('Workspace not found')
+
+    // Cloud workspaces: upload to R2 via cloud asset storage
+    if (workspace.storageType === 'cloud' || !workspace.rootPath) {
+      const provider = await getStorageProvider(workspace)
+      if (!provider?.assets) throw new Error('Cloud storage not available')
+
+      const buffer = Buffer.from(base64, 'base64')
+      const ext = relativePath.toLowerCase().slice(relativePath.lastIndexOf('.'))
+
+      // For SVGs, upload directly
+      if (mimeType === 'image/svg+xml' || ext === '.svg') {
+        await provider.assets.upload(relativePath, buffer, 'image/svg+xml')
+        return
+      }
+
+      // For raster images, resize to max 256x256 (same as local)
+      const image = nativeImage.createFromBuffer(buffer)
+      const size = image.getSize()
+
+      if (size.width > 256 || size.height > 256) {
+        const ratio = Math.min(256 / size.width, 256 / size.height)
+        const newWidth = Math.round(size.width * ratio)
+        const newHeight = Math.round(size.height * ratio)
+        const resized = image.resize({ width: newWidth, height: newHeight, quality: 'best' })
+        await provider.assets.upload(relativePath, resized.toPNG(), 'image/png')
+      } else {
+        await provider.assets.upload(relativePath, buffer, mimeType)
+      }
+      return
+    }
 
     const { writeFileSync, existsSync, unlinkSync, readdirSync } = await import('fs')
     const { join, normalize, basename } = await import('path')
@@ -2850,19 +2655,40 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // Workspace-level theme overrides
   ipcMain.handle(IPC_CHANNELS.THEME_GET_WORKSPACE_COLOR_THEME, async (_event, workspaceId: string) => {
     const { getWorkspaces } = await import('@craft-agent/shared/config/storage')
-    const { getWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
     const workspaces = getWorkspaces()
     const workspace = workspaces.find(w => w.id === workspaceId)
     if (!workspace) return null
+    // Cloud workspaces: read colorTheme from inline defaults
+    if (workspace.storageType === 'cloud') {
+      return workspace.defaults?.colorTheme ?? null
+    }
+    if (!workspace.rootPath) return null
+    const { getWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
     return getWorkspaceColorTheme(workspace.rootPath) ?? null
   })
 
   ipcMain.handle(IPC_CHANNELS.THEME_SET_WORKSPACE_COLOR_THEME, async (_event, workspaceId: string, themeId: string | null) => {
     const { getWorkspaces } = await import('@craft-agent/shared/config/storage')
-    const { setWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
     const workspaces = getWorkspaces()
     const workspace = workspaces.find(w => w.id === workspaceId)
     if (!workspace) return
+    // Cloud workspaces: store colorTheme in inline defaults via global config
+    if (workspace.storageType === 'cloud') {
+      const globalConfig = loadStoredConfig()
+      if (!globalConfig) return
+      const wsEntry = globalConfig.workspaces.find(w => w.id === workspaceId)
+      if (!wsEntry) return
+      wsEntry.defaults = wsEntry.defaults || {}
+      if (themeId) {
+        wsEntry.defaults.colorTheme = themeId
+      } else {
+        delete wsEntry.defaults.colorTheme
+      }
+      saveConfig(globalConfig)
+      return
+    }
+    if (!workspace.rootPath) return
+    const { setWorkspaceColorTheme } = await import('@craft-agent/shared/workspaces/storage')
     setWorkspaceColorTheme(workspace.rootPath, themeId ?? undefined)
   })
 
@@ -2872,7 +2698,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspaces = getWorkspaces()
     const themes: Record<string, string | undefined> = {}
     for (const ws of workspaces) {
-      themes[ws.id] = getWorkspaceColorTheme(ws.rootPath)
+      if (ws.storageType === 'cloud') {
+        themes[ws.id] = ws.defaults?.colorTheme
+      } else if (ws.rootPath) {
+        themes[ws.id] = getWorkspaceColorTheme(ws.rootPath)
+      }
     }
     return themes
   })
@@ -3016,5 +2846,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Note: Permission mode cycling settings (cyclablePermissionModes) are now workspace-level
   // and managed via WORKSPACE_SETTINGS_GET/UPDATE channels
+
+  // Let plugins register their own IPC handlers
+  for (const plugin of getPlugins()) {
+    plugin.registerIpcHandlers?.({ ipcMain, sessionManager, windowManager })
+  }
 
 }

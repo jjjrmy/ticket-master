@@ -56,8 +56,8 @@ export interface SessionConfig {
   id: string;
   /** SDK session ID (captured after first message) */
   sdkSessionId?: string;
-  /** Workspace root path this session belongs to */
-  workspaceRootPath: string;
+  /** Workspace root path this session belongs to (absent for cloud workspaces) */
+  workspaceRootPath?: string;
   /** Optional user-defined name */
   name?: string;
   createdAt: number;
@@ -130,8 +130,8 @@ export interface SessionHeader {
   id: string;
   /** SDK session ID (captured after first message) */
   sdkSessionId?: string;
-  /** Workspace root path (stored as portable path, e.g., ~/.craft-agent/...) */
-  workspaceRootPath: string;
+  /** Workspace root path (stored as portable path, e.g., ~/.craft-agent/...) (absent for cloud) */
+  workspaceRootPath?: string;
   /** Optional user-defined name */
   name?: string;
   createdAt: number;
@@ -199,7 +199,7 @@ export interface SessionHeader {
  */
 export interface SessionMetadata {
   id: string;
-  workspaceRootPath: string;
+  workspaceRootPath?: string;
   name?: string;
   createdAt: number;
   lastUsedAt: number;

@@ -448,6 +448,100 @@ app.post('/api/sandbox/:workspaceSlug/:sessionId/heartbeat', async (c) => {
 });
 
 // ============================================================
+// Workspace Asset Routes (R2) — workspace-scoped, not session-scoped
+// ============================================================
+
+// Helper to build R2 key for workspace assets: {workspace}/_assets/{path}
+function buildAssetR2Key(workspace: string, path: string): string {
+  return `${workspace}/_assets/${path}`;
+}
+
+// Upload asset
+app.put('/assets/:workspace/*', async (c) => {
+  const workspace = c.req.param('workspace');
+  const path = c.req.param('*');
+  if (!path) return c.json({ error: 'Missing asset path' }, 400);
+
+  const key = buildAssetR2Key(workspace, path);
+  const contentType = c.req.header('Content-Type') || 'application/octet-stream';
+  const body = await c.req.arrayBuffer();
+
+  await c.env.FILES.put(key, body, {
+    httpMetadata: { contentType },
+    customMetadata: { uploadedAt: Date.now().toString() },
+  });
+
+  return c.json({ name: path, size: body.byteLength, mimeType: contentType }, 201);
+});
+
+// Download asset (supports both auth header and signed URLs)
+app.get('/assets/:workspace/*', async (c) => {
+  const workspace = c.req.param('workspace');
+  const path = c.req.param('*');
+  if (!path) return c.json({ error: 'Missing asset path' }, 400);
+
+  // Check for signed URL params
+  const sig = c.req.query('sig');
+  const exp = c.req.query('exp');
+  if (sig && exp) {
+    const signPath = `assets/${workspace}/${path}`;
+    const isValid = await validateSignedUrl(signPath, sig, exp, c.env.API_KEY);
+    if (!isValid) {
+      return c.json({ error: 'Invalid or expired signature' }, 403);
+    }
+  }
+
+  const key = buildAssetR2Key(workspace, path);
+  const object = await c.env.FILES.get(key);
+
+  if (!object) {
+    return c.json({ error: 'Asset not found' }, 404);
+  }
+
+  const headers = new Headers();
+  headers.set('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream');
+  headers.set('Content-Length', object.size.toString());
+  headers.set('Cache-Control', 'private, max-age=3600');
+
+  return new Response(object.body, { headers });
+});
+
+// Delete asset
+app.delete('/assets/:workspace/*', async (c) => {
+  const workspace = c.req.param('workspace');
+  const path = c.req.param('*');
+  if (!path) return c.json({ error: 'Missing asset path' }, 400);
+
+  const key = buildAssetR2Key(workspace, path);
+  await c.env.FILES.delete(key);
+
+  return c.json({ success: true });
+});
+
+// Generate signed URL for an asset
+app.post('/assets/:workspace/sign/*', async (c) => {
+  const workspace = c.req.param('workspace');
+  const path = c.req.param('*');
+  if (!path) return c.json({ error: 'Missing asset path' }, 400);
+
+  const body = await c.req.json<{ expiresIn?: number }>().catch(() => ({} as { expiresIn?: number }));
+  const expiresIn = body.expiresIn || 900;
+
+  const key = buildAssetR2Key(workspace, path);
+  const object = await c.env.FILES.head(key);
+  if (!object) {
+    return c.json({ error: 'Asset not found' }, 404);
+  }
+
+  const signPath = `assets/${workspace}/${path}`;
+  const baseUrl = new URL(c.req.url).origin;
+  const signedUrl = await generateSignedUrl(baseUrl, signPath, c.env.API_KEY, expiresIn);
+  const expiresAt = Date.now() + expiresIn * 1000;
+
+  return c.json({ url: signedUrl, expiresAt });
+});
+
+// ============================================================
 // Workspace Routes (Durable Object)
 // ============================================================
 

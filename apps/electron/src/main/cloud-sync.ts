@@ -107,6 +107,9 @@ export class CloudSyncManager {
       }
     }
 
+    // Auto-download URL icons for source/status updates and upload to R2
+    this.handleIconDownloads(workspaceId, event)
+
     // Then broadcast to renderer
     if (!this.windowManager) return
 
@@ -118,6 +121,53 @@ export class CloudSyncManager {
 
     ipcLog.info(`Cloud remote change: ${event.entity} ${event.action} in ${workspaceId}`)
     this.windowManager.broadcastToAll(IPC_CHANNELS.CLOUD_SYNC_EVENT, syncEvent)
+  }
+
+  /**
+   * Check change events for URL icons that need to be downloaded
+   * and uploaded to R2. Fire-and-forget — doesn't block the sync event.
+   *
+   * Public so it can be called after local saves too (the DO broadcast
+   * skips the sender, so remote events alone won't cover the sender's own changes).
+   */
+  handleIconDownloads(workspaceId: string, event: RemoteChangeEvent): void {
+    const provider = this.providers.get(workspaceId)
+    if (!provider?.assets) return
+
+    const doDownload = async () => {
+      const { isIconUrl } = await import('@craft-agent/shared/utils/icon-constants')
+      const { downloadIconToStorage } = await import('@craft-agent/shared/utils/icon')
+
+      if (event.entity === 'source' && (event.action === 'created' || event.action === 'updated')) {
+        const source = event.data
+        if (source.icon && isIconUrl(source.icon)) {
+          await downloadIconToStorage(
+            source.icon,
+            `sources/${source.slug}/icon.svg`,
+            provider.assets,
+            `CloudSync:source:${source.slug}`
+          )
+        }
+      }
+
+      if (event.entity === 'statuses' && event.action === 'updated') {
+        const statusConfig = event.data
+        for (const status of statusConfig.statuses) {
+          if (status.icon && isIconUrl(status.icon)) {
+            await downloadIconToStorage(
+              status.icon,
+              `statuses/icons/${status.id}.svg`,
+              provider.assets,
+              `CloudSync:status:${status.id}`
+            )
+          }
+        }
+      }
+    }
+
+    doDownload().catch(err => {
+      ipcLog.error(`Failed to download icons for ${event.entity} in ${workspaceId}:`, err)
+    })
   }
 
   /**

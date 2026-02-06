@@ -268,6 +268,16 @@ const api: ElectronAPI = {
   // Status management
   listStatuses: (workspaceId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.STATUSES_LIST, workspaceId),
+  createStatus: (workspaceId: string, input: import('@craft-agent/shared/statuses').CreateStatusInput) =>
+    ipcRenderer.invoke(IPC_CHANNELS.STATUSES_CREATE, workspaceId, input),
+  updateStatus: (workspaceId: string, statusId: string, updates: import('@craft-agent/shared/statuses').UpdateStatusInput) =>
+    ipcRenderer.invoke(IPC_CHANNELS.STATUSES_UPDATE, workspaceId, statusId, updates),
+  deleteStatus: (workspaceId: string, statusId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.STATUSES_DELETE, workspaceId, statusId),
+  resetStatuses: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.STATUSES_RESET, workspaceId),
+  saveStatusConfig: (workspaceId: string, config: import('@craft-agent/shared/statuses').WorkspaceStatusConfig) =>
+    ipcRenderer.invoke(IPC_CHANNELS.STATUSES_SAVE_CONFIG, workspaceId, config),
   reorderStatuses: (workspaceId: string, orderedIds: string[]) =>
     ipcRenderer.invoke(IPC_CHANNELS.STATUSES_REORDER, workspaceId, orderedIds),
 

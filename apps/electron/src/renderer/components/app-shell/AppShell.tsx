@@ -79,14 +79,15 @@ import { useFocusContext } from "@/context/FocusContext"
 import { getSessionTitle } from "@/utils/session"
 import { useSetAtom } from "jotai"
 import type { Session, Workspace, FileAttachment, PermissionRequest, LoadedSource, LoadedSkill, PermissionMode, SourceFilter } from "../../../shared/types"
-import { sessionMetaMapAtom, type SessionMeta } from "@/atoms/sessions"
+import { sessionMetaMapAtom, sessionsLoadingAtom, type SessionMeta } from "@/atoms/sessions"
 import { sourcesAtom } from "@/atoms/sources"
 import { skillsAtom } from "@/atoms/skills"
 import { type TodoStateId, type TodoState, statusConfigsToTodoStates } from "@/config/todo-states"
 import { useStatuses } from "@/hooks/useStatuses"
 import { useLabels } from "@/hooks/useLabels"
-import { useCloudSync } from "@/hooks/useCloudSync"
-import { useSandboxStatus } from "@/hooks/useSandboxStatus"
+import { CloudPluginProvider } from "@/cloud-plugin"
+import { useCloudSync } from "@/cloud-plugin/useCloudSync"
+import { useSandboxStatus } from "@/cloud-plugin/useSandboxStatus"
 import { useViews } from "@/hooks/useViews"
 import { LabelIcon, LabelValueTypeIcon } from "@/components/ui/label-icon"
 import { filterItems as filterLabelMenuItems, filterStates as filterLabelMenuStates, type LabelMenuItem } from "@/components/ui/label-menu"
@@ -898,7 +899,6 @@ function AppShellContent({
   useCloudSync({ workspaceId: activeWorkspaceId })
 
   // Sandbox status: track active cloud sandboxes for this workspace
-  // Check for cloudConfig which is what the sandbox API actually requires
   const { sandboxStatuses, terminateSandbox } = useSandboxStatus({
     workspaceId: activeWorkspaceId,
     isCloudWorkspace: !!(activeWorkspace?.storageType === 'cloud' || activeWorkspace?.cloudConfig),
@@ -1157,6 +1157,7 @@ function AppShellContent({
   // Use session metadata from Jotai atom (lightweight, no messages)
   // This prevents closures from retaining full message arrays
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
+  const sessionsLoading = useAtomValue(sessionsLoadingAtom)
 
   // Reload skills when active session's workingDirectory changes (for project-level skills)
   // Skills are loaded from: global (~/.agents/skills/), workspace, and project ({workingDirectory}/.agents/skills/)
@@ -1938,6 +1939,7 @@ function AppShellContent({
   }, [chatFilter, labelCounts, activeWorkspace?.id, handleLabelClick, isExpanded, toggleExpanded, openConfigureLabels, handleAddLabel, handleDeleteLabel])
 
   return (
+    <CloudPluginProvider activeWorkspace={activeWorkspace ?? null}>
     <AppShellProvider value={appShellContextValue}>
       <TooltipProvider delayDuration={0}>
         {/*
@@ -2852,7 +2854,7 @@ function AppShellContent({
                       }
                       {...getEditConfig(
                         sourceFilter?.kind === 'type' ? `add-source-${sourceFilter.sourceType}` as EditContextKey : 'add-source',
-                        activeWorkspace.rootPath
+                        activeWorkspace.rootPath!
                       )}
                     />
                   )}
@@ -2866,7 +2868,7 @@ function AppShellContent({
                           data-tutorial="add-skill-button"
                         />
                       }
-                      {...getEditConfig('add-skill', activeWorkspace.rootPath)}
+                      {...getEditConfig('add-skill', activeWorkspace.rootPath!)}
                     />
                   )}
                 </>
@@ -2961,6 +2963,7 @@ function AppShellContent({
                   labelFilterMap={labelFilter}
                   sandboxStatuses={sandboxStatuses}
                   onTerminateSandbox={terminateSandbox}
+                  isLoading={sessionsLoading}
                 />
               </>
             )}
@@ -3121,9 +3124,9 @@ function AppShellContent({
             align="start"
             secondaryAction={{
               label: 'Edit File',
-              filePath: `${activeWorkspace.rootPath}/statuses/config.json`,
+              filePath: `${activeWorkspace.rootPath!}/statuses/config.json`,
             }}
-            {...getEditConfig('edit-statuses', activeWorkspace.rootPath)}
+            {...getEditConfig('edit-statuses', activeWorkspace.rootPath!)}
           />
           {/* Configure Labels EditPopover - anchored near sidebar */}
           <EditPopover
@@ -3141,11 +3144,11 @@ function AppShellContent({
             align="start"
             secondaryAction={{
               label: 'Edit File',
-              filePath: `${activeWorkspace.rootPath}/labels/config.json`,
+              filePath: `${activeWorkspace.rootPath!}/labels/config.json`,
             }}
             {...(() => {
               // Spread base config, override context to include which label was right-clicked
-              const config = getEditConfig('edit-labels', activeWorkspace.rootPath)
+              const config = getEditConfig('edit-labels', activeWorkspace.rootPath!)
               const targetLabel = editLabelTargetId.current
                 ? findLabelById(labelConfigs, editLabelTargetId.current)
                 : undefined
@@ -3177,9 +3180,9 @@ function AppShellContent({
             align="start"
             secondaryAction={{
               label: 'Edit File',
-              filePath: `${activeWorkspace.rootPath}/views.json`,
+              filePath: `${activeWorkspace.rootPath!}/views.json`,
             }}
-            {...getEditConfig('edit-views', activeWorkspace.rootPath)}
+            {...getEditConfig('edit-views', activeWorkspace.rootPath!)}
           />
           {/* Add Source EditPopovers - one for each variant (generic + filter-specific)
            * editPopoverOpen can be: 'add-source', 'add-source-api', 'add-source-mcp', 'add-source-local'
@@ -3199,7 +3202,7 @@ function AppShellContent({
               }
               side="bottom"
               align="start"
-              {...getEditConfig(variant, activeWorkspace.rootPath)}
+              {...getEditConfig(variant, activeWorkspace.rootPath!)}
             />
           ))}
           {/* Add Skill EditPopover */}
@@ -3216,7 +3219,7 @@ function AppShellContent({
             }
             side="bottom"
             align="start"
-            {...getEditConfig('add-skill', activeWorkspace.rootPath)}
+            {...getEditConfig('add-skill', activeWorkspace.rootPath!)}
           />
           {/* Add Label EditPopover - triggered from "Add New Label" context menu on labels */}
           <EditPopover
@@ -3234,11 +3237,11 @@ function AppShellContent({
             align="start"
             secondaryAction={{
               label: 'Edit File',
-              filePath: `${activeWorkspace.rootPath}/labels/config.json`,
+              filePath: `${activeWorkspace.rootPath!}/labels/config.json`,
             }}
             {...(() => {
               // Spread base config, override context to include which label was right-clicked
-              const config = getEditConfig('add-label', activeWorkspace.rootPath)
+              const config = getEditConfig('add-label', activeWorkspace.rootPath!)
               const targetLabel = editLabelTargetId.current
                 ? findLabelById(labelConfigs, editLabelTargetId.current)
                 : undefined
@@ -3259,5 +3262,6 @@ function AppShellContent({
 
       </TooltipProvider>
     </AppShellProvider>
+    </CloudPluginProvider>
   )
 }

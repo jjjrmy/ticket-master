@@ -829,6 +829,8 @@ interface SessionListProps {
   sandboxStatuses?: Map<string, SandboxStatus>
   /** Callback to terminate a sandbox */
   onTerminateSandbox?: (sessionId: string) => Promise<boolean>
+  /** Whether sessions are still being loaded (e.g., from cloud API) */
+  isLoading?: boolean
 }
 
 // Re-export TodoStateId for use by parent components
@@ -870,6 +872,7 @@ export function SessionList({
   labelFilterMap,
   sandboxStatuses,
   onTerminateSandbox,
+  isLoading,
 }: SessionListProps) {
   const [session] = useSession()
   const { navigate } = useNavigation()
@@ -1286,6 +1289,15 @@ export function SessionList({
       getContainerProps().onKeyDown(e)
       return
     }
+  }
+
+  // Loading state - show spinner while sessions are being fetched (e.g., from cloud API)
+  if (isLoading && flatItems.length === 0 && !searchActive) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <Spinner className="text-foreground/30" />
+      </div>
+    )
   }
 
   // Empty state - render outside ScrollArea for proper vertical centering

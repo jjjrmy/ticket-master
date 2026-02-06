@@ -44,5 +44,8 @@ export function createStorageProvider(options: CreateStorageProviderOptions): IS
   }
 
   // Default: local filesystem storage
+  if (!workspace.rootPath) {
+    throw new Error(`Local workspace "${workspace.name}" is missing rootPath`);
+  }
   return new LocalStorageProvider(workspace.id, workspace.rootPath);
 }

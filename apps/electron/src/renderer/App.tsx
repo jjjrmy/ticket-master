@@ -37,6 +37,7 @@ import {
   sessionIdsAtom,
   backgroundTasksAtomFamily,
   extractSessionMeta,
+  sessionsLoadingAtom,
   type SessionMeta,
 } from '@/atoms/sessions'
 import { sourcesAtom } from '@/atoms/sources'
@@ -158,6 +159,7 @@ export default function App() {
   // - sessionMetaMapAtom for lightweight listing
   // - sessionAtomFamily(id) for individual session data
   const initializeSessions = useSetAtom(initializeSessionsAtom)
+  const setSessionsLoading = useSetAtom(sessionsLoadingAtom)
   const addSession = useSetAtom(addSessionAtom)
   const removeSession = useSetAtom(removeSessionAtom)
   const updateSessionDirect = useSetAtom(updateSessionAtom)
@@ -366,6 +368,7 @@ export default function App() {
 
     window.electronAPI.getWorkspaces().then(setWorkspaces)
     window.electronAPI.getNotificationsEnabled().then(setNotificationsEnabled)
+    setSessionsLoading(true)
     window.electronAPI.getSessions().then((loadedSessions) => {
       // Initialize per-session atoms and metadata map
       // NOTE: No sessionsAtom used - sessions are only in per-session atoms
@@ -385,8 +388,9 @@ export default function App() {
         }
       }
       setSessionOptions(optionsMap)
-      // Mark sessions as loaded for splash screen
+      // Mark sessions as loaded for splash screen and session list
       setSessionsLoaded(true)
+      setSessionsLoading(false)
 
       // If window was opened with a specific session (via "Open in New Window"), select it
       if (initialSessionId && windowWorkspaceId) {
@@ -1182,10 +1186,12 @@ export default function App() {
       store.set(sourcesAtom, [])
       store.set(skillsAtom, [])
 
-      // 9. Clear session atoms BEFORE navigating
+      // 9. Clear session atoms BEFORE navigating and mark as loading
       // This prevents applyNavigationState from auto-selecting a session from the old workspace.
       // Without this, getFirstSessionId() would return a session ID from the previous workspace,
       // causing the detail panel to show a stale chat until sessions reload.
+      // Setting sessionsLoadingAtom prevents the empty state from flashing while cloud sessions load.
+      store.set(sessionsLoadingAtom, true)
       store.set(sessionMetaMapAtom, new Map())
       store.set(sessionIdsAtom, [])
 

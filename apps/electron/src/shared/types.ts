@@ -681,6 +681,11 @@ export const IPC_CHANNELS = {
 
   // Status management (workspace-scoped)
   STATUSES_LIST: 'statuses:list',
+  STATUSES_CREATE: 'statuses:create',
+  STATUSES_UPDATE: 'statuses:update',
+  STATUSES_DELETE: 'statuses:delete',
+  STATUSES_RESET: 'statuses:reset',
+  STATUSES_SAVE_CONFIG: 'statuses:saveConfig',  // Bulk save entire config
   STATUSES_REORDER: 'statuses:reorder',  // Reorder statuses (drag-and-drop)
   STATUSES_CHANGED: 'statuses:changed',  // Broadcast event
 
@@ -1047,6 +1052,11 @@ export interface ElectronAPI {
 
   // Statuses (workspace-scoped)
   listStatuses(workspaceId: string): Promise<import('@craft-agent/shared/statuses').StatusConfig[]>
+  createStatus(workspaceId: string, input: import('@craft-agent/shared/statuses').CreateStatusInput): Promise<import('@craft-agent/shared/statuses').StatusConfig>
+  updateStatus(workspaceId: string, statusId: string, updates: import('@craft-agent/shared/statuses').UpdateStatusInput): Promise<import('@craft-agent/shared/statuses').StatusConfig>
+  deleteStatus(workspaceId: string, statusId: string): Promise<{ migrated: number }>
+  resetStatuses(workspaceId: string): Promise<void>
+  saveStatusConfig(workspaceId: string, config: import('@craft-agent/shared/statuses').WorkspaceStatusConfig): Promise<void>
   reorderStatuses(workspaceId: string, orderedIds: string[]): Promise<void>
   // Statuses change listener (live updates when statuses config or icon files change)
   onStatusesChanged(callback: (workspaceId: string) => void): () => void

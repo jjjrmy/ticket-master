@@ -3,7 +3,7 @@
 import { loadShellEnv } from './shell-env'
 loadShellEnv()
 
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
 import { createHash } from 'crypto'
 import { hostname, homedir } from 'os'
 import * as Sentry from '@sentry/electron/main'
@@ -320,21 +320,23 @@ app.whenReady().then(async () => {
     sessionManager = new SessionManager()
     sessionManager.setWindowManager(windowManager)
 
-    // Initialize cloud sync manager (for cloud workspace real-time sync)
-    const { getCloudSyncManager } = await import('./cloud-sync')
-    const cloudSyncManager = getCloudSyncManager()
-    cloudSyncManager.setWindowManager(windowManager)
-
-    // Wire up session change handler so SessionManager updates before renderer refetches
-    cloudSyncManager.setSessionChangeHandler((workspaceId, event) =>
-      sessionManager!.handleRemoteSessionChange(workspaceId, event)
-    )
+    // Register cloud plugin (extends app with cloud sync, sandbox, and cloud storage)
+    const { registerPlugin } = await import('./plugins')
+    const { cloudPlugin } = await import('./cloud-plugin')
+    registerPlugin(cloudPlugin)
 
     // Initialize notification service
     initNotificationService(windowManager)
 
     // Register IPC handlers (must happen before window creation)
+    // Note: Plugin IPC handlers are registered at the end of registerIpcHandlers()
     registerIpcHandlers(sessionManager, windowManager)
+
+    // Run plugin onAppReady lifecycle (cloud sync init, etc.)
+    const { getPlugins } = await import('./plugins')
+    for (const plugin of getPlugins()) {
+      await plugin.onAppReady?.({ ipcMain, sessionManager, windowManager })
+    }
 
     // Create initial windows (restores from saved state or opens first workspace)
     await createInitialWindows()
@@ -448,11 +450,13 @@ app.on('before-quit', async (event) => {
     // Clean up SessionManager resources (file watchers, timers, etc.)
     sessionManager.cleanup()
 
-    // Disconnect all cloud sync providers
+    // Run plugin onAppQuit lifecycle (disconnect cloud sync, etc.)
     try {
-      const { getCloudSyncManager } = await import('./cloud-sync')
-      await getCloudSyncManager().disposeAll()
-      mainLog.info('Disconnected cloud sync providers')
+      const { getPlugins } = await import('./plugins')
+      for (const plugin of getPlugins()) {
+        await plugin.onAppQuit?.()
+      }
+      mainLog.info('Plugins cleaned up')
     } catch { /* ignore cleanup errors */ }
 
     // If update is in progress, let electron-updater handle the quit flow

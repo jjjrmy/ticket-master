@@ -13,6 +13,7 @@ import type {
   ILabelStorage,
   ISkillStorage,
   IFileStorage,
+  IAssetStorage,
   RemoteChangeEvent,
 } from '../types.ts';
 import type { CloudConnectionState } from '@craft-agent/core/types/cloud';
@@ -24,6 +25,7 @@ import { CloudStatusStorage } from './statuses.ts';
 import { CloudLabelStorage } from './labels.ts';
 import { CloudSkillStorage } from './skills.ts';
 import { CloudFileStorage } from './files.ts';
+import { CloudAssetStorage } from './assets.ts';
 
 export interface CloudStorageProviderConfig {
   remoteUrl: string;
@@ -41,6 +43,7 @@ export class CloudStorageProvider implements IStorageProvider {
   labels: ILabelStorage;
   skills: ISkillStorage;
   files: IFileStorage;
+  assets: IAssetStorage;
 
   private connection: CloudConnection;
 
@@ -54,6 +57,7 @@ export class CloudStorageProvider implements IStorageProvider {
     this.labels = new CloudLabelStorage(this.connection);
     this.skills = new CloudSkillStorage(this.connection);
     this.files = new CloudFileStorage(config.remoteUrl, config.workspaceSlug, config.apiKey);
+    this.assets = new CloudAssetStorage(config.remoteUrl, config.workspaceSlug, config.apiKey);
   }
 
   async initialize(): Promise<void> {

@@ -18,7 +18,7 @@ export type WorkspaceStorageType = 'local' | 'cloud';
 export interface Workspace {
   id: string;
   name: string;            // Read from workspace folder config (not stored in global config)
-  rootPath: string;        // Absolute path to workspace folder (also used for local config cache in cloud mode)
+  rootPath?: string;       // Absolute path to workspace folder (required for local workspaces, absent for cloud)
   createdAt: number;
   lastAccessedAt?: number; // For sorting recent workspaces
   iconUrl?: string;
@@ -27,6 +27,20 @@ export interface Workspace {
 
   /** Storage backend type. Defaults to 'local' if not set. */
   storageType?: WorkspaceStorageType;
+
+  /**
+   * Inline workspace defaults (used by cloud workspaces where there's no local config.json).
+   * For local workspaces, these settings live in {rootPath}/config.json instead.
+   */
+  defaults?: {
+    model?: string;
+    enabledSourceSlugs?: string[];
+    permissionMode?: string;
+    cyclablePermissionModes?: string[];
+    workingDirectory?: string;
+    thinkingLevel?: string;
+    colorTheme?: string;
+  };
 
   /**
    * Cloud workspace configuration (only present when storageType is 'cloud').

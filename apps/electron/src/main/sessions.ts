@@ -49,7 +49,8 @@ import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skill
 import type { ToolDisplayMeta } from '@craft-agent/core/types'
 import { DEFAULT_MODEL, getToolIconsDir } from '@craft-agent/shared/config'
 import { SandboxClient, type SandboxEvent, type SandboxAttachment } from './sandbox-client'
-import type { CloudStorageProvider, RemoteChangeEvent } from '@craft-agent/shared/storage'
+import type { CloudStorageProvider, RemoteChangeEvent, IStorageProvider } from '@craft-agent/shared/storage'
+import { resolvePluginStorage } from './plugins'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
 import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
 import { listLabels } from '@craft-agent/shared/labels/storage'
@@ -167,7 +168,7 @@ interface McpTokenRefreshResult {
 async function refreshMcpOAuthTokensIfNeeded(
   agent: CraftAgent,
   sources: LoadedSource[],
-  sessionPath: string,
+  sessionPath: string | undefined,
   tokenRefreshManager: TokenRefreshManager
 ): Promise<McpTokenRefreshResult> {
   sessionLog.debug('[OAuth] Checking if any MCP OAuth tokens need refresh')
@@ -774,7 +775,7 @@ export class SessionManager {
   private async reloadSessionSources(managed: ManagedSession): Promise<void> {
     if (!managed.agent) return  // No agent = nothing to update (fresh build on next message)
 
-    const workspaceRootPath = managed.workspace.rootPath
+    const workspaceRootPath = managed.workspace.rootPath!
     sessionLog.info(`Reloading sources for session ${managed.id}`)
 
     // Reload all sources (from cloud for cloud workspaces, from disk for local)
@@ -983,7 +984,7 @@ export class SessionManager {
       }
     } else {
       // Local workspace: read from disk
-      const workspaceRootPath = workspace.rootPath
+      const workspaceRootPath = workspace.rootPath!
       const sessionMetadata = listStoredSessions(workspaceRootPath)
       // Load workspace config once per workspace for default working directory
       const wsConfig = loadWorkspaceConfig(workspaceRootPath)
@@ -1094,7 +1095,7 @@ export class SessionManager {
           }
         } else {
           // Local workspace: read from disk
-          const workspaceRootPath = workspace.rootPath
+          const workspaceRootPath = workspace.rootPath!
           const sessionMetadata = listStoredSessions(workspaceRootPath)
           // Load workspace config once per workspace for default working directory
           const wsConfig = loadWorkspaceConfig(workspaceRootPath)
@@ -1219,12 +1220,23 @@ export class SessionManager {
   private async getCloudProvider(workspace: Workspace): Promise<CloudStorageProvider | null> {
     if (!this.isCloudWorkspace(workspace)) return null
     try {
-      const { getCloudSyncManager } = await import('./cloud-sync')
-      return await getCloudSyncManager().getProvider(workspace)
+      const provider = await resolvePluginStorage(workspace)
+      return provider as CloudStorageProvider | null
     } catch (err) {
-      sessionLog.error(`Failed to get cloud provider for workspace "${workspace.name}":`, err)
+      sessionLog.error(`Failed to get cloud provider for workspace "${workspace.name}":`, err instanceof Error ? err.message : err)
       return null
     }
+  }
+
+  /** Get the storage provider for a workspace (cloud or local) */
+  private async getStorageProvider(workspace: Workspace): Promise<IStorageProvider> {
+    const pluginProvider = await resolvePluginStorage(workspace)
+    if (pluginProvider) return pluginProvider
+    if (!workspace.rootPath) {
+      throw new Error(`Local storage provider requires rootPath (workspace: ${workspace.id})`)
+    }
+    const { LocalStorageProvider } = await import('@craft-agent/shared/storage')
+    return new LocalStorageProvider(workspace.id, workspace.rootPath)
   }
 
   /** Update session metadata via cloud provider (for cloud workspaces) */
@@ -1245,33 +1257,27 @@ export class SessionManager {
 
   /** Load all sources for a workspace (cloud or local), including built-ins */
   private async resolveAllSources(workspace: Workspace): Promise<LoadedSource[]> {
-    const provider = await this.getCloudProvider(workspace)
-    if (provider) return provider.sources.loadWorkspaceSources()
-    return loadAllSources(workspace.rootPath)
+    const provider = await this.getStorageProvider(workspace)
+    return provider.sources.loadWorkspaceSources()
   }
 
   /** Load specific sources by slugs for a workspace (cloud or local) */
   private async resolveSourcesBySlugs(workspace: Workspace, slugs: string[]): Promise<LoadedSource[]> {
-    const provider = await this.getCloudProvider(workspace)
-    if (provider) {
-      const allSources = await provider.sources.loadWorkspaceSources()
-      return allSources.filter(s => slugs.includes(s.config.slug))
-    }
-    return getSourcesBySlugs(workspace.rootPath, slugs)
+    const provider = await this.getStorageProvider(workspace)
+    const allSources = await provider.sources.loadWorkspaceSources()
+    return allSources.filter(s => slugs.includes(s.config.slug))
   }
 
   /** Load workspace sources list (cloud or local), not including built-ins */
   private async resolveWorkspaceSources(workspace: Workspace): Promise<LoadedSource[]> {
-    const provider = await this.getCloudProvider(workspace)
-    if (provider) return provider.sources.loadWorkspaceSources()
-    return loadWorkspaceSources(workspace.rootPath)
+    const provider = await this.getStorageProvider(workspace)
+    return provider.sources.loadWorkspaceSources()
   }
 
   /** Load labels for a workspace (cloud or local) */
   private async resolveLabels(workspace: Workspace): Promise<import('@craft-agent/shared/labels').LabelConfig[]> {
-    const provider = await this.getCloudProvider(workspace)
-    if (provider) return provider.labels.listLabels()
-    return listLabels(workspace.rootPath)
+    const provider = await this.getStorageProvider(workspace)
+    return provider.labels.listLabels()
   }
 
   // Flush a specific session immediately (call on session close/switch)
@@ -1604,7 +1610,7 @@ export class SessionManager {
       // Store credentials using existing workspace ID extraction pattern
       const credManager = getCredentialManager()
       // Extract workspace ID from root path (last segment of path)
-      const wsId = managed.workspace.rootPath.split('/').pop() || managed.workspace.id
+      const wsId = managed.workspace.rootPath!.split('/').pop() || managed.workspace.id
 
       if (request.mode === 'basic') {
         // Store value as JSON string {username, password} - credential-manager.ts parses it for basic auth
@@ -1633,7 +1639,7 @@ export class SessionManager {
 
       // Update source config to mark as authenticated
       const { markSourceAuthenticated } = await import('@craft-agent/shared/sources')
-      markSourceAuthenticated(managed.workspace.rootPath, request.sourceSlug)
+      markSourceAuthenticated(managed.workspace.rootPath!, request.sourceSlug)
 
       // Mark source as unseen so fresh guide is injected on next message
       if (managed.agent) {
@@ -1741,7 +1747,7 @@ export class SessionManager {
       hasUnread: m.hasUnread,  // Explicit unread flag for NEW badge state machine
       workingDirectory: m.workingDirectory,
       model: m.model,
-      sessionFolderPath: getSessionStoragePath(m.workspace.rootPath, m.id),
+      sessionFolderPath: getSessionStoragePath(m.workspace.rootPath!, m.id),
       enabledSourceSlugs: m.enabledSourceSlugs,
       labels: m.labels,
       sharedUrl: m.sharedUrl,
@@ -1798,7 +1804,7 @@ export class SessionManager {
       }
     } else {
       // Local workspace: read from disk
-      storedSession = loadStoredSession(managed.workspace.rootPath, managed.id)
+      storedSession = loadStoredSession(managed.workspace.rootPath!, managed.id)
     }
 
     if (storedSession) {
@@ -1826,7 +1832,7 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (!managed) return null
     if (this.isCloudWorkspace(managed.workspace)) return null
-    return getSessionStoragePath(managed.workspace.rootPath, sessionId)
+    return getSessionStoragePath(managed.workspace.rootPath!, sessionId)
   }
 
   async createSession(workspaceId: string, options?: import('../shared/types').CreateSessionOptions): Promise<Session> {
@@ -1837,7 +1843,7 @@ export class SessionManager {
 
     // Get new session defaults from workspace config (with global fallback)
     // Options.permissionMode overrides the workspace default (used by EditPopover for auto-execute)
-    const workspaceRootPath = workspace.rootPath
+    const workspaceRootPath = workspace.rootPath!
     const wsConfig = loadWorkspaceConfig(workspaceRootPath)
     const globalDefaults = loadConfigDefaults()
 
@@ -1962,8 +1968,13 @@ export class SessionManager {
     if (!managed.agent) {
       const end = perf.start('agent.create', { sessionId: managed.id })
       const config = loadStoredConfig()
+      // Resolve storage provider for cloud-aware tools (status CRUD, config validation)
+      const storageProvider = await this.getStorageProvider(managed.workspace)
+
       managed.agent = new CraftAgent({
         workspace: managed.workspace,
+        // Storage provider enables cloud-aware session-scoped tools
+        storageProvider,
         // Session model takes priority, fallback to global config, then resolve with customModel override
         model: resolveModelId(managed.model || config?.model || DEFAULT_MODEL),
         // Initialize thinking level at construction to avoid race conditions
@@ -2162,7 +2173,7 @@ export class SessionManager {
       managed.agent.onSourceActivationRequest = async (sourceSlug: string): Promise<boolean> => {
         sessionLog.info(`Source activation request for session ${managed.id}:`, sourceSlug)
 
-        const workspaceRootPath = managed.workspace.rootPath
+        const workspaceRootPath = managed.workspace.rootPath!
 
         // Check if source is already enabled
         if (managed.enabledSourceSlugs?.includes(sourceSlug)) {
@@ -2853,7 +2864,7 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (managed) {
       if (this.isCloudWorkspace(managed.workspace)) return // Plan execution state is local-only for now
-      await setStoredPendingPlanExecution(managed.workspace.rootPath, sessionId, planPath)
+      await setStoredPendingPlanExecution(managed.workspace.rootPath!, sessionId, planPath)
       sessionLog.info(`Session ${sessionId}: set pending plan execution for ${planPath}`)
     }
   }
@@ -2867,7 +2878,7 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (managed) {
       if (this.isCloudWorkspace(managed.workspace)) return
-      await markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
+      await markStoredCompactionComplete(managed.workspace.rootPath!, sessionId)
       sessionLog.info(`Session ${sessionId}: compaction marked complete for pending plan`)
     }
   }
@@ -2881,7 +2892,7 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (managed) {
       if (this.isCloudWorkspace(managed.workspace)) return
-      await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+      await clearStoredPendingPlanExecution(managed.workspace.rootPath!, sessionId)
       sessionLog.info(`Session ${sessionId}: cleared pending plan execution`)
     }
   }
@@ -2894,7 +2905,7 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (!managed) return null
     if (this.isCloudWorkspace(managed.workspace)) return null
-    return getStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+    return getStoredPendingPlanExecution(managed.workspace.rootPath!, sessionId)
   }
 
   // ============================================
@@ -2922,7 +2933,7 @@ export class SessionManager {
         const provider = await this.getCloudProvider(managed.workspace)
         if (provider) storedSession = await provider.sessions.loadSession(sessionId)
       } else {
-        storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
+        storedSession = loadStoredSession(managed.workspace.rootPath!, sessionId)
       }
       if (!storedSession) {
         return { success: false, error: 'Session file not found' }
@@ -2952,7 +2963,7 @@ export class SessionManager {
       if (this.isCloudWorkspace(managed.workspace)) {
         await this.cloudUpdateMetadata(managed.workspace, sessionId, shareUpdates)
       } else {
-        await updateSessionMetadata(managed.workspace.rootPath, sessionId, shareUpdates)
+        await updateSessionMetadata(managed.workspace.rootPath!, sessionId, shareUpdates)
       }
 
       sessionLog.info(`Session ${sessionId} shared at ${data.url}`)
@@ -2993,7 +3004,7 @@ export class SessionManager {
         const provider = await this.getCloudProvider(managed.workspace)
         if (provider) storedSession = await provider.sessions.loadSession(sessionId)
       } else {
-        storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
+        storedSession = loadStoredSession(managed.workspace.rootPath!, sessionId)
       }
       if (!storedSession) {
         return { success: false, error: 'Session file not found' }
@@ -3062,7 +3073,7 @@ export class SessionManager {
       if (this.isCloudWorkspace(managed.workspace)) {
         await this.cloudUpdateMetadata(managed.workspace, sessionId, revokeUpdates)
       } else {
-        await updateSessionMetadata(managed.workspace.rootPath, sessionId, revokeUpdates)
+        await updateSessionMetadata(managed.workspace.rootPath!, sessionId, revokeUpdates)
       }
 
       sessionLog.info(`Session ${sessionId} share revoked`)
@@ -3094,7 +3105,7 @@ export class SessionManager {
       throw new Error(`Session not found: ${sessionId}`)
     }
 
-    const workspaceRootPath = managed.workspace.rootPath
+    const workspaceRootPath = managed.workspace.rootPath!
     sessionLog.info(`Setting sources for session ${sessionId}:`, sourceSlugs)
 
     // Store the selection
@@ -3229,7 +3240,7 @@ export class SessionManager {
       if (this.isCloudWorkspace(managed.workspace)) {
         await this.cloudUpdateMetadata(managed.workspace, sessionId, updates)
       } else {
-        await updateSessionMetadata(managed.workspace.rootPath, sessionId, updates)
+        await updateSessionMetadata(managed.workspace.rootPath!, sessionId, updates)
       }
     }
   }
@@ -3247,7 +3258,7 @@ export class SessionManager {
       if (this.isCloudWorkspace(managed.workspace)) {
         await this.cloudUpdateMetadata(managed.workspace, sessionId, metaUpdates)
       } else {
-        await updateSessionMetadata(managed.workspace.rootPath, sessionId, metaUpdates)
+        await updateSessionMetadata(managed.workspace.rootPath!, sessionId, metaUpdates)
       }
     }
   }
@@ -3357,12 +3368,12 @@ export class SessionManager {
       if (this.isCloudWorkspace(managed.workspace)) {
         await this.cloudUpdateMetadata(managed.workspace, sessionId, { model: model ?? undefined })
       } else {
-        await updateSessionMetadata(managed.workspace.rootPath, sessionId, { model: model ?? undefined })
+        await updateSessionMetadata(managed.workspace.rootPath!, sessionId, { model: model ?? undefined })
       }
       // Update agent model if it already exists (takes effect on next query)
       if (managed.agent) {
         // Fallback chain: session model > workspace default > global config > DEFAULT_MODEL
-        const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+        const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath!)
         const effectiveModel = model ?? wsConfig?.defaults?.model ?? loadStoredConfig()?.model ?? DEFAULT_MODEL
         const resolvedModel = resolveModelId(effectiveModel)
         managed.agent.setModel(resolvedModel)
@@ -3405,7 +3416,7 @@ export class SessionManager {
     }
 
     // Get workspace slug before deleting
-    const workspaceRootPath = managed.workspace.rootPath
+    const workspaceRootPath = managed.workspace.rootPath!
 
     // If processing is in progress, force-abort via Query.close() and wait for cleanup
     if (managed.isProcessing && managed.agent) {
@@ -3479,7 +3490,7 @@ export class SessionManager {
     // This acts as a safety valve - if the user moves on, we don't want to
     // auto-execute an old plan later.
     if (!this.isCloudWorkspace(managed.workspace)) {
-      await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+      await clearStoredPendingPlanExecution(managed.workspace.rootPath!, sessionId)
     }
 
     // Ensure messages are loaded before we try to add new ones
@@ -3646,7 +3657,7 @@ export class SessionManager {
     sendSpan.mark('agent.ready')
 
     // Always set all sources for context (even if none are enabled), including built-ins
-    const workspaceRootPath = managed.workspace.rootPath
+    const workspaceRootPath = managed.workspace.rootPath!
     const allSources = await this.resolveAllSources(managed.workspace)
     agent.setAllSources(allSources)
     sendSpan.mark('sources.loaded')
@@ -3954,7 +3965,7 @@ export class SessionManager {
           if (this.isCloudWorkspace(managed.workspace)) {
             await this.cloudUpdateMetadata(managed.workspace, sessionId, { hasUnread: true })
           } else {
-            await updateSessionMetadata(managed.workspace.rootPath, sessionId, { hasUnread: true })
+            await updateSessionMetadata(managed.workspace.rootPath!, sessionId, { hasUnread: true })
           }
         }
       }
@@ -4346,7 +4357,7 @@ To view this task's output:
 
         // Resolve tool display metadata (icon, displayName) for skills/sources
         // Only resolve when we have input (second event for SDK dual-event pattern)
-        const workspaceRootPath = managed.workspace.rootPath
+        const workspaceRootPath = managed.workspace.rootPath!
         let toolDisplayMeta: ToolDisplayMeta | undefined
         if (formattedToolInput && Object.keys(formattedToolInput).length > 0) {
           const allSources = await this.resolveAllSources(managed.workspace)
@@ -4465,7 +4476,7 @@ To view this task's output:
           // without a prior tool_start. If tool_start arrives later, findToolMessage will
           // locate this message by toolUseId and update it with input/intent/displayMeta.
           sessionLog.info(`RESULT WITHOUT START: toolUseId=${event.toolUseId}, toolName=${toolName} (creating message from result)`)
-          const fallbackWorkspaceRootPath = managed.workspace.rootPath
+          const fallbackWorkspaceRootPath = managed.workspace.rootPath!
           const fallbackSources = await this.resolveAllSources(managed.workspace)
           const fallbackToolDisplayMeta = resolveToolDisplayMeta(toolName, undefined, fallbackWorkspaceRootPath, fallbackSources)
 
@@ -4561,7 +4572,7 @@ To view this task's output:
           // not affected by CMD+R during compaction. The frontend reload
           // recovery will see awaitingCompaction=false and trigger execution.
           if (!this.isCloudWorkspace(managed.workspace)) {
-            void markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
+            void markStoredCompactionComplete(managed.workspace.rootPath!, sessionId)
           }
           sessionLog.info(`Session ${sessionId}: compaction complete, marked pending plan ready`)
 
