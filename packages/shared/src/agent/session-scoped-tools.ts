@@ -319,7 +319,12 @@ This tool initiates the OAuth 2.0 + PKCE flow for sources that require authentic
 - Source must be type 'mcp' with authType 'oauth'
 - Source must have a valid MCP URL
 
-**IMPORTANT:** After calling this tool, execution will be paused while OAuth completes.`,
+**IMPORTANT:** After calling this tool, execution will be paused while OAuth completes.
+
+**Advanced OAuth options:**
+Some MCP servers (e.g., Figma) restrict OAuth client registration to known client names or expect a specific callback path. Configure these in the source's config.json under \`mcp\`:
+- \`clientName\` — Override the client name sent during registration (default: "Craft Agent")
+- \`callbackPath\` — Override the OAuth callback path (default: "/oauth/callback")`,
 
   source_google_oauth_trigger: `Trigger Google OAuth authentication for a Google API source.
 
