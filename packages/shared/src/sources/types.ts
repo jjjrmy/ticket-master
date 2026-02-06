@@ -237,6 +237,13 @@ export interface McpSourceConfig {
    */
   clientId?: string;
 
+  /**
+   * Override the client name sent during OAuth dynamic client registration (RFC 7591).
+   * Some MCP servers (e.g., Figma) restrict registration to known client names.
+   * Defaults to "Craft Agent" if not specified.
+   */
+  clientName?: string;
+
   // === Stdio transport fields ===
   /**
    * Command to spawn for stdio transport.

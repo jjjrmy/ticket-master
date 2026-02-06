@@ -23,6 +23,7 @@
  *   delete-session/{id}       - Delete session
  *   flag-session/{id}         - Flag session
  *   unflag-session/{id}       - Unflag session
+ *   rename-session/{id}       - Rename session, requires ?name=New%20Name
  *
  * Examples:
  *   craftagents://allSessions                               (all sessions view)
@@ -38,6 +39,7 @@ import type { BrowserWindow } from 'electron'
 import { mainLog } from './logger'
 import type { WindowManager } from './window-manager'
 import { IPC_CHANNELS } from '../shared/types'
+import type { FileAttachment } from '../shared/types'
 
 export interface DeepLinkTarget {
   /** Workspace ID - undefined means use active window */
@@ -68,6 +70,8 @@ export interface DeepLinkNavigation {
   /** Action route (e.g., 'new-chat', 'delete-session') */
   action?: string
   actionParams?: Record<string, string>
+  /** File attachments downloaded from worker (for new-chat with files) */
+  attachments?: FileAttachment[]
 }
 
 /**
@@ -233,7 +237,8 @@ function buildDeepLinkWithoutWindowParam(url: string): string {
  */
 export async function handleDeepLink(
   url: string,
-  windowManager: WindowManager
+  windowManager: WindowManager,
+  attachments?: FileAttachment[]
 ): Promise<DeepLinkResult> {
   const target = parseDeepLink(url)
 
@@ -319,6 +324,7 @@ export async function handleDeepLink(
       view: target.view,
       action: target.action,
       actionParams: target.actionParams,
+      attachments,
     }
     if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
       window.webContents.send(IPC_CHANNELS.DEEP_LINK_NAVIGATE, navigation)

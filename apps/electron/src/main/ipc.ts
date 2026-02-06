@@ -3575,4 +3575,44 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // Note: Permission mode cycling settings (cyclablePermissionModes) are now workspace-level
   // and managed via WORKSPACE_SETTINGS_GET/UPDATE channels
 
+  // ============================================
+  // Cloud Proxy (Worker Bridge)
+  // ============================================
+
+  ipcMain.handle(IPC_CHANNELS.WORKER_GET_CONFIG, async () => {
+    const { getWorkerUrl, getWorkerApiKey } = await import('@craft-agent/shared/config/storage')
+    return {
+      workerUrl: getWorkerUrl(),
+      apiKey: await getWorkerApiKey(),
+    }
+  })
+
+  ipcMain.handle(IPC_CHANNELS.WORKER_SET_CONFIG, async (_event, config: { workerUrl: string | null; apiKey: string | null }) => {
+    const { setWorkerUrl, setWorkerApiKey, deleteWorkerApiKey } = await import('@craft-agent/shared/config/storage')
+    setWorkerUrl(config.workerUrl)
+
+    if (config.apiKey) {
+      await setWorkerApiKey(config.apiKey)
+    } else {
+      await deleteWorkerApiKey()
+    }
+
+    // Notify worker bridge of config change
+    const { getWorkerBridge } = await import('./worker-bridge-init')
+    const bridge = getWorkerBridge()
+    if (bridge) {
+      if (config.workerUrl && config.apiKey) {
+        bridge.restart({ workerUrl: config.workerUrl, apiKey: config.apiKey })
+      } else {
+        bridge.stop()
+      }
+    }
+  })
+
+  ipcMain.handle(IPC_CHANNELS.WORKER_GET_STATUS, async () => {
+    const { getWorkerBridge } = await import('./worker-bridge-init')
+    const bridge = getWorkerBridge()
+    return bridge?.getStatus() ?? 'disconnected'
+  })
+
 }

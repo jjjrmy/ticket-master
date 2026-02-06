@@ -7,6 +7,7 @@ import { type OAuthSessionContext, buildOAuthDeeplinkUrl } from './types.ts';
 
 export interface OAuthConfig {
   mcpUrl: string; // Full MCP URL including path (e.g., https://mcp.craft.do/my/mcp)
+  clientName?: string; // Override client name for dynamic client registration
 }
 
 export interface OAuthTokens {
@@ -76,7 +77,7 @@ export class CraftOAuth {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        client_name: CLIENT_NAME,
+        client_name: this.config.clientName || CLIENT_NAME,
         redirect_uris: [redirectUri],
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],

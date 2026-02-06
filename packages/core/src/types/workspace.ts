@@ -47,5 +47,7 @@ export interface StoredConfig {
   activeWorkspaceId: string | null;
   activeSessionId: string | null;  // Currently active session (primary scope)
   model?: string;
+  // Worker Bridge
+  workerUrl?: string;  // Protocol-stripped domain, e.g. "my-worker.worker-domain.com"
 }
 

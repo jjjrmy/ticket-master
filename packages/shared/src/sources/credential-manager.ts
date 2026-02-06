@@ -402,7 +402,7 @@ export class SourceCredentialManager {
 
     try {
       const oauth = new CraftOAuth(
-        { mcpUrl: source.config.mcp.url },
+        { mcpUrl: source.config.mcp.url, clientName: source.config.mcp.clientName },
         callbacks,
         sessionContext
       );

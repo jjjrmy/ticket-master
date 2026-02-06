@@ -70,6 +70,8 @@ export interface StoredConfig {
   keepAwakeWhileRunning?: boolean;  // Prevent screen sleep while sessions are running (default: false)
   // Tool metadata
   richToolDescriptions?: boolean;  // Add intent/action metadata to all tool calls (default: true)
+  // Worker Bridge
+  workerUrl?: string;  // Protocol-stripped domain, e.g. "my-worker.worker-domain.com"
 }
 
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -319,6 +321,47 @@ export function setKeepAwakeWhileRunning(enabled: boolean): void {
   saveConfig(config);
 }
 
+// ============================================
+// Worker Bridge Configuration
+// ============================================
+
+/**
+ * Strip protocol from a URL, returning just the domain (+ optional path).
+ * e.g. "wss://my-worker.example.com" → "my-worker.example.com"
+ * e.g. "https://my-worker.example.com/path" → "my-worker.example.com/path"
+ * e.g. "my-worker.example.com" → "my-worker.example.com" (no-op)
+ */
+function stripProtocol(url: string): string {
+  return url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/\/+$/, '');
+}
+
+/**
+ * Get the Worker Bridge URL (protocol-stripped domain).
+ * Returns null if not configured.
+ */
+export function getWorkerUrl(): string | null {
+  const config = loadStoredConfig();
+  return config?.workerUrl ?? null;
+}
+
+/**
+ * Set the Worker Bridge URL.
+ * Automatically strips protocol (wss://, https://, etc.) and stores just the domain.
+ * Pass null to clear.
+ */
+export function setWorkerUrl(url: string | null): void {
+  const config = loadStoredConfig();
+  if (!config) return;
+
+  if (url) {
+    const trimmed = url.trim();
+    config.workerUrl = trimmed ? stripProtocol(trimmed) : undefined;
+  } else {
+    delete config.workerUrl;
+  }
+  saveConfig(config);
+}
+
 /**
  * Get whether rich tool descriptions are enabled.
  * When enabled, all tool calls include intent and display name metadata.
@@ -340,6 +383,31 @@ export function setRichToolDescriptions(enabled: boolean): void {
   if (!config) return;
   config.richToolDescriptions = enabled;
   saveConfig(config);
+}
+
+/**
+ * Get the Worker API key from credential store.
+ */
+export async function getWorkerApiKey(): Promise<string | null> {
+  const manager = getCredentialManager();
+  const cred = await manager.get({ type: 'worker_api_key' });
+  return cred?.value || null;
+}
+
+/**
+ * Set the Worker API key in credential store.
+ */
+export async function setWorkerApiKey(key: string): Promise<void> {
+  const manager = getCredentialManager();
+  await manager.set({ type: 'worker_api_key' }, { value: key });
+}
+
+/**
+ * Delete the Worker API key from credential store.
+ */
+export async function deleteWorkerApiKey(): Promise<void> {
+  const manager = getCredentialManager();
+  await manager.delete({ type: 'worker_api_key' });
 }
 
 // Note: getDefaultWorkingDirectory/setDefaultWorkingDirectory removed
