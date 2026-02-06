@@ -741,6 +741,12 @@ export const IPC_CHANNELS = {
   // Git operations
   GET_GIT_BRANCH: 'git:getBranch',
 
+  // Cloud Proxy (Worker Bridge)
+  WORKER_GET_CONFIG: 'worker:getConfig',
+  WORKER_SET_CONFIG: 'worker:setConfig',
+  WORKER_GET_STATUS: 'worker:getStatus',
+  WORKER_STATUS_CHANGED: 'worker:statusChanged',
+
   // Git Bash (Windows)
   GITBASH_CHECK: 'gitbash:check',
   GITBASH_BROWSE: 'gitbash:browse',
@@ -1025,6 +1031,12 @@ export interface ElectronAPI {
   broadcastWorkspaceThemeChange(workspaceId: string, themeId: string | null): Promise<void>
   onWorkspaceThemeChange(callback: (data: { workspaceId: string; themeId: string | null }) => void): () => void
 
+  // Cloud Proxy (Worker Bridge)
+  getWorkerConfig(): Promise<WorkerConfig>
+  setWorkerConfig(config: WorkerConfig): Promise<void>
+  getWorkerStatus(): Promise<WorkerBridgeStatus>
+  onWorkerStatusChange(callback: (status: WorkerBridgeStatus) => void): () => void
+
   // Git operations
   getGitBranch(dirPath: string): Promise<string | null>
 
@@ -1105,6 +1117,19 @@ export interface WorkspaceSettings {
 }
 
 /**
+ * Worker Bridge configuration (for Settings UI)
+ */
+export interface WorkerConfig {
+  workerUrl: string | null
+  apiKey: string | null
+}
+
+/**
+ * Worker Bridge status
+ */
+export type WorkerBridgeStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
+
+/**
  * Navigation payload for deep links (main → renderer)
  */
 export interface DeepLinkNavigation {
@@ -1115,6 +1140,8 @@ export interface DeepLinkNavigation {
   tabParams?: Record<string, string>
   action?: string
   actionParams?: Record<string, string>
+  /** File attachments downloaded from worker (for new-chat with files) */
+  attachments?: FileAttachment[]
 }
 
 // ============================================
@@ -1148,7 +1175,7 @@ export type ChatFilter =
 /**
  * Settings subpage options
  */
-export type SettingsSubpage = 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences'
+export type SettingsSubpage = 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences' | 'cloud-proxy'
 
 /**
  * Chats navigation state - shows SessionList in navigator
@@ -1317,7 +1344,7 @@ export const parseNavigationStateKey = (key: string): NavigationState | null => 
   if (key === 'settings') return { navigator: 'settings', subpage: 'app' }
   if (key.startsWith('settings:')) {
     const subpage = key.slice(9) as SettingsSubpage
-    if (['app', 'appearance', 'input', 'workspace', 'permissions', 'labels', 'shortcuts', 'preferences'].includes(subpage)) {
+    if (['app', 'appearance', 'input', 'workspace', 'permissions', 'labels', 'shortcuts', 'preferences', 'cloud-proxy'].includes(subpage)) {
       return { navigator: 'settings', subpage }
     }
   }

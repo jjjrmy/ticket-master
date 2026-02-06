@@ -17,4 +17,5 @@ export {
   LabelsSettingsPage,
   ShortcutsPage,
   PreferencesPage,
+  CloudProxySettingsPage,
 } from './settings'

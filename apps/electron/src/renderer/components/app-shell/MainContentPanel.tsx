@@ -24,7 +24,7 @@ import {
   isSettingsNavigation,
   isSkillsNavigation,
 } from '@/contexts/NavigationContext'
-import { AppSettingsPage, AppearanceSettingsPage, InputSettingsPage, WorkspaceSettingsPage, PermissionsSettingsPage, LabelsSettingsPage, PreferencesPage, ShortcutsPage, SourceInfoPage, ChatPage } from '@/pages'
+import { AppSettingsPage, AppearanceSettingsPage, InputSettingsPage, WorkspaceSettingsPage, PermissionsSettingsPage, LabelsSettingsPage, PreferencesPage, ShortcutsPage, CloudProxySettingsPage, SourceInfoPage, ChatPage } from '@/pages'
 import SkillInfoPage from '@/pages/SkillInfoPage'
 
 export interface MainContentPanelProps {
@@ -91,6 +91,12 @@ export function MainContentPanel({
         return wrapWithStoplight(
           <Panel variant="grow" className={className}>
             <PreferencesPage />
+          </Panel>
+        )
+      case 'cloud-proxy':
+        return wrapWithStoplight(
+          <Panel variant="grow" className={className}>
+            <CloudProxySettingsPage />
           </Panel>
         )
       case 'app':

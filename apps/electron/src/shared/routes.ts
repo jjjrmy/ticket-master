@@ -41,8 +41,9 @@ export const routes = {
      * @param send - If true and input is provided, immediately sends the message
      * @param status - Optional status/todo-state ID to apply to the new session
      * @param label - Optional label ID to apply to the new session
+     * @param sources - Optional comma-separated source slugs to activate
      */
-    newChat: (params?: { input?: string; name?: string; send?: boolean; status?: string; label?: string }) =>
+    newChat: (params?: { input?: string; name?: string; send?: boolean; status?: string; label?: string; sources?: string }) =>
       `action/new-chat${toQueryString(params ? { ...params, send: params.send ? 'true' : undefined } : undefined)}` as const,
 
     /** Rename a session */
@@ -151,7 +152,7 @@ export const routes = {
     },
 
     /** Settings view (settings navigator) */
-    settings: (subpage?: 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences') =>
+    settings: (subpage?: 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences' | 'cloud-proxy') =>
       subpage && subpage !== 'app'
         ? `settings/${subpage}` as const
         : 'settings' as const,

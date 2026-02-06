@@ -208,7 +208,7 @@ export const MENU_SECTIONS: MenuSection[] = [EDIT_MENU, VIEW_MENU, WINDOW_MENU]
  * Used by both AppMenu (logo dropdown) and SettingsNavigator (sidebar panel)
  */
 export interface SettingsMenuItem {
-  id: 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences'
+  id: 'app' | 'appearance' | 'input' | 'workspace' | 'permissions' | 'labels' | 'shortcuts' | 'preferences' | 'cloud-proxy'
   label: string
   icon: string        // Lucide icon name for AppMenu
   description: string // Shown in SettingsNavigator
@@ -266,6 +266,12 @@ export const SETTINGS_ITEMS: SettingsMenuItem[] = [
     label: 'Preferences',
     icon: 'UserCircle',
     description: 'Your personal preferences',
+  },
+  {
+    id: 'cloud-proxy',
+    label: 'Cloud Proxy',
+    icon: 'Radio',
+    description: 'Remote deeplink relay via WebSocket',
   },
 ]
 

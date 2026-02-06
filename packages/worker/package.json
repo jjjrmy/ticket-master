@@ -1,0 +1,21 @@
+{
+  "name": "@craft-agent/worker",
+  "version": "0.3.4",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Cloudflare Worker bridge for remote deeplink relay via WebSocket",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "wrangler": "^4.0.0"
+  }
+}
