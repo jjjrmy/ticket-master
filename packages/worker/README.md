@@ -66,6 +66,12 @@ All action requests require your API key. Pass it via either:
 | GET/POST | `/action/{actionName}[/{id}][?params]` | Trigger a deeplink action |
 | GET/POST | `/workspace/{wsId}/action/{actionName}[/{id}][?params]` | Action targeting a workspace |
 | GET | `/attachments/{actionId}/{filename}` | Download a staged attachment (used internally by desktop app) |
+| GET | `/workspaces` | List all workspaces |
+| GET | `/workspace/{slug}` | Get workspace config |
+| GET | `/workspace/{slug}/labels` | Get workspace labels |
+| GET | `/workspace/{slug}/statuses` | Get workspace statuses |
+| GET | `/workspace/{slug}/sources` | Get workspace sources |
+| GET | `/workspace/{slug}/working-directories` | Get workspace working directories |
 | GET | `/health` | Health check + connection count |
 | GET | `/ws` | WebSocket upgrade (used by the desktop app) |
 
@@ -293,6 +299,140 @@ The HTTP path directly mirrors the `craftagents://` deeplink structure:
 | `/action/rename-session/SESSION_ID?name=NAME` | `craftagents://action/rename-session/SESSION_ID?name=NAME` |
 | `/action/resume-sdk-session/SDK_SESSION_ID` | `craftagents://action/resume-sdk-session/SDK_SESSION_ID` |
 | `POST /action/new-chat -F file=@img.png` | Same as above, with file attachment staged in R2 |
+
+## Query API
+
+The query endpoints let you read workspace data from the desktop app remotely. Queries are relayed over WebSocket to the first connected client, which reads the data from disk and returns it. All query endpoints require authentication and return JSON.
+
+Queries have a **5-second timeout**. If the desktop app is offline or doesn't respond in time, you'll get a `504` error.
+
+### List Workspaces
+
+```bash
+curl "https://YOUR_WORKER_URL/workspaces" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+```json
+{
+  "workspaces": [
+    { "id": "ws_a1b2c3d4", "name": "my-workspace", "slug": "my-workspace", "createdAt": 1770350454171 }
+  ]
+}
+```
+
+### Get Workspace Config
+
+```bash
+curl "https://YOUR_WORKER_URL/workspace/my-workspace" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+```json
+{
+  "id": "ws_a1b2c3d4",
+  "name": "my-workspace",
+  "slug": "my-workspace",
+  "defaults": {
+    "model": "claude-sonnet-4-5-20250929",
+    "permissionMode": "ask",
+    "workingDirectory": "/Users/me/projects/my-app"
+  },
+  "createdAt": 1770350454171,
+  "updatedAt": 1770350454171
+}
+```
+
+### Get Labels
+
+```bash
+curl "https://YOUR_WORKER_URL/workspace/my-workspace/labels" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+```json
+{
+  "version": 1,
+  "labels": [
+    {
+      "id": "development",
+      "name": "Development",
+      "color": { "light": "#3B82F6", "dark": "#60A5FA" },
+      "children": [
+        { "id": "code", "name": "Code", "color": { "light": "#4F46E5", "dark": "#818CF8" } }
+      ]
+    },
+    { "id": "priority", "name": "Priority", "color": { "light": "#F59E0B", "dark": "#FBBF24" }, "valueType": "number" }
+  ]
+}
+```
+
+### Get Statuses
+
+```bash
+curl "https://YOUR_WORKER_URL/workspace/my-workspace/statuses" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+```json
+{
+  "version": 1,
+  "statuses": [
+    { "id": "todo", "label": "Todo", "category": "open", "isFixed": true, "order": 1 },
+    { "id": "done", "label": "Done", "category": "closed", "isFixed": true, "order": 3 }
+  ],
+  "defaultStatusId": "todo"
+}
+```
+
+### Get Sources
+
+```bash
+curl "https://YOUR_WORKER_URL/workspace/my-workspace/sources" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+```json
+{
+  "sources": [
+    {
+      "id": "github_e7f3a9b2",
+      "name": "GitHub",
+      "slug": "github",
+      "type": "mcp",
+      "provider": "github",
+      "enabled": true,
+      "isAuthenticated": true,
+      "connectionStatus": "connected",
+      "tagline": "Repositories, issues, and pull requests"
+    }
+  ]
+}
+```
+
+### Get Working Directories
+
+```bash
+curl "https://YOUR_WORKER_URL/workspace/my-workspace/working-directories" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+```json
+{
+  "directories": [
+    { "path": "/Users/me/projects/my-app", "label": "my-app" }
+  ]
+}
+```
+
+### Query Error Responses
+
+| Status | Error | Description |
+|--------|-------|-------------|
+| `401` | `Unauthorized` | Missing or invalid API key |
+| `404` | `Workspace not found` | No workspace with that slug |
+| `503` | `No connected clients` | Desktop app is not connected |
+| `504` | `Query timed out` | Desktop app didn't respond within 5 seconds |
 
 ## Development
 

@@ -5,7 +5,7 @@
  * and relays action messages from HTTP triggers.
  */
 
-import type { Env, WorkerToClientMessage, ClientToWorkerMessage, AttachmentMeta } from './types.ts'
+import type { Env, WorkerToClientMessage, ClientToWorkerMessage, AttachmentMeta, QueryResource } from './types.ts'
 
 interface ConnectedClient {
   websocket: WebSocket
@@ -13,8 +13,14 @@ interface ConnectedClient {
   connectedAt: number
 }
 
+interface PendingQuery {
+  resolve: (result: { data?: unknown; error?: string }) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
 export class BridgeDurableObject {
   private clients: Map<string, ConnectedClient> = new Map()
+  private pendingQueries: Map<string, PendingQuery> = new Map()
   private env: Env
 
   constructor(state: DurableObjectState, env: Env) {
@@ -30,6 +36,10 @@ export class BridgeDurableObject {
 
     if (url.pathname === '/action') {
       return this.handleAction(request)
+    }
+
+    if (url.pathname === '/query') {
+      return this.handleQuery(request)
     }
 
     if (url.pathname === '/health') {
@@ -64,6 +74,15 @@ export class BridgeDurableObject {
           case 'ack':
             // Acknowledgement received - could log or track
             break
+          case 'query_response': {
+            const pending = this.pendingQueries.get(data.id)
+            if (pending) {
+              clearTimeout(pending.timeout)
+              this.pendingQueries.delete(data.id)
+              pending.resolve({ data: data.data, error: data.error })
+            }
+            break
+          }
           case 'ping':
             this.send(clientId, { type: 'pong' })
             break
@@ -151,6 +170,69 @@ export class BridgeDurableObject {
       attachments: attachments?.length ?? 0,
     }), {
       status: delivered > 0 ? 200 : 503,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
+  private async handleQuery(request: Request): Promise<Response> {
+    const resource = request.headers.get('X-Query-Resource') as QueryResource | null
+    const workspaceSlug = request.headers.get('X-Query-Workspace') || undefined
+
+    if (!resource) {
+      return new Response(JSON.stringify({ error: 'Missing resource' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // Find the first authenticated client
+    let targetClientId: string | null = null
+    for (const [clientId, client] of this.clients) {
+      if (client.authenticated) {
+        targetClientId = clientId
+        break
+      }
+    }
+
+    if (!targetClientId) {
+      return new Response(JSON.stringify({ error: 'No connected clients' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    const queryId = crypto.randomUUID()
+
+    // Send query to the first authenticated client
+    const result = await new Promise<{ data?: unknown; error?: string }>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingQueries.delete(queryId)
+        resolve({ error: 'Query timed out' })
+      }, 5000)
+
+      this.pendingQueries.set(queryId, { resolve, timeout })
+
+      try {
+        this.send(targetClientId!, { type: 'query', id: queryId, resource, workspaceSlug })
+      } catch {
+        clearTimeout(timeout)
+        this.pendingQueries.delete(queryId)
+        resolve({ error: 'Failed to send query to client' })
+      }
+    })
+
+    if (result.error) {
+      const status = result.error === 'Query timed out' ? 504
+        : result.error === 'Workspace not found' ? 404
+        : 502
+      return new Response(JSON.stringify({ error: result.error }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    return new Response(JSON.stringify(result.data), {
+      status: 200,
       headers: { 'Content-Type': 'application/json' },
     })
   }

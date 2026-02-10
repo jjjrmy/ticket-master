@@ -13,17 +13,28 @@ export interface AttachmentMeta {
   size: number
 }
 
+/** Queryable workspace resources */
+export type QueryResource =
+  | 'workspaces'
+  | 'workspace'
+  | 'labels'
+  | 'statuses'
+  | 'sources'
+  | 'working-directories'
+
 /** Messages sent from Worker to Client */
 export type WorkerToClientMessage =
   | { type: 'auth_ok' }
   | { type: 'auth_error'; error: string }
   | { type: 'action'; url: string; id?: string; attachments?: AttachmentMeta[] }
+  | { type: 'query'; id: string; resource: QueryResource; workspaceSlug?: string }
   | { type: 'pong' }
 
 /** Messages sent from Client to Worker */
 export type ClientToWorkerMessage =
   | { type: 'auth'; apiKey: string }
   | { type: 'ack'; id: string; success: boolean; error?: string }
+  | { type: 'query_response'; id: string; data?: unknown; error?: string }
   | { type: 'ping' }
 
 /** Worker environment bindings */

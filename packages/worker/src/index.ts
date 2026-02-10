@@ -8,13 +8,19 @@
  *   GET/POST /action/{actionName}[/{id}][?params]              - Trigger a deeplink action
  *   GET/POST /workspace/{wsId}/action/{actionName}[/{id}][?params] - Action targeting a workspace
  *   GET      /attachments/{key+}                               - Download a staged attachment from R2
+ *   GET      /workspaces                                       - List all workspaces
+ *   GET      /workspace/{slug}                                 - Workspace config
+ *   GET      /workspace/{slug}/labels                          - Labels config
+ *   GET      /workspace/{slug}/statuses                        - Statuses config
+ *   GET      /workspace/{slug}/sources                         - Sources list
+ *   GET      /workspace/{slug}/working-directories             - Working directories
  *   GET      /ws                                               - WebSocket upgrade for clients
  *   GET      /health                                           - Health check / connection status
  */
 
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import type { Env, AttachmentMeta } from './types.ts'
+import type { Env, AttachmentMeta, QueryResource } from './types.ts'
 
 // Re-export the Durable Object class so Wrangler can find it
 export { BridgeDurableObject } from './websocket.ts'
@@ -37,6 +43,18 @@ app.use('/action/*', async (c, next) => {
 })
 
 app.use('/workspace/*', async (c, next) => {
+  const apiKey = c.req.header('Authorization')?.replace('Bearer ', '')
+    || c.req.query('key')
+
+  if (!apiKey || apiKey !== c.env.API_KEY) {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  await next()
+})
+
+// Auth middleware for workspaces query endpoints
+app.use('/workspaces', async (c, next) => {
   const apiKey = c.req.header('Authorization')?.replace('Bearer ', '')
     || c.req.query('key')
 
@@ -186,6 +204,52 @@ app.get('/attachments/:actionId/:filename', async (c) => {
   headers.set('Content-Disposition', `attachment; filename="${c.req.param('filename')}"`)
 
   return new Response(object.body, { headers })
+})
+
+// ============================================================
+// Query Endpoints - GET workspace data via WebSocket relay
+// ============================================================
+
+/** Helper to relay a query to the Durable Object and return the response */
+async function relayQuery(env: Env, resource: QueryResource, workspaceSlug?: string): Promise<Response> {
+  const bridge = getBridge(env)
+  const headers: Record<string, string> = {
+    'X-Query-Resource': resource,
+  }
+  if (workspaceSlug) {
+    headers['X-Query-Workspace'] = workspaceSlug
+  }
+  return bridge.fetch(new Request('https://bridge/query', { headers }))
+}
+
+// GET /workspaces - List all workspaces
+app.get('/workspaces', async (c) => {
+  return relayQuery(c.env, 'workspaces')
+})
+
+// GET /workspace/:slug - Workspace config
+app.get('/workspace/:slug', async (c) => {
+  return relayQuery(c.env, 'workspace', c.req.param('slug'))
+})
+
+// GET /workspace/:slug/labels - Labels config
+app.get('/workspace/:slug/labels', async (c) => {
+  return relayQuery(c.env, 'labels', c.req.param('slug'))
+})
+
+// GET /workspace/:slug/statuses - Statuses config
+app.get('/workspace/:slug/statuses', async (c) => {
+  return relayQuery(c.env, 'statuses', c.req.param('slug'))
+})
+
+// GET /workspace/:slug/sources - Sources list
+app.get('/workspace/:slug/sources', async (c) => {
+  return relayQuery(c.env, 'sources', c.req.param('slug'))
+})
+
+// GET /workspace/:slug/working-directories - Working directories
+app.get('/workspace/:slug/working-directories', async (c) => {
+  return relayQuery(c.env, 'working-directories', c.req.param('slug'))
 })
 
 // GET /ws - WebSocket upgrade

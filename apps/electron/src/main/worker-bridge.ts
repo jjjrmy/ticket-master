@@ -33,13 +33,18 @@ interface WorkerAttachmentMeta {
   size: number
 }
 
+/** Queryable workspace resources */
+type QueryResource = 'workspaces' | 'workspace' | 'labels' | 'statuses' | 'sources' | 'working-directories'
+
 /** Messages from Worker → Client */
 interface WorkerMessage {
-  type: 'auth_ok' | 'auth_error' | 'action' | 'pong'
+  type: 'auth_ok' | 'auth_error' | 'action' | 'query' | 'pong'
   url?: string
   id?: string
   error?: string
   attachments?: WorkerAttachmentMeta[]
+  resource?: QueryResource
+  workspaceSlug?: string
 }
 
 export class WorkerBridge {
@@ -172,6 +177,13 @@ export class WorkerBridge {
         }
         break
 
+      case 'query':
+        if (message.id && message.resource) {
+          mainLog.info('[WorkerBridge] Received query:', message.resource, 'workspace:', message.workspaceSlug ?? 'n/a')
+          this.handleQuery(message)
+        }
+        break
+
       case 'pong':
         // Heartbeat response - connection is alive
         break
@@ -198,6 +210,135 @@ export class WorkerBridge {
       if (message.id) {
         this.send({ type: 'ack', id: message.id, success: false, error: String(err) })
       }
+    }
+  }
+
+  /**
+   * Handle a query message: read workspace data and send back query_response.
+   */
+  private async handleQuery(message: WorkerMessage): Promise<void> {
+    const { id, resource, workspaceSlug } = message
+
+    try {
+      const {
+        discoverWorkspacesInDefaultLocation,
+        loadWorkspaceConfig,
+        getWorkspaceSourcesPath,
+      } = await import('@craft-agent/shared/workspaces')
+
+      const data = await (async () => {
+        // List all workspaces (no slug needed)
+        if (resource === 'workspaces') {
+          const paths = discoverWorkspacesInDefaultLocation()
+          const workspaces = paths.map(rootPath => {
+            const config = loadWorkspaceConfig(rootPath)
+            if (!config) return null
+            return { id: config.id, name: config.name, slug: config.slug, createdAt: config.createdAt }
+          }).filter(Boolean)
+          return { workspaces }
+        }
+
+        // All other resources require a workspace identifier (slug or ID)
+        if (!workspaceSlug) {
+          throw new Error('Workspace identifier is required')
+        }
+
+        // Resolve workspace identifier (slug or ID) to root path
+        const allPaths = discoverWorkspacesInDefaultLocation()
+        const rootPath = allPaths.find(p => {
+          const config = loadWorkspaceConfig(p)
+          return config?.slug === workspaceSlug || config?.id === workspaceSlug
+        })
+
+        if (!rootPath) {
+          throw new Error('Workspace not found')
+        }
+
+        switch (resource) {
+          case 'workspace': {
+            const config = loadWorkspaceConfig(rootPath)
+            return config ? {
+              id: config.id,
+              name: config.name,
+              slug: config.slug,
+              defaults: config.defaults,
+              createdAt: config.createdAt,
+              updatedAt: config.updatedAt,
+            } : null
+          }
+
+          case 'labels': {
+            const { loadLabelConfig } = await import('@craft-agent/shared/labels/storage')
+            return loadLabelConfig(rootPath)
+          }
+
+          case 'statuses': {
+            const { loadStatusConfig } = await import('@craft-agent/shared/statuses/storage')
+            return loadStatusConfig(rootPath)
+          }
+
+          case 'sources': {
+            const { loadWorkspaceSources } = await import('@craft-agent/shared/sources/storage')
+            const loaded = loadWorkspaceSources(rootPath)
+            return {
+              sources: loaded.map(s => ({
+                id: s.config.id,
+                name: s.config.name,
+                slug: s.config.slug,
+                type: s.config.type,
+                provider: s.config.provider,
+                enabled: s.config.enabled,
+                isAuthenticated: s.config.isAuthenticated,
+                connectionStatus: s.config.connectionStatus,
+                tagline: s.config.tagline,
+                icon: s.config.icon,
+              })),
+            }
+          }
+
+          case 'working-directories': {
+            const { listSessions } = await import('@craft-agent/shared/sessions')
+            const config = loadWorkspaceConfig(rootPath)
+            const seen = new Set<string>()
+            const directories: { path: string; label: string }[] = []
+
+            // Add workspace default first (if set)
+            if (config?.defaults?.workingDirectory) {
+              const dir = config.defaults.workingDirectory
+              seen.add(dir)
+              directories.push({
+                path: dir,
+                label: dir.split('/').pop() || dir,
+              })
+            }
+
+            // Collect unique working directories from sessions (sorted by most recent)
+            // Filter out internal session folder paths (sdkCwd) that aren't real working directories
+            const sessions = listSessions(rootPath)
+            sessions.sort((a, b) => (b.lastMessageAt ?? b.lastUsedAt) - (a.lastMessageAt ?? a.lastUsedAt))
+            for (const session of sessions) {
+              const dir = session.workingDirectory
+              if (dir && !seen.has(dir) && !dir.includes('.craft-agent/workspaces/')) {
+                seen.add(dir)
+                directories.push({
+                  path: dir,
+                  label: dir.split('/').pop() || dir,
+                })
+              }
+            }
+
+            return { directories }
+          }
+
+          default:
+            throw new Error(`Unknown resource: ${resource}`)
+        }
+      })()
+
+      this.send({ type: 'query_response', id, data })
+    } catch (err) {
+      mainLog.error('[WorkerBridge] Failed to handle query:', err)
+      this.send({ type: 'query_response', id, error: String(err) })
     }
   }
 
