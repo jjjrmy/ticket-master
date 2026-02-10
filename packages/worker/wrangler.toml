@@ -1,0 +1,17 @@
+name = "craft-agent-worker"
+account_id = "ab7347813b21ea6079df4cb18c4bb9e8"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+
+[durable_objects]
+bindings = [
+  { name = "BRIDGE", class_name = "BridgeDurableObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["BridgeDurableObject"]
+
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "craft-agent-attachments"

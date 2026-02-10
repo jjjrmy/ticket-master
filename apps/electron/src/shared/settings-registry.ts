@@ -41,6 +41,7 @@ export const SETTINGS_PAGES = [
   { id: 'labels', label: 'Labels', description: 'Manage session labels' },
   { id: 'shortcuts', label: 'Shortcuts', description: 'Keyboard shortcuts' },
   { id: 'preferences', label: 'Preferences', description: 'User preferences' },
+  { id: 'cloud-proxy', label: 'Cloud Proxy', description: 'Remote deeplink relay via WebSocket' },
 ] as const satisfies readonly SettingsPageDefinition[]
 
 /**
