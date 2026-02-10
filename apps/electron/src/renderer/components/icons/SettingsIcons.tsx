@@ -158,6 +158,23 @@ export const PreferencesIcon = ({ className }: IconProps) => (
   </svg>
 )
 
+/** Radio/signal icon for Cloud Proxy */
+export const CloudProxyIcon = ({ className }: IconProps) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    className={className}
+  >
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM12 8C9.79 8 8 9.79 8 12C8 14.21 9.79 16 12 16C14.21 16 16 14.21 16 12C16 9.79 14.21 8 12 8ZM12 14C10.9 14 10 13.1 10 12C10 10.9 10.9 10 12 10C13.1 10 14 10.9 14 12C14 13.1 13.1 14 12 14ZM5.07 7.19C4.11 8.48 3.5 10.11 3.5 12C3.5 13.89 4.11 15.52 5.07 16.81L6.54 15.73C5.78 14.71 5.3 13.4 5.3 12C5.3 10.6 5.78 9.29 6.54 8.27L5.07 7.19ZM18.93 7.19L17.46 8.27C18.22 9.29 18.7 10.6 18.7 12C18.7 13.4 18.22 14.71 17.46 15.73L18.93 16.81C19.89 15.52 20.5 13.89 20.5 12C20.5 10.11 19.89 8.48 18.93 7.19Z"
+      fill="currentColor"
+    />
+  </svg>
+)
+
 /**
  * Map of settings subpage IDs to their icon components.
  * Used by both AppMenu and SettingsNavigator for consistent icons.
@@ -172,4 +189,5 @@ export const SETTINGS_ICONS: Record<SettingsSubpage, React.ComponentType<IconPro
   labels: LabelsIcon,
   shortcuts: ShortcutsIcon,
   preferences: PreferencesIcon,
+  'cloud-proxy': CloudProxyIcon,
 }

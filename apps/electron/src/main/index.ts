@@ -85,6 +85,7 @@ import log, { isDebugMode, mainLog, getLogFilePath } from './logger'
 import { setPerfEnabled, enableDebug } from '@craft-agent/shared/utils'
 import { initNotificationService, clearBadgeCount, initBadgeIcon, initInstanceBadge } from './notifications'
 import { checkForUpdatesOnLaunch, setWindowManager as setAutoUpdateWindowManager, isUpdating } from './auto-update'
+import { initWorkerBridge } from './worker-bridge-init'
 
 // Initialize electron-log for renderer process support
 log.initialize()
@@ -338,6 +339,9 @@ app.whenReady().then(async () => {
     } catch (err) {
       mainLog.warn('Failed to set Sentry context tags:', err)
     }
+
+    // Initialize Worker Bridge (WebSocket relay for remote deeplinks)
+    await initWorkerBridge(windowManager)
 
     // Initialize auto-update (check immediately on launch)
     // Skip in dev mode to avoid replacing /Applications app and launching it instead

@@ -25,6 +25,7 @@ export type CredentialType =
   | 'llm_oauth'          // OAuth token for LLM connection
   | 'llm_iam'            // AWS IAM credentials (accessKeyId + secretAccessKey)
   | 'llm_service_account' // GCP service account JSON
+  | 'worker_api_key'     // Worker Bridge API key
   // Workspace credentials
   | 'workspace_oauth'    // Workspace MCP OAuth token
   // Source credentials (stored at ~/.craft-agent/workspaces/{ws}/sources/{slug}/)
@@ -41,6 +42,7 @@ const VALID_CREDENTIAL_TYPES: readonly CredentialType[] = [
   'llm_oauth',
   'llm_iam',
   'llm_service_account',
+  'worker_api_key',
   'workspace_oauth',
   'source_oauth',
   'source_bearer',

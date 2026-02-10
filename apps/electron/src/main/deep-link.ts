@@ -23,6 +23,7 @@
  *   delete-session/{id}       - Delete session
  *   flag-session/{id}         - Flag session
  *   unflag-session/{id}       - Unflag session
+ *   rename-session/{id}       - Rename session, requires ?name=New%20Name
  *
  * Examples:
  *   craftagents://allSessions                               (all sessions view)
@@ -38,6 +39,7 @@ import type { BrowserWindow } from 'electron'
 import { mainLog } from './logger'
 import type { WindowManager } from './window-manager'
 import { IPC_CHANNELS } from '../shared/types'
+import type { FileAttachment } from '../shared/types'
 
 export interface DeepLinkTarget {
   /** Workspace ID - undefined means use active window */
@@ -68,6 +70,8 @@ export interface DeepLinkNavigation {
   /** Action route (e.g., 'new-chat', 'delete-session') */
   action?: string
   actionParams?: Record<string, string>
+  /** File attachments downloaded from worker (for new-chat with files) */
+  attachments?: FileAttachment[]
 }
 
 /**
@@ -233,11 +237,14 @@ function buildDeepLinkWithoutWindowParam(url: string): string {
  */
 export async function handleDeepLink(
   url: string,
-  windowManager: WindowManager
+  windowManager: WindowManager,
+  attachments?: FileAttachment[]
 ): Promise<DeepLinkResult> {
+  mainLog.info('[DeepLink] Received URL:', url)
   const target = parseDeepLink(url)
 
   if (!target) {
+    mainLog.warn('[DeepLink] Failed to parse URL:', url)
     // Return success for null targets (like auth-callback) - they're handled elsewhere
     if (url.includes('auth-callback')) {
       return { success: true }
@@ -245,7 +252,47 @@ export async function handleDeepLink(
     return { success: false, error: 'Invalid deep link URL' }
   }
 
-  mainLog.info('[DeepLink] Handling:', target)
+  mainLog.info('[DeepLink] Parsed target:', JSON.stringify(target))
+
+  // Resolve workspace identifier to actual workspace ID (from global config).
+  // Deep links may use slugs (e.g., 'TSGS') or ws_-prefixed config IDs (e.g., 'ws_6f5eb9a1'),
+  // but the window manager uses global config UUIDs. Without this resolution,
+  // focusOrCreateWindow() never finds the existing window and always creates a new one.
+  if (target.workspaceId) {
+    const { getWorkspaces } = await import('@craft-agent/shared/config')
+    const { loadWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
+    const workspaces = getWorkspaces()
+
+    const knownIds = workspaces.map(ws => ws.id)
+    mainLog.info('[DeepLink] Workspace lookup — target:', target.workspaceId, '| known IDs:', knownIds)
+
+    // 1. Try exact workspace ID match
+    const directMatch = workspaces.find(ws => ws.id === target.workspaceId)
+    if (directMatch) {
+      mainLog.info('[DeepLink] Direct workspace ID match found')
+    } else {
+      // 2. Try matching by slug or workspace config ID (ws_-prefixed)
+      mainLog.info('[DeepLink] No direct ID match, trying slug/config ID lookup...')
+      let resolved = false
+      for (const ws of workspaces) {
+        const config = loadWorkspaceConfig(ws.rootPath)
+        mainLog.info('[DeepLink] Checking workspace:', ws.id, '| slug:', config?.slug, '| configId:', config?.id)
+        if (config?.slug === target.workspaceId || config?.id === target.workspaceId) {
+          mainLog.info('[DeepLink] Resolved workspace identifier to ID:', target.workspaceId, '→', ws.id)
+          target.workspaceId = ws.id
+          resolved = true
+          break
+        }
+      }
+
+      // 3. If still unresolved, clear workspaceId so we fall back to focused/last active window
+      //    instead of creating a new window with an invalid workspace ID
+      if (!resolved) {
+        mainLog.warn('[DeepLink] Could not resolve workspace identifier:', target.workspaceId, '— falling back to active window')
+        target.workspaceId = undefined
+      }
+    }
+  }
 
   // If windowMode is set, create a new window instead of navigating in existing
   if (target.windowMode) {
@@ -291,14 +338,26 @@ export async function handleDeepLink(
   // 1. Get target window (existing behavior for non-window-mode links)
   let window: BrowserWindow | null = null
 
+  const allManagedWindows = windowManager.getAllWindows()
+  mainLog.info('[DeepLink] Window resolution — workspaceId:', target.workspaceId ?? '(none)',
+    '| open windows:', allManagedWindows.map(w => `${w.workspaceId}:${w.window.webContents.id}`))
+
   if (target.workspaceId) {
     // Workspace specified - focus or create window for that workspace
+    mainLog.info('[DeepLink] Looking for window with workspaceId:', target.workspaceId)
     window = windowManager.focusOrCreateWindow(target.workspaceId)
+    mainLog.info('[DeepLink] focusOrCreateWindow result — webContentsId:', window.webContents.id,
+      '| isNew:', !allManagedWindows.some(w => w.window.webContents.id === window!.webContents.id))
   } else {
     // No workspace - use focused window or last active
-    window = windowManager.getFocusedWindow() ?? windowManager.getLastActiveWindow()
+    const focused = windowManager.getFocusedWindow()
+    const lastActive = windowManager.getLastActiveWindow()
+    mainLog.info('[DeepLink] No workspace — focused:', focused?.webContents.id ?? 'none',
+      '| lastActive:', lastActive?.webContents.id ?? 'none')
+    window = focused ?? lastActive
 
     if (!window) {
+      mainLog.warn('[DeepLink] No windows available to navigate')
       // No windows at all - can't navigate without a workspace
       return { success: false, error: 'No active window to navigate' }
     }
@@ -319,11 +378,17 @@ export async function handleDeepLink(
       view: target.view,
       action: target.action,
       actionParams: target.actionParams,
+      attachments,
     }
     if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      mainLog.info('[DeepLink] Sending navigation to window:', window.webContents.id, '| action:', target.action, '| view:', target.view)
       window.webContents.send(IPC_CHANNELS.DEEP_LINK_NAVIGATE, navigation)
+    } else {
+      mainLog.warn('[DeepLink] Window destroyed before navigation could be sent')
     }
   }
 
-  return { success: true, windowId: window.isDestroyed() ? -1 : window.webContents.id }
+  const resultWindowId = window.isDestroyed() ? -1 : window.webContents.id
+  mainLog.info('[DeepLink] Complete — success: true, windowId:', resultWindowId)
+  return { success: true, windowId: resultWindowId }
 }

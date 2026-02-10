@@ -46,6 +46,8 @@ import { NAVIGATE_EVENT } from '../lib/navigate'
 import * as storage from '@/lib/local-storage'
 import type {
   DeepLinkNavigation,
+  FileAttachment,
+  StoredAttachment,
   Session,
   NavigationState,
   SessionFilter,
@@ -154,6 +156,9 @@ export function NavigationProvider({
 
   // Queue navigation if not ready yet
   const pendingNavigationRef = useRef<ParsedRoute | null>(null)
+
+  // Pending file attachments from worker deep links (consumed by handleActionNavigation)
+  const pendingAttachmentsRef = useRef<FileAttachment[] | undefined>(undefined)
 
   // Helper: Check if a session is "done" (completed or cancelled)
   const isSessionDone = useCallback((session: SessionMeta): boolean => {
@@ -301,6 +306,14 @@ export function NavigationProvider({
             await window.electronAPI.sessionCommand(session.id, { type: 'setLabels', labels: [parsed.params.label] })
           }
 
+          // Activate sources if specified (comma-separated slugs)
+          if (parsed.params.sources) {
+            const sourceSlugs = parsed.params.sources.split(',').map(s => s.trim()).filter(Boolean)
+            if (sourceSlugs.length > 0) {
+              await window.electronAPI.sessionCommand(session.id, { type: 'setSources', sourceSlugs })
+            }
+          }
+
           // Determine navigation filter — preserve status/label context if the new session was created with one
           const filter: import('../../shared/types').SessionFilter =
             parsed.params.status ? { kind: 'state', stateId: parsed.params.status } :
@@ -324,18 +337,36 @@ export function NavigationProvider({
             }
           }
 
+          // Consume any pending file attachments from worker deep links
+          const fileAttachments = pendingAttachmentsRef.current
+          pendingAttachmentsRef.current = undefined
+
           // Handle input: either auto-send (if send=true) or pre-fill
           if (parsed.params.input) {
             const shouldSend = parsed.params.send === 'true'
             if (shouldSend) {
               // Auto-send the message immediately after session is ready
-              // Pass badges in options so they're stored with the message
-              setTimeout(() => {
+              // If we have file attachments from the worker, store them in the
+              // session's attachments folder first, then send with both references.
+              setTimeout(async () => {
+                let storedAttachments: StoredAttachment[] | undefined
+                if (fileAttachments && fileAttachments.length > 0) {
+                  storedAttachments = []
+                  for (const attachment of fileAttachments) {
+                    try {
+                      const stored = await window.electronAPI.storeAttachment(session.id, attachment)
+                      storedAttachments.push(stored as StoredAttachment)
+                    } catch (e) {
+                      console.error('[Navigation] Failed to store attachment:', attachment.name, e)
+                    }
+                  }
+                }
+                // Pass badges in options so they're stored with the message
                 window.electronAPI.sendMessage(
                   session.id,
                   parsed.params.input!,
-                  undefined, // attachments
-                  undefined, // storedAttachments
+                  fileAttachments,
+                  storedAttachments,
                   badges ? { badges } : undefined
                 )
               }, 100)
@@ -838,6 +869,10 @@ export function NavigationProvider({
             description: 'The content may have been moved or deleted.',
           })
           return
+        }
+        // Stash attachments for handleActionNavigation to consume
+        if (nav.attachments && nav.attachments.length > 0) {
+          pendingAttachmentsRef.current = nav.attachments
         }
         navigate(route as Route)
       }

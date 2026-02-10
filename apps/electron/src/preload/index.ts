@@ -495,6 +495,19 @@ const api: ElectronAPI = {
   browseForGitBash: () => ipcRenderer.invoke(IPC_CHANNELS.GITBASH_BROWSE),
   setGitBashPath: (path: string) => ipcRenderer.invoke(IPC_CHANNELS.GITBASH_SET_PATH, path),
 
+  // Cloud Proxy (Worker Bridge)
+  getWorkerConfig: () => ipcRenderer.invoke(IPC_CHANNELS.WORKER_GET_CONFIG),
+  setWorkerConfig: (config: { workerUrl: string | null; apiKey: string | null }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.WORKER_SET_CONFIG, config),
+  getWorkerStatus: () => ipcRenderer.invoke(IPC_CHANNELS.WORKER_GET_STATUS),
+  onWorkerStatusChange: (callback: (status: string) => void) => {
+    const handler = (_event: unknown, status: string) => callback(status)
+    ipcRenderer.on(IPC_CHANNELS.WORKER_STATUS_CHANGED, handler)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.WORKER_STATUS_CHANGED, handler)
+    }
+  },
+
   // Menu actions (for unified Craft menu)
   menuQuit: () => ipcRenderer.invoke(IPC_CHANNELS.MENU_QUIT),
   menuNewWindow: () => ipcRenderer.invoke(IPC_CHANNELS.MENU_NEW_WINDOW),
