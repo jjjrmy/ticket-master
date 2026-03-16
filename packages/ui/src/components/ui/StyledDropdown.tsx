@@ -13,12 +13,84 @@
 
 import * as React from 'react'
 import * as DropdownMenuPrimitive from '@radix-ui/react-dropdown-menu'
+import { ChevronRightIcon } from 'lucide-react'
 import { cn } from '../../lib/utils'
+
+const SUPPORTED_HOVER_PREFIXES = ['bg-', 'text-', 'border-', 'ring-', 'opacity-']
+
+/**
+ * Mirror hover styles to open-state styles for Radix triggers.
+ *
+ * Example:
+ * - hover:bg-foreground/5 -> data-[state=open]:bg-foreground/5
+ *
+ * Consumers can still provide explicit data-[state=open]:* classes to override.
+ */
+export function mirrorHoverToOpenStateClasses(className?: string): string | undefined {
+  if (!className) return className
+
+  const tokens = className.trim().split(/\s+/)
+  const mirrored: string[] = []
+
+  for (const token of tokens) {
+    if (!token.includes('hover:')) continue
+
+    const hoverIdx = token.indexOf('hover:')
+    const afterHover = token.slice(hoverIdx + 'hover:'.length)
+    const utility = afterHover.includes(':') ? afterHover.slice(afterHover.lastIndexOf(':') + 1) : afterHover
+
+    if (!SUPPORTED_HOVER_PREFIXES.some(prefix => utility.startsWith(prefix))) continue
+
+    mirrored.push(token.replace('hover:', 'data-[state=open]:'))
+  }
+
+  return cn(...mirrored, className)
+}
 
 // Re-export raw primitives that need no styling
 const DropdownMenu = DropdownMenuPrimitive.Root
-const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger
 const DropdownMenuSub = DropdownMenuPrimitive.Sub
+
+interface DropdownMenuTriggerProps extends React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Trigger> {
+  /** Auto-mirror hover:* classes to data-[state=open]:* while menu is open. Default: true */
+  autoMirrorHoverToOpen?: boolean
+}
+
+const DropdownMenuTrigger = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Trigger>,
+  DropdownMenuTriggerProps
+>(({ className, autoMirrorHoverToOpen = true, asChild, children, ...props }, ref) => {
+  const triggerClassName = autoMirrorHoverToOpen ? mirrorHoverToOpenStateClasses(className) : className
+
+  if (asChild && autoMirrorHoverToOpen && React.isValidElement(children)) {
+    const childClassName = (children.props as { className?: string }).className
+    const mergedChildClassName = mirrorHoverToOpenStateClasses(cn(childClassName, className))
+
+    return (
+      <DropdownMenuPrimitive.Trigger
+        ref={ref}
+        asChild
+        {...props}
+      >
+        {React.cloneElement(children as React.ReactElement<{ className?: string }>, {
+          className: mergedChildClassName,
+        })}
+      </DropdownMenuPrimitive.Trigger>
+    )
+  }
+
+  return (
+    <DropdownMenuPrimitive.Trigger
+      ref={ref}
+      asChild={asChild}
+      className={triggerClassName}
+      {...props}
+    >
+      {children}
+    </DropdownMenuPrimitive.Trigger>
+  )
+})
+DropdownMenuTrigger.displayName = 'DropdownMenuTrigger'
 
 export { DropdownMenu, DropdownMenuTrigger, DropdownMenuSub }
 
@@ -80,7 +152,7 @@ export const StyledDropdownMenuItem = React.forwardRef<
       'data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       // styled additions
       'pr-4 rounded-[4px] hover:bg-foreground/[0.03] focus:bg-foreground/[0.03]',
-      '[&_svg]:size-auto [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:shrink-0',
+      '[&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:shrink-0',
       variant === 'destructive' && 'text-destructive focus:text-destructive hover:text-destructive [&_svg]:!text-destructive',
       className,
     )}
@@ -108,18 +180,21 @@ StyledDropdownMenuSeparator.displayName = 'StyledDropdownMenuSeparator'
 export const StyledDropdownMenuSubTrigger = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.SubTrigger>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubTrigger>
->(({ className, ...props }, ref) => (
+>(({ className, children, ...props }, ref) => (
   <DropdownMenuPrimitive.SubTrigger
     ref={ref}
     className={cn(
       'relative flex cursor-default items-center gap-2 px-2 py-1.5 text-sm outline-hidden select-none',
       '[&_svg]:pointer-events-none [&_svg]:shrink-0',
       'pr-1.5 rounded-[4px] hover:bg-foreground/10 focus:bg-foreground/10 data-[state=open]:bg-foreground/10',
-      '[&_svg]:size-auto [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:shrink-0',
+      '[&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:shrink-0',
       className,
     )}
     {...props}
-  />
+  >
+    {children}
+    <ChevronRightIcon className="ml-auto size-4" />
+  </DropdownMenuPrimitive.SubTrigger>
 ))
 StyledDropdownMenuSubTrigger.displayName = 'StyledDropdownMenuSubTrigger'
 

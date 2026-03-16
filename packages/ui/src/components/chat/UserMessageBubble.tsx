@@ -47,23 +47,6 @@ function EditRequestBadge({ badge }: { badge: ContentBadge }) {
 }
 
 /**
- * UltrathinkBadge - Indicates the message was sent with ultrathink enabled
- * Styled with gradient to match the input area ultrathink badge
- */
-function UltrathinkBadge() {
-  return (
-    <span
-      className="inline-flex items-center h-[28px] px-2.5 rounded-[8px] shadow-tinted bg-gradient-to-r from-blue-600/10 via-purple-600/10 to-pink-600/10 text-xs font-medium"
-      style={{ '--shadow-color': '147, 51, 234' } as React.CSSProperties}
-    >
-      <span className="bg-gradient-to-r from-blue-600 via-purple-600 to-pink-600 bg-clip-text text-transparent">
-        Ultrathink
-      </span>
-    </span>
-  )
-}
-
-/**
  * InlineBadge - Renders a single content badge inline with text
  * Styled to match the input field badges (bg-background with shadow)
  */
@@ -263,9 +246,15 @@ function renderContentWithBadges(
       const textBefore = content.slice(lastEnd, badge.start)
       if (textBefore.trim()) {
         elements.push(
-          <span key={`text-${i}`} className="whitespace-pre-wrap">
+          <Markdown
+            key={`text-${i}`}
+            mode="minimal"
+            onUrlClick={onUrlClick}
+            onFileClick={onFileClick}
+            className="inline text-sm [&_a]:underline [&_code]:bg-foreground/10 [&_p]:whitespace-pre-wrap [&_p]:inline"
+          >
             {textBefore}
-          </span>
+          </Markdown>
         )
       }
     }
@@ -293,9 +282,15 @@ function renderContentWithBadges(
     const textAfter = content.slice(lastEnd)
     if (textAfter.trim()) {
       elements.push(
-        <span key="text-end" className="whitespace-pre-wrap">
+        <Markdown
+          key="text-end"
+          mode="minimal"
+          onUrlClick={onUrlClick}
+          onFileClick={onFileClick}
+          className="inline text-sm [&_a]:underline [&_code]:bg-foreground/10 [&_p]:whitespace-pre-wrap [&_p]:inline"
+        >
           {textAfter}
-        </span>
+        </Markdown>
       )
     }
   }
@@ -321,8 +316,6 @@ export interface UserMessageBubbleProps {
   isPending?: boolean
   /** Whether the message is queued (badge shown) */
   isQueued?: boolean
-  /** Whether the message was sent with ultrathink enabled */
-  ultrathink?: boolean
   /** Compact mode - reduces padding for popover embedding */
   compactMode?: boolean
 }
@@ -336,7 +329,6 @@ export function UserMessageBubble({
   badges,
   isPending,
   isQueued,
-  ultrathink,
   compactMode,
 }: UserMessageBubbleProps) {
   const hasAttachments = attachments && attachments.length > 0
@@ -393,7 +385,7 @@ export function UserMessageBubble({
                   </div>
                 ) : (
                   /* DOCUMENT: Bubble with thumbnail/icon + 2-line text */
-                  <div className="flex items-center gap-2.5 rounded-[8px] bg-foreground/5 pl-1.5 pr-3 py-1.5">
+                  <div className="flex items-center gap-2.5 rounded-[8px] bg-user-message-bubble pl-1.5 pr-3 py-1.5">
                     <div className="h-11 w-8 rounded-[6px] overflow-hidden bg-background shadow-minimal flex items-center justify-center shrink-0">
                       {hasThumbnail ? (
                         <img
@@ -421,10 +413,9 @@ export function UserMessageBubble({
         </div>
       )}
 
-      {/* Badges row - ultrathink and edit request badges above text bubble */}
-      {(ultrathink || hasEditRequestBadges) && (
+      {/* Badges row - edit request badges above text bubble */}
+      {hasEditRequestBadges && (
         <div className="flex gap-2 justify-end max-w-[80%] flex-wrap">
-          {ultrathink && <UltrathinkBadge />}
           {editRequestBadges.map((badge, i) => (
             <EditRequestBadge key={`edit-badge-${i}`} badge={badge} />
           ))}
@@ -434,7 +425,7 @@ export function UserMessageBubble({
       {/* Text content bubble */}
       <div
         className={cn(
-          "max-w-[80%] bg-foreground/5 rounded-[16px] break-words min-w-0 select-text [&_p]:m-0",
+          "max-w-[80%] bg-user-message-bubble rounded-[16px] break-words min-w-0 select-text [&_p]:m-0",
           compactMode ? "px-4 py-2" : "px-5 py-3.5",
           isPending && "animate-shimmer"
         )}

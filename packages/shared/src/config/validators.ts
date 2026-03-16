@@ -64,7 +64,7 @@ const WorkspaceSchema = z.object({
 // --- LLM Connection schema for config validation ---
 
 const LlmProviderTypeSchema = z.enum([
-  'anthropic', 'anthropic_compat', 'openai', 'openai_compat', 'bedrock', 'vertex',
+  'anthropic', 'anthropic_compat', 'openai', 'openai_compat', 'pi', 'pi_compat', 'bedrock', 'vertex', 'copilot',
 ]);
 
 const LlmAuthTypeSchema = z.enum([
@@ -80,6 +80,7 @@ const LlmConnectionSchema = z.object({
   baseUrl: z.string().optional(),
   models: z.array(z.union([z.string(), z.object({ id: z.string() }).passthrough()])).optional(),
   defaultModel: z.string().optional(),
+  modelSelectionMode: z.enum(['automaticallySyncedFromProvider', 'userDefined3Tier']).optional(),
   createdAt: z.number(),
   // Allow additional fields (codexPath, awsRegion, gcpProjectId, etc.)
 }).passthrough();
@@ -90,6 +91,7 @@ export const StoredConfigSchema = z.object({
   activeSessionId: z.string().nullable(),
   llmConnections: z.array(LlmConnectionSchema).optional(),
   defaultLlmConnection: z.string().optional(),
+  defaultThinkingLevel: z.enum(['off', 'think', 'max']).optional(),
   // Note: tokenDisplay, showCost, cumulativeUsage, defaultPermissionMode removed
   // Permission mode and cyclable modes are now per-workspace in workspace config.json
 });
@@ -332,12 +334,12 @@ export function validateAll(workspaceId?: string, workspaceRoot?: string): Valid
     results.push(validateAllSources(workspaceId));
   }
 
-  // Include skill, status, label, hooks, and permissions validation if workspaceRoot is provided
+  // Include skill, status, label, automations, and permissions validation if workspaceRoot is provided
   if (workspaceRoot) {
     results.push(validateAllSkills(workspaceRoot));
     results.push(validateStatuses(workspaceRoot));
     results.push(validateLabels(workspaceRoot));
-    results.push(validateHooks(workspaceRoot));
+    results.push(validateAutomations(workspaceRoot));
     results.push(validateAllPermissions(workspaceRoot));
   }
 
@@ -376,6 +378,10 @@ const McpSourceConfigSchema = z.object({
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   env: z.record(z.string(), z.string()).optional(),
+  // Custom headers for HTTP/SSE transport (e.g., API keys, custom auth)
+  headers: z.record(z.string(), z.string()).optional(),
+  // Header names for credential-store auth (values stored in credential store as JSON)
+  headerNames: z.array(z.string()).optional(),
 }).refine(
   (data) => {
     if (data.transport === 'stdio') {
@@ -414,27 +420,7 @@ const LocalSourceConfigSchema = z.object({
   format: z.string().optional(),
 });
 
-// Source brand and action card schemas
-const SourceCardActionHandlerSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('api'), method: z.string(), path: z.string() }),
-  z.object({ type: z.literal('mcp'), tool: z.string() }),
-  z.object({ type: z.literal('copy') }),
-  z.object({ type: z.literal('open'), urlTemplate: z.string() }),
-]);
-
-const SourceCardActionSchema = z.object({
-  label: z.string().min(1),
-  variant: z.enum(['primary', 'secondary']),
-  handler: SourceCardActionHandlerSchema,
-});
-
-const SourceCardDefinitionSchema = z.object({
-  type: z.string().min(1),
-  label: z.string().min(1),
-  icon: z.string().min(1),
-  actions: z.array(SourceCardActionSchema),
-});
-
+// Source brand schema
 const SourceBrandSchema = z.object({
   color: EntityColorSchema.optional(),
 });
@@ -450,7 +436,6 @@ export const FolderSourceConfigSchema = z.object({
   api: ApiSourceConfigSchema.optional(),
   local: LocalSourceConfigSchema.optional(),
   brand: SourceBrandSchema.optional(),
-  cards: z.array(SourceCardDefinitionSchema).optional(),
   isAuthenticated: z.boolean().optional(),
   lastTestedAt: z.number().int().min(0).optional(),
   // Timestamps are optional - manually created configs may not have them
@@ -897,9 +882,10 @@ const STATUS_CONFIG_FILE = 'statuses/config.json';
 const REQUIRED_FIXED_STATUS_IDS = ['todo', 'done', 'cancelled'] as const;
 
 /**
- * Status icons are simple strings: emoji characters (e.g., "✅") or URLs.
- * Local icon files (statuses/icons/{id}.svg) are auto-discovered at runtime,
- * not referenced in the config.
+ * Status icons are simple strings: emoji characters, URLs, or local filenames
+ * such as "in-progress.svg" which resolve to statuses/icons/in-progress.svg.
+ * When icon is omitted, local icon files (statuses/icons/{id}.svg) are still
+ * auto-discovered at runtime.
  */
 const StatusIconSchema = z.string();
 
@@ -1337,7 +1323,7 @@ import {
   getSourcePermissionsPath,
   getAppPermissionsDir,
 } from '../agent/permissions-config.ts';
-import { validateHooksContent, validateHooks } from '../hooks-simple/index.ts';
+import { validateAutomationsContent, validateAutomations, AUTOMATIONS_CONFIG_FILE } from '../automations/index.ts';
 
 /**
  * Internal: Validate a single permissions.json file
@@ -1517,6 +1503,56 @@ export function isValidPermissionsFile(filePath: string): boolean {
 
 const CSSColorSchema = z.string().min(1);
 
+const ThemeDarkOverrideSchema = z.object({
+  background: CSSColorSchema.optional(),
+  foreground: CSSColorSchema.optional(),
+  accent: CSSColorSchema.optional(),
+  info: CSSColorSchema.optional(),
+  success: CSSColorSchema.optional(),
+  destructive: CSSColorSchema.optional(),
+  paper: CSSColorSchema.optional(),
+  navigator: CSSColorSchema.optional(),
+  input: CSSColorSchema.optional(),
+  popover: CSSColorSchema.optional(),
+  popoverSolid: CSSColorSchema.optional(),
+}).strict();
+
+/**
+ * Zod schema for app-level theme override files (~/.craft-agent/theme.json).
+ * Allows partial overrides but rejects unknown keys.
+ */
+export const ThemeOverrideSchema = z.object({
+  // Semantic colors
+  background: CSSColorSchema.optional(),
+  foreground: CSSColorSchema.optional(),
+  accent: CSSColorSchema.optional(),
+  info: CSSColorSchema.optional(),
+  success: CSSColorSchema.optional(),
+  destructive: CSSColorSchema.optional(),
+  // Surface colors
+  paper: CSSColorSchema.optional(),
+  navigator: CSSColorSchema.optional(),
+  input: CSSColorSchema.optional(),
+  popover: CSSColorSchema.optional(),
+  popoverSolid: CSSColorSchema.optional(),
+  // Scenic mode
+  mode: z.enum(['solid', 'scenic']).optional(),
+  backgroundImage: z.string().optional(),
+  // Dark mode overrides
+  dark: ThemeDarkOverrideSchema.optional(),
+}).strict()
+  .refine(
+    (data) => {
+      const keys = Object.keys(data);
+      return keys.length > 0;
+    },
+    { message: 'Theme override must include at least one supported field' }
+  )
+  .refine(
+    (data) => data.mode !== 'scenic' || Boolean(data.backgroundImage),
+    { message: 'backgroundImage is required when mode is scenic', path: ['backgroundImage'] }
+  );
+
 /**
  * Zod schema for preset theme files.
  * Validates theme structure and requires at least one color property.
@@ -1585,6 +1621,44 @@ export function validateThemeContent(jsonString: string, displayFile: string = '
 
   // Validate schema
   const result = PresetThemeSchema.safeParse(content);
+  if (!result.success) {
+    errors.push(...zodErrorToIssues(result.error, displayFile));
+    return { valid: false, errors, warnings: [] };
+  }
+
+  return {
+    valid: true,
+    errors: [],
+    warnings: [],
+  };
+}
+
+/**
+ * Validate app-level theme override content from a JSON string (no disk reads).
+ * Unlike preset validation, this accepts partial ThemeOverrides objects and rejects unknown keys.
+ */
+export function validateThemeOverrideContent(jsonString: string, displayFile: string = 'theme.json'): ValidationResult {
+  const errors: ValidationIssue[] = [];
+
+  // Parse JSON
+  let content: unknown;
+  try {
+    content = safeJsonParse(jsonString);
+  } catch (e) {
+    return {
+      valid: false,
+      errors: [{
+        file: displayFile,
+        path: '',
+        message: `Invalid JSON: ${e instanceof Error ? e.message : 'Unknown error'}`,
+        severity: 'error',
+      }],
+      warnings: [],
+    };
+  }
+
+  // Validate schema
+  const result = ThemeOverrideSchema.safeParse(content);
   if (!result.success) {
     errors.push(...zodErrorToIssues(result.error, displayFile));
     return { valid: false, errors, warnings: [] };
@@ -1858,7 +1932,7 @@ export function formatValidationResult(result: ValidationResult): string {
  * Result of detecting what type of config file a path corresponds to.
  */
 export interface ConfigFileDetection {
-  type: 'source' | 'skill' | 'statuses' | 'labels' | 'permissions' | 'tool-icons' | 'hooks';
+  type: 'source' | 'skill' | 'statuses' | 'labels' | 'permissions' | 'tool-icons' | 'automations';
   /** Slug of the source or skill (if applicable) */
   slug?: string;
   /** Display file path for error messages */
@@ -1912,9 +1986,9 @@ export function detectConfigFileType(filePath: string, workspaceRootPath: string
     return { type: 'labels', displayFile: 'labels/config.json' };
   }
 
-  // Match: hooks.json (workspace-level)
-  if (relativePath === 'hooks.json') {
-    return { type: 'hooks', displayFile: 'hooks.json' };
+  // Match: automations config file
+  if (relativePath === AUTOMATIONS_CONFIG_FILE) {
+    return { type: 'automations', displayFile: relativePath };
   }
 
   // Match: permissions.json (workspace-level)
@@ -1976,8 +2050,8 @@ export function validateConfigFileContent(
       return validateStatusesContent(content);
     case 'labels':
       return validateLabelsContent(content);
-    case 'hooks':
-      return validateHooksContent(content);
+    case 'automations':
+      return validateAutomationsContent(content, detection.displayFile);
     case 'permissions':
       return validatePermissionsContent(content, detection.displayFile);
     case 'tool-icons':

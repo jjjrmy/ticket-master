@@ -16,7 +16,7 @@
  */
 
 import * as React from 'react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAtomValue } from 'jotai'
 import { Panel } from './Panel'
 import { MultiSelectPanel } from './MultiSelectPanel'
@@ -29,41 +29,100 @@ import {
   isSourcesNavigation,
   isSettingsNavigation,
   isSkillsNavigation,
+  isAutomationsNavigation,
 } from '@/contexts/NavigationContext'
 import { useSessionSelection, useIsMultiSelectActive, useSelectedIds, useSelectionCount } from '@/hooks/useSession'
+import { sourceSelection, skillSelection } from '@/hooks/useEntitySelection'
 import { extractLabelId } from '@craft-agent/shared/labels'
-import type { TodoStateId } from '@/config/todo-states'
+import type { SessionStatusId } from '@/config/session-status-config'
 import { SourceInfoPage, ChatPage } from '@/pages'
 import SkillInfoPage from '@/pages/SkillInfoPage'
 import { getSettingsPageComponent } from '@/pages/settings/settings-pages'
+import { AutomationInfoPage } from '../automations/AutomationInfoPage'
+import type { ExecutionEntry } from '../automations/types'
+import { automationsAtom } from '@/atoms/automations'
 
 export interface MainContentPanelProps {
-  /** Whether the app is in focused mode (single chat, no sidebar) */
-  isFocusedMode?: boolean
+  /** Whether both sidebar and navigator are hidden (focus mode / CMD+.) */
+  isSidebarAndNavigatorHidden?: boolean
   /** Optional className for the container */
   className?: string
+  /**
+   * Override the navigation state for this panel.
+   * When provided, this panel renders based on the override instead of the global NavigationState.
+   * Used by PanelSlot to render panels in the panel stack.
+   */
+  navStateOverride?: import('../../../shared/types').NavigationState | null
 }
 
 export function MainContentPanel({
-  isFocusedMode = false,
+  isSidebarAndNavigatorHidden = false,
   className,
+  navStateOverride,
 }: MainContentPanelProps) {
-  const navState = useNavigationState()
+  const globalNavState = useNavigationState()
+  const navState = navStateOverride ?? globalNavState
   const {
     activeWorkspaceId,
-    onTodoStateChange,
+    onSessionStatusChange,
     onArchiveSession,
     onSessionLabelsChange,
-    todoStates,
+    sessionStatuses,
     labels,
+    onTestAutomation,
+    onToggleAutomation,
+    onDuplicateAutomation,
+    onDeleteAutomation,
+    onReplayAutomation,
+    automationTestResults,
+    getAutomationHistory,
   } = useAppShellContext()
 
-  // Multi-select state
+  // Session multi-select state
   const isMultiSelectActive = useIsMultiSelectActive()
   const selectedIds = useSelectedIds()
   const selectionCount = useSelectionCount()
   const { clearMultiSelect } = useSessionSelection()
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
+  const automations = useAtomValue(automationsAtom)
+
+  // Execution history for the selected automation
+  const selectedAutomationId = isAutomationsNavigation(navState) ? navState.details?.automationId : undefined
+  const [executions, setExecutions] = useState<ExecutionEntry[]>([])
+
+  useEffect(() => {
+    if (!selectedAutomationId || !getAutomationHistory) {
+      setExecutions([])
+      return
+    }
+    let stale = false
+
+    // Initial fetch
+    getAutomationHistory(selectedAutomationId).then(entries => {
+      if (!stale) setExecutions(entries)
+    })
+
+    // Re-fetch on automation changes (live updates when automations fire)
+    const cleanup = window.electronAPI.onAutomationsChanged(() => {
+      if (!stale) {
+        getAutomationHistory(selectedAutomationId).then(entries => {
+          if (!stale) setExecutions(entries)
+        })
+      }
+    })
+
+    return () => { stale = true; cleanup() }
+  }, [selectedAutomationId, getAutomationHistory])
+
+  // Source multi-select state
+  const isSourceMultiSelectActive = sourceSelection.useIsMultiSelectActive()
+  const sourceSelectionCount = sourceSelection.useSelectionCount()
+  const { clearMultiSelect: clearSourceSelection } = sourceSelection.useSelection()
+
+  // Skill multi-select state
+  const isSkillMultiSelectActive = skillSelection.useIsMultiSelectActive()
+  const skillSelectionCount = skillSelection.useSelectionCount()
+  const { clearMultiSelect: clearSkillSelection } = skillSelection.useSelection()
 
   const selectedMetas = useMemo(() => {
     const metas: SessionMeta[] = []
@@ -74,10 +133,10 @@ export function MainContentPanel({
     return metas
   }, [selectedIds, sessionMetaMap])
 
-  const activeStatusId = useMemo((): TodoStateId | null => {
+  const activeStatusId = useMemo((): SessionStatusId | null => {
     if (selectedMetas.length === 0) return null
-    const first = (selectedMetas[0].todoState || 'todo') as TodoStateId
-    const allSame = selectedMetas.every(meta => (meta.todoState || 'todo') === first)
+    const first = (selectedMetas[0].sessionStatus || 'todo') as SessionStatusId
+    const allSame = selectedMetas.every(meta => (meta.sessionStatus || 'todo') === first)
     return allSame ? first : null
   }, [selectedMetas])
 
@@ -96,11 +155,11 @@ export function MainContentPanel({
   }, [selectedMetas])
 
   // Batch operations for multi-select
-  const handleBatchSetStatus = useCallback((status: TodoStateId) => {
+  const handleBatchSetStatus = useCallback((status: SessionStatusId) => {
     selectedIds.forEach(sessionId => {
-      onTodoStateChange(sessionId, status)
+      onSessionStatusChange(sessionId, status)
     })
-  }, [selectedIds, onTodoStateChange])
+  }, [selectedIds, onSessionStatusChange])
 
   const handleBatchArchive = useCallback(() => {
     selectedIds.forEach(sessionId => {
@@ -128,7 +187,7 @@ export function MainContentPanel({
 
   // Wrap content with StoplightProvider so PanelHeaders auto-compensate in focused mode
   const wrapWithStoplight = (content: React.ReactNode) => (
-    <StoplightProvider value={isFocusedMode}>
+    <StoplightProvider value={isSidebarAndNavigatorHidden}>
       {content}
     </StoplightProvider>
   )
@@ -143,8 +202,19 @@ export function MainContentPanel({
     )
   }
 
-  // Sources navigator - show source info or empty state
+  // Sources navigator - show source info, multi-select panel, or empty state
   if (isSourcesNavigation(navState)) {
+    if (isSourceMultiSelectActive) {
+      return wrapWithStoplight(
+        <Panel variant="grow" className={className}>
+          <MultiSelectPanel
+            count={sourceSelectionCount}
+            entityName="Source"
+            onClearSelection={clearSourceSelection}
+          />
+        </Panel>
+      )
+    }
     if (navState.details) {
       return wrapWithStoplight(
         <Panel variant="grow" className={className}>
@@ -165,8 +235,19 @@ export function MainContentPanel({
     )
   }
 
-  // Skills navigator - show skill info or empty state
+  // Skills navigator - show skill info, multi-select panel, or empty state
   if (isSkillsNavigation(navState)) {
+    if (isSkillMultiSelectActive) {
+      return wrapWithStoplight(
+        <Panel variant="grow" className={className}>
+          <MultiSelectPanel
+            count={skillSelectionCount}
+            entityName="Skill"
+            onClearSelection={clearSkillSelection}
+          />
+        </Panel>
+      )
+    }
     if (navState.details?.type === 'skill') {
       return wrapWithStoplight(
         <Panel variant="grow" className={className}>
@@ -187,6 +268,36 @@ export function MainContentPanel({
     )
   }
 
+  // Automations navigator - show automation info or empty state
+  if (isAutomationsNavigation(navState)) {
+    if (navState.details) {
+      const automation = automations.find(h => h.id === navState.details!.automationId)
+      if (automation) {
+        return wrapWithStoplight(
+          <Panel variant="grow" className={className}>
+            <AutomationInfoPage
+              automation={automation}
+              executions={executions}
+              testResult={automationTestResults?.[automation.id]}
+              onTest={onTestAutomation ? () => onTestAutomation(automation.id) : undefined}
+              onToggleEnabled={onToggleAutomation ? () => onToggleAutomation(automation.id) : undefined}
+              onDuplicate={onDuplicateAutomation ? () => onDuplicateAutomation(automation.id) : undefined}
+              onDelete={onDeleteAutomation ? () => onDeleteAutomation(automation.id) : undefined}
+              onReplay={onReplayAutomation}
+            />
+          </Panel>
+        )
+      }
+    }
+    return wrapWithStoplight(
+      <Panel variant="grow" className={className}>
+        <div className="flex items-center justify-center h-full text-muted-foreground">
+          <p className="text-sm">No automations configured</p>
+        </div>
+      </Panel>
+    )
+  }
+
   // Chats navigator - show chat, multi-select panel, or empty state
   if (isSessionsNavigation(navState)) {
     // Multi-select mode: show batch actions panel
@@ -195,7 +306,7 @@ export function MainContentPanel({
         <Panel variant="grow" className={className}>
           <MultiSelectPanel
             count={selectionCount}
-            todoStates={todoStates}
+            sessionStatuses={sessionStatuses}
             activeStatusId={activeStatusId}
             onSetStatus={handleBatchSetStatus}
             labels={labels}
@@ -219,11 +330,7 @@ export function MainContentPanel({
     return wrapWithStoplight(
       <Panel variant="grow" className={className}>
         <div className="flex items-center justify-center h-full text-muted-foreground">
-          <p className="text-sm">
-            {navState.filter.kind === 'flagged'
-              ? 'No flagged conversations'
-              : 'No conversations yet'}
-          </p>
+          <p className="text-sm">No session selected</p>
         </div>
       </Panel>
     )

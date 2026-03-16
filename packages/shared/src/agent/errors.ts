@@ -77,7 +77,7 @@ const ERROR_DEFINITIONS: Record<ErrorCode, Omit<AgentError, 'code' | 'originalEr
   },
   expired_oauth_token: {
     title: 'Session Expired',
-    message: 'Your Claude Max session has expired.',
+    message: 'Your session has expired. Please try signing in again.',
     actions: [
       { key: 'r', label: 'Re-authenticate', action: 'reauth' },
       { key: 's', label: 'Switch API setup', command: '/settings', action: 'settings' },
@@ -271,7 +271,7 @@ export function parseError(error: unknown): AgentError {
   // Check for specific HTTP status codes or patterns
   } else if (lowerMessage.includes('402') || lowerMessage.includes('payment required')) {
     code = 'billing_error';
-  } else if (lowerMessage.includes('401') || lowerMessage.includes('unauthorized') || lowerMessage.includes('invalid api key') || lowerMessage.includes('invalid x-api-key') || lowerMessage.includes('authentication failed')) {
+  } else if (lowerMessage.includes('401') || lowerMessage.includes('unauthorized') || lowerMessage.includes('invalid api key') || lowerMessage.includes('invalid x-api-key') || lowerMessage.includes('authentication failed') || lowerMessage.includes('token is expired') || lowerMessage.includes('token expired')) {
     // Distinguish between API key and OAuth errors
     if (lowerMessage.includes('oauth') || lowerMessage.includes('token') || lowerMessage.includes('session')) {
       code = 'expired_oauth_token';

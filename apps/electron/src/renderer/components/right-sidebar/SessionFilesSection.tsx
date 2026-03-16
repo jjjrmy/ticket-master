@@ -4,7 +4,8 @@
  * Features:
  * - Recursive tree view with expandable folders (matches sidebar styling)
  * - File watcher for auto-refresh when files change
- * - Click to reveal in Finder, double-click to open
+ * - Click to preview in-app, double-click to open
+ * - Right-click context menu with "Open" / "Show in {file manager}" actions
  * - Persisted expanded folder state per session
  *
  * Styling matches LeftSidebar patterns:
@@ -16,11 +17,18 @@
 import * as React from 'react'
 import { useState, useEffect, useCallback, useRef, memo } from 'react'
 import { AnimatePresence, motion, type Variants } from 'motion/react'
-import { File, Folder, FolderOpen, FileText, Image, FileCode, ChevronRight } from 'lucide-react'
+import { File, Folder, FolderOpen, FileText, Image, FileCode, ChevronRight, ExternalLink } from 'lucide-react'
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  StyledContextMenuContent,
+  StyledContextMenuItem,
+} from '@/components/ui/styled-context-menu'
 import type { SessionFile } from '../../../shared/types'
 import { cn } from '@/lib/utils'
 import * as storage from '@/lib/local-storage'
 import { useAppShellContext } from '@/context/AppShellContext'
+import { getFileManagerName } from '@/lib/platform'
 
 /**
  * Stagger animation variants for child items - matches LeftSidebar pattern
@@ -61,6 +69,10 @@ const itemVariants: Variants = {
 export interface SessionFilesSectionProps {
   sessionId?: string
   className?: string
+  /** Absolute session folder path for header actions (e.g. View in Finder) */
+  sessionFolderPath?: string
+  /** Hide section header when embedded inside compact containers (e.g. popovers) */
+  hideHeader?: boolean
 }
 
 /**
@@ -71,6 +83,23 @@ function formatFileSize(bytes?: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/** Collect all directory paths recursively so the tree can start fully expanded. */
+function collectDirectoryPaths(entries: SessionFile[]): string[] {
+  const directories: string[] = []
+  const visit = (items: SessionFile[]) => {
+    for (const item of items) {
+      if (item.type === 'directory') {
+        directories.push(item.path)
+        if (item.children && item.children.length > 0) {
+          visit(item.children)
+        }
+      }
+    }
+  }
+  visit(entries)
+  return directories
 }
 
 /**
@@ -180,6 +209,7 @@ interface FileTreeItemProps {
   onToggleExpand: (path: string) => void
   onFileClick: (file: SessionFile) => void
   onFileDoubleClick: (file: SessionFile) => void
+  onRevealInFileManager: (path: string) => void
   /** Whether this item is inside an expanded folder (for stagger animation) */
   isNested?: boolean
 }
@@ -198,6 +228,7 @@ function FileTreeItem({
   onToggleExpand,
   onFileClick,
   onFileDoubleClick,
+  onRevealInFileManager,
   isNested,
 }: FileTreeItemProps) {
   const isDirectory = file.type === 'directory'
@@ -273,10 +304,32 @@ function FileTreeItem({
     </button>
   )
 
+  const fileManagerName = getFileManagerName()
+
   // Inner content: button and expandable children (wrapped in group/section like LeftSidebar)
   const innerContent = (
     <div className="group/section min-w-0">
-      {buttonElement}
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          {buttonElement}
+        </ContextMenuTrigger>
+        <StyledContextMenuContent>
+          {/* Open — files only (folders just show "Show in file manager") */}
+          {file.type !== 'directory' && (
+            <StyledContextMenuItem onSelect={() => onFileClick(file)}>
+              <ExternalLink className="h-3.5 w-3.5" />
+              Open
+            </StyledContextMenuItem>
+          )}
+          {/* Show in file manager */}
+          <StyledContextMenuItem
+            onSelect={() => onRevealInFileManager(file.path)}
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+            {`Show in ${fileManagerName}`}
+          </StyledContextMenuItem>
+        </StyledContextMenuContent>
+      </ContextMenu>
       {/* Expandable children with framer-motion animation - matches LeftSidebar exactly */}
       {hasChildren && (
         <AnimatePresence initial={false}>
@@ -311,6 +364,7 @@ function FileTreeItem({
                         onToggleExpand={onToggleExpand}
                         onFileClick={onFileClick}
                         onFileDoubleClick={onFileDoubleClick}
+                        onRevealInFileManager={onRevealInFileManager}
                         isNested={true}
                       />
                     </motion.div>
@@ -332,19 +386,29 @@ function FileTreeItem({
 /**
  * Section displaying session files as a tree
  */
-export function SessionFilesSection({ sessionId, className }: SessionFilesSectionProps) {
+export function SessionFilesSection({ sessionId, className, sessionFolderPath, hideHeader = false }: SessionFilesSectionProps) {
   const [files, setFiles] = useState<SessionFile[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
+  const [hasSavedExpandedState, setHasSavedExpandedState] = useState(false)
   const mountedRef = useRef(true)
 
-  // Load expanded paths from storage when session changes
+  // Load expanded paths from storage when session changes.
+  // If no value exists yet, we default to "expand all" after files load.
   useEffect(() => {
     if (sessionId) {
-      const saved = storage.get<string[]>(storage.KEYS.sessionFilesExpandedFolders, [], sessionId)
-      setExpandedPaths(new Set(saved))
+      const raw = storage.getRaw(storage.KEYS.sessionFilesExpandedFolders, sessionId)
+      if (raw !== null) {
+        const saved = storage.get<string[]>(storage.KEYS.sessionFilesExpandedFolders, [], sessionId)
+        setExpandedPaths(new Set(saved))
+        setHasSavedExpandedState(true)
+      } else {
+        setExpandedPaths(new Set())
+        setHasSavedExpandedState(false)
+      }
     } else {
       setExpandedPaths(new Set())
+      setHasSavedExpandedState(false)
     }
   }, [sessionId])
 
@@ -367,6 +431,16 @@ export function SessionFilesSection({ sessionId, className }: SessionFilesSectio
       const sessionFiles = await window.electronAPI.getSessionFiles(sessionId)
       if (mountedRef.current) {
         setFiles(sessionFiles)
+
+        // Default behavior: expand the entire folder tree when there's no saved state yet.
+        if (!hasSavedExpandedState) {
+          const allDirectoryPaths = new Set(collectDirectoryPaths(sessionFiles))
+          if (allDirectoryPaths.size > 0) {
+            setExpandedPaths(allDirectoryPaths)
+            saveExpandedPaths(allDirectoryPaths)
+            setHasSavedExpandedState(true)
+          }
+        }
       }
     } catch (error) {
       console.error('Failed to load session files:', error)
@@ -378,7 +452,7 @@ export function SessionFilesSection({ sessionId, className }: SessionFilesSectio
         setIsLoading(false)
       }
     }
-  }, [sessionId])
+  }, [sessionId, hasSavedExpandedState, saveExpandedPaths])
 
   // Initial load and file watcher setup
   useEffect(() => {
@@ -409,10 +483,16 @@ export function SessionFilesSection({ sessionId, className }: SessionFilesSectio
   }, [sessionId, loadFiles])
 
   // Use the link interceptor (via context) so file clicks show in-app previews
-  // instead of always opening in Finder / default app.
+  // instead of always opening in the file manager / default app.
   const { onOpenFile } = useAppShellContext()
+  const fileManagerName = getFileManagerName()
 
-  // Handle file click — preview in-app if possible, open directory in Finder
+  // Reveal a file/folder in the system file manager
+  const handleRevealInFileManager = useCallback((path: string) => {
+    window.electronAPI.showInFolder(path)
+  }, [])
+
+  // Handle file click — preview in-app if possible, open directory in file manager
   const handleFileClick = useCallback((file: SessionFile) => {
     if (file.type === 'directory') {
       // eslint-disable-next-line craft-links/no-direct-file-open -- directories can't be previewed in-app
@@ -453,9 +533,20 @@ export function SessionFilesSection({ sessionId, className }: SessionFilesSectio
   return (
     <div className={cn('flex flex-col h-full min-h-0', className)}>
       {/* Header - matches sidebar styling with select-none, extra top padding for visual balance */}
-      <div className="flex items-center justify-between px-4 pt-4 pb-2 shrink-0 select-none">
-        <span className="text-xs font-medium text-muted-foreground">Files</span>
-      </div>
+      {!hideHeader && (
+        <div className="flex items-center justify-between px-4 pt-4 pb-2 shrink-0 select-none">
+          <span className="text-xs font-medium text-muted-foreground">Session Files</span>
+          {sessionFolderPath && (
+            <button
+              type="button"
+              onClick={() => window.electronAPI.showInFolder(sessionFolderPath)}
+              className="text-xs text-foreground/50 hover:text-foreground/80 hover:underline underline-offset-2 transition-colors"
+            >
+              {`View in ${fileManagerName}`}
+            </button>
+          )}
+        </div>
+      )}
 
       {/* File tree - px-2 is on nav to match LeftSidebar exactly (constrains grid width) */}
       {/* overflow-x-hidden prevents horizontal scroll, forcing truncation */}
@@ -478,6 +569,7 @@ export function SessionFilesSection({ sessionId, className }: SessionFilesSectio
                 onToggleExpand={handleToggleExpand}
                 onFileClick={handleFileClick}
                 onFileDoubleClick={handleFileDoubleClick}
+                onRevealInFileManager={handleRevealInFileManager}
               />
             ))}
           </nav>

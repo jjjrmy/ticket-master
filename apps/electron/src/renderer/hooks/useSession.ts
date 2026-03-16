@@ -1,28 +1,13 @@
-import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { useCallback, useMemo } from 'react'
-import {
-  type MultiSelectState,
-  createInitialState,
-  singleSelect,
-  toggleSelect,
-  rangeSelect,
-  selectAll,
-  clearMultiSelect,
-  removeFromSelection,
-  isMultiSelectActive,
-  getSelectionCount,
-  isItemSelected,
-} from './useMultiSelect'
-
 /**
- * Session selection atom - manages both single and multi-select state.
+ * Session selection hooks.
  *
- * The state includes:
- * - selected: The currently active/focused session ID
- * - selectedIds: Set of all selected session IDs (for multi-select)
- * - anchorId/anchorIndex: For shift+click range selection
+ * Re-exports from the generic useEntitySelection factory.
+ * The legacy useSession() hook is preserved for backward compatibility.
  */
-const sessionSelectionAtom = atom<MultiSelectState>(createInitialState())
+
+import { useCallback } from 'react'
+import { createInitialState, singleSelect } from './useMultiSelect'
+import { sessionSelection } from './useEntitySelection'
 
 /**
  * Legacy type alias for backward compatibility
@@ -38,108 +23,22 @@ type Config = {
  * @deprecated Use useSessionSelection() for full multi-select support
  */
 export function useSession(): [Config, (config: Config) => void] {
-  const [state, setState] = useAtom(sessionSelectionAtom)
+  const { state, setState } = sessionSelection.useSelectionStore()
 
   const legacySetSession = useCallback((config: Config) => {
     if (config.selected === null) {
       setState(createInitialState())
     } else {
-      // When using legacy setter, treat it as single select
-      // We don't know the index, so we set it to -1 (will be updated on next interaction)
       setState(singleSelect(config.selected, -1))
     }
   }, [setState])
 
-  // Return legacy-compatible shape
   return [{ selected: state.selected }, legacySetSession]
 }
 
-/**
- * Full multi-select hook - provides complete control over selection state.
- */
-export function useSessionSelection() {
-  const [state, setState] = useAtom(sessionSelectionAtom)
-
-  const actions = useMemo(() => ({
-    /**
-     * Single select - clears multi-select and selects one item
-     */
-    select: (id: string, index: number) => {
-      setState(singleSelect(id, index))
-    },
-
-    /**
-     * Toggle select - add/remove item from selection (cmd/ctrl+click)
-     */
-    toggle: (id: string, index: number) => {
-      setState(prev => toggleSelect(prev, id, index))
-    },
-
-    /**
-     * Range select - select all items between anchor and target (shift+click)
-     */
-    selectRange: (toIndex: number, items: string[]) => {
-      setState(prev => rangeSelect(prev, toIndex, items))
-    },
-
-    /**
-     * Select all items
-     */
-    selectAll: (items: string[]) => {
-      setState(selectAll(items))
-    },
-
-    /**
-     * Clear multi-select, keeping only the active item
-     */
-    clearMultiSelect: () => {
-      setState(prev => clearMultiSelect(prev))
-    },
-
-    /**
-     * Remove items from selection (when items are deleted)
-     */
-    removeFromSelection: (ids: string[]) => {
-      setState(prev => removeFromSelection(prev, ids))
-    },
-
-    /**
-     * Reset to initial empty state
-     */
-    reset: () => {
-      setState(createInitialState())
-    },
-  }), [setState])
-
-  return {
-    state,
-    ...actions,
-    isMultiSelectActive: isMultiSelectActive(state),
-    selectionCount: getSelectionCount(state),
-    isSelected: (id: string) => isItemSelected(state, id),
-  }
-}
-
-/**
- * Read-only hook for checking if multi-select is active
- */
-export function useIsMultiSelectActive(): boolean {
-  const state = useAtomValue(sessionSelectionAtom)
-  return isMultiSelectActive(state)
-}
-
-/**
- * Read-only hook for getting selected IDs
- */
-export function useSelectedIds(): Set<string> {
-  const state = useAtomValue(sessionSelectionAtom)
-  return state.selectedIds
-}
-
-/**
- * Read-only hook for getting selection count
- */
-export function useSelectionCount(): number {
-  const state = useAtomValue(sessionSelectionAtom)
-  return getSelectionCount(state)
-}
+// Re-export factory-generated hooks under existing names
+export const useSessionSelection = sessionSelection.useSelection
+export const useSessionSelectionStore = sessionSelection.useSelectionStore
+export const useIsMultiSelectActive = sessionSelection.useIsMultiSelectActive
+export const useSelectedIds = sessionSelection.useSelectedIds
+export const useSelectionCount = sessionSelection.useSelectionCount

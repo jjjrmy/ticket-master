@@ -11,7 +11,7 @@ import { getDefaultSummarizationModel } from '../config/models.ts';
 
 import { debug } from '../utils/debug.ts';
 import { parseError, parseSDKErrorText, type AgentError } from '../agent/errors.ts';
-import { getLastApiError } from '../network-interceptor.ts';
+import { getLastApiError } from '../interceptor-common.ts';
 
 export interface UrlValidationResult {
   valid: boolean;

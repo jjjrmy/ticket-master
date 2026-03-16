@@ -1,9 +1,17 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
 @plugin "@tailwindcss/typography";
 
 /* Tell Tailwind where to scan for utility classes */
-@source "../**/*.{tsx,ts,jsx,js}";
-@source "../../../../packages/ui/src/**/*.{tsx,ts,jsx,js}";
+@source "../renderer/App.tsx";
+@source "../renderer/main.tsx";
+@source "../renderer/components/**/*.{ts,tsx,jsx}";
+@source "../renderer/contexts/**/*.{ts,tsx,jsx}";
+@source "../renderer/hooks/**/*.{ts,tsx,jsx}";
+@source "../renderer/pages/**/*.{ts,tsx,jsx}";
+@source "../renderer/tabs/**/*.{ts,tsx,jsx}";
+@source "../renderer/playground/**/*.{ts,tsx,jsx}";
+@source "../../../../packages/ui/src/components/**/*.{ts,tsx,jsx}";
+@source "../../../../packages/ui/src/lib/**/*.{ts,tsx,jsx}";
 
 /* =============================================================================
    ANIMATABLE CSS CUSTOM PROPERTIES
@@ -71,8 +79,12 @@
 :root {
   /* === 6 BASE COLORS === */
   --background: oklch(0.98 0.003 265);
+  --background-elevated: color-mix(in srgb, var(--foreground) 1.5%, var(--background));
   --foreground: oklch(0.185 0.01 270);
+  --foreground-dimmed: color-mix(in srgb, var(--foreground) 80%, var(--background)); /* unfocused panel text */
   --foreground-rgb: 38, 36, 42;             /* RGB for shadow borders */
+  --user-message-bubble: oklch(from var(--foreground) l c h / 0.05);
+  --user-message-bubble-dimmed: oklch(from var(--foreground) l c h / 0.03);
   --accent: oklch(0.62 0.13 293);           /* purple - brand, Auto mode */
   --accent-rgb: 104, 78, 133;               /* darkened RGB for shadow-tinted (70% of accent) */
   --info: oklch(0.75 0.16 70);              /* amber - warnings, Ask mode */
@@ -93,6 +105,12 @@
     rgba(var(--foreground-rgb), 0.06) 0px 0px 0px 1px,
     rgba(0, 0, 0, var(--shadow-blur-opacity)) 0px 1px 1px -0.5px,
     rgba(0, 0, 0, var(--shadow-blur-opacity)) 0px 3px 3px -1.5px;
+
+  /* Minimal shadow without blur layers — just the border ring */
+  --shadow-minimal-flat:
+    rgba(0, 0, 0, 0) 0px 0px 0px 0px,
+    rgba(0, 0, 0, 0) 0px 0px 0px 0px,
+    rgba(var(--foreground-rgb), 0.06) 0px 0px 0px 1px;
 
   --shadow-modal-small:
     rgba(0, 0, 0, 0) 0px 0px 0px 0px,
@@ -187,6 +205,9 @@
      fullscreen         350     Fullscreen content viewers (above app chrome)
      floating-backdrop  390     Backdrop for floating menus
      floating-menu      400     Floating menus above modals
+     island-overlay     390     Backdrop for annotation island interactions
+     island             400     Annotation island menu surface
+     island-popover     410     Popovers/dropdowns opened from island content
      splash             600     Splash screen, workspace creation
   */
   --z-base: 0;
@@ -201,6 +222,9 @@
   --z-fullscreen: 350;
   --z-floating-backdrop: 390;
   --z-floating-menu: 400;
+  --z-island-overlay: 390;
+  --z-island: 400;
+  --z-island-popover: 410;
   --z-splash: 600;
 
 }
@@ -209,8 +233,12 @@
 .dark {
   /* === 6 BASE COLORS === */
   --background: oklch(0.2 0.005 270);
+  --background-elevated: color-mix(in srgb, var(--foreground) 1.5%, var(--background));
   --foreground: oklch(0.92 0.005 270);
+  --foreground-dimmed: color-mix(in srgb, var(--foreground) 80%, var(--background)); /* unfocused panel text */
   --foreground-rgb: 227, 226, 229;           /* RGB for shadow borders */
+  --user-message-bubble: oklch(from var(--foreground) l c h / 0.05);
+  --user-message-bubble-dimmed: oklch(from var(--foreground) l c h / 0.03);
   --accent: oklch(0.68 0.13 293);            /* brighter purple in dark */
   --accent-rgb: 118, 92, 147;                /* darkened RGB for shadow-tinted (70% of accent) */
   --info: oklch(0.70 0.16 70);               /* amber */
@@ -375,6 +403,8 @@ html[data-font="inter"] {
   /* === SEMANTIC SURFACE COLORS === */
   /* Subtle hover background for sidebar list items (2% foreground opacity) */
   --color-sidebar-hover: oklch(from var(--foreground) l c h / 0.02);
+  /* User message bubble background (overridden on unfocused panels) */
+  --color-user-message-bubble: var(--user-message-bubble);
 
   /* === LEGACY COMPATIBILITY === */
   --color-card: var(--card);
@@ -409,6 +439,9 @@ html[data-font="inter"] {
   --z-index-fullscreen: var(--z-fullscreen);
   --z-index-floating-backdrop: var(--z-floating-backdrop);
   --z-index-floating-menu: var(--z-floating-menu);
+  --z-index-island-overlay: var(--z-island-overlay);
+  --z-index-island: var(--z-island);
+  --z-index-island-popover: var(--z-island-popover);
   --z-index-splash: var(--z-splash);
 
   --shadow-2xs: var(--shadow-2xs);
@@ -481,6 +514,11 @@ html[data-font="inter"] {
     box-shadow: var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow, 0 0 #0000);
   }
 
+  /* Thin horizontal scrollbar for panel stack */
+  .panel-scroll::-webkit-scrollbar {
+    height: 4px;
+  }
+
   /* Hide scrollbar but keep scrolling */
   .scrollbar-hide {
     -ms-overflow-style: none;
@@ -488,6 +526,24 @@ html[data-font="inter"] {
   }
   .scrollbar-hide::-webkit-scrollbar {
     display: none;
+  }
+
+  /* Hide scrollbar until parent .group is hovered */
+  .scrollbar-hover::-webkit-scrollbar {
+    width: 4px;
+  }
+  .scrollbar-hover::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-hover::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 4px;
+  }
+  .group:hover .scrollbar-hover::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
+  .group:hover .scrollbar-hover::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
   }
 
   /* Mask fade utilities - for fading content at edges over transparent/image backgrounds */
@@ -510,6 +566,15 @@ html[data-font="inter"] {
       rgba(0, 0, 0, 0) 0px 0px 0px 0px,
       rgba(0, 0, 0, 0) 0px 0px 0px 0px,
       rgba(var(--foreground-rgb), 0.06) 0px 0px 0px 1px;
+  }
+
+  /* Semantic inset separators for table rows/headers (border-like, but shadow-based) */
+  .shadow-bottom-border {
+    box-shadow: inset 0 -1.5px 0 var(--color-border);
+  }
+
+  .shadow-bottom-border-thin {
+    box-shadow: inset 0 -1px 0 var(--color-border);
   }
 
   .shadow-minimal {
@@ -560,6 +625,46 @@ html[data-font="inter"] {
       rgba(0, 0, 0, var(--shadow-blur-opacity)) 0px 6px 6px -3px,
       rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.67)) 0px 12px 12px -6px,
       rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.67)) 0px 24px 24px -12px;
+  }
+
+  .shadow-panel-focused {
+    position: relative;
+    box-shadow:
+      rgba(0, 0, 0, 0) 0px 0px 0px 0px,
+      rgba(0, 0, 0, 0) 0px 0px 0px 0px,
+      rgba(0, 0, 0, 0) 0px 0px 0px 0px,
+      rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.67)) 0px 1px 1px -0.5px,
+      rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.67)) 0px 3px 3px 1px,
+      rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.5)) 0px 6px 6px 2px,
+      rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.5)) 0px 12px 12px 3px,
+      rgba(0, 0, 0, calc(var(--shadow-blur-opacity) * 0.33)) 0px 24px 24px 4px;
+  }
+
+  /* Gradient border: lighter at top, stronger at bottom */
+  .shadow-panel-focused::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      to bottom,
+      rgba(var(--foreground-rgb), 0.1),
+      rgba(var(--foreground-rgb), 0.3)
+    );
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* Ensure content sits above the ::before pseudo-element */
+  .shadow-panel-focused > * {
+    position: relative;
+    z-index: 2;
   }
 
   .shadow-modal-small {
@@ -933,6 +1038,16 @@ html.dark[data-scenic] .fullscreen-overlay-background {
   border-radius: inherit;
 }
 
+/* Browser loading line — accent gradient sliding left→right */
+@keyframes shimmer-loading {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.animate-shimmer-loading {
+  animation: shimmer-loading 1.2s linear infinite;
+}
+
 /* Text shimmer - subtle opacity pulse for inline text (title regeneration, etc.) */
 .animate-shimmer-text {
   animation: shimmer-text 1.2s ease-in-out infinite;
@@ -1001,6 +1116,7 @@ html.dark[data-scenic] .fullscreen-overlay-background {
 
 /* Description (subtitle) at 70% opacity */
 [data-sonner-toast] [data-description] {
+  color: inherit !important;
   opacity: 0.7 !important;
 }
 
@@ -1022,21 +1138,34 @@ html.dark[data-scenic] .fullscreen-overlay-background {
   left: unset !important;
   right: -14px !important;
   opacity: 0 !important;
-  transition: opacity 0.15s ease !important;
+  transition: opacity 0.15s ease, color 0.15s ease !important;
   background-color: var(--background) !important;
+  color: oklch(from var(--foreground) l c h / 0.7) !important;
   border: none !important;
   box-shadow:
-    rgba(0, 0, 0, 0) 0px 0px 0px 0px,
-    rgba(0, 0, 0, 0) 0px 0px 0px 0px,
     rgba(var(--foreground-rgb), 0.06) 0px 0px 0px 1px,
-    rgba(0, 0, 0, var(--shadow-blur-opacity)) 0px 1px 1px -0.5px,
-    rgba(0, 0, 0, var(--shadow-blur-opacity)) 0px 3px 3px -1.5px,
-    rgba(0, 0, 0, var(--shadow-blur-opacity)) 0px 6px 6px -3px !important;
+    var(--shadow-minimal) !important;
 }
 
 [data-sonner-toast].group:hover [data-close-button],
 [data-sonner-toast]:hover [data-close-button] {
   opacity: 1 !important;
+}
+
+[data-sonner-toast] [data-close-button]:hover {
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast]:focus-visible {
+  box-shadow:
+    var(--shadow-modal-small),
+    0 0 0 2px rgba(var(--foreground-rgb), 0.18) !important;
+}
+
+[data-sonner-toast] [data-close-button]:focus-visible {
+  box-shadow:
+    var(--shadow-minimal),
+    0 0 0 2px rgba(var(--foreground-rgb), 0.18) !important;
 }
 
 /* Tinted backgrounds for toast states - use linear-gradient to layer

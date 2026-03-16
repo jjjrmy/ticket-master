@@ -9,7 +9,6 @@
 import * as React from 'react'
 import { createContext, useContext, useCallback } from 'react'
 import { useAtomValue } from 'jotai'
-import type { RichTextInputHandle } from '@/components/ui/rich-text-input'
 import type { ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
 import type {
   Session,
@@ -19,13 +18,14 @@ import type {
   CredentialRequest,
   CredentialResponse,
   PermissionMode,
-  TodoState,
+  SessionStatus,
   LoadedSource,
   LoadedSkill,
   NewChatActionParams,
   LlmConnectionWithStatus,
+  TestAutomationResult,
 } from '../../shared/types'
-import type { TodoState as TodoStateConfig } from '@/config/todo-states'
+import type { SessionStatus as SessionStatusConfig } from '@/config/session-status-config'
 import type { SessionOptions, SessionOptionUpdates } from '../hooks/useSessionOptions'
 import { defaultSessionOptions } from '../hooks/useSessionOptions'
 import { sessionAtomFamily } from '../atoms/sessions'
@@ -60,9 +60,9 @@ export interface AppShellContextType {
   /** Enabled permission modes for Shift+Tab cycling */
   enabledModes?: PermissionMode[]
   /** Dynamic todo states from workspace config (provided by AppShell, defaults to empty) */
-  todoStates?: TodoStateConfig[]
+  sessionStatuses?: SessionStatusConfig[]
 
-  // Unified session options (replaces ultrathinkSessions and sessionModes)
+  // Unified session options map
   /** All session-scoped options in one map. Use useSessionOptionsFor() hook for easy access. */
   sessionOptions: Map<string, SessionOptions>
 
@@ -78,7 +78,7 @@ export interface AppShellContextType {
   onMarkSessionUnread: (sessionId: string) => void
   /** Track which session user is viewing (for unread state machine) */
   onSetActiveViewingSession: (sessionId: string) => void
-  onTodoStateChange: (sessionId: string, state: TodoState) => void
+  onSessionStatusChange: (sessionId: string, state: SessionStatus) => void
   onDeleteSession: (sessionId: string, skipConfirmation?: boolean) => Promise<boolean>
 
   // Permission handling
@@ -86,7 +86,8 @@ export interface AppShellContextType {
     sessionId: string,
     requestId: string,
     allowed: boolean,
-    alwaysAllow: boolean
+    alwaysAllow: boolean,
+    options?: import('../../shared/types').PermissionResponseOptions
   ) => void
 
   // Credential handling
@@ -110,7 +111,7 @@ export interface AppShellContextType {
   onOpenStoredUserPreferences: () => void
   onReset: () => void
 
-  // Unified session options callback (replaces onUltrathinkChange, onSkipPermissionsChange, onModeChange)
+  // Unified session options callback
   onSessionOptionsChange: (sessionId: string, updates: SessionOptionUpdates) => void
 
   // Input draft callback
@@ -119,14 +120,14 @@ export interface AppShellContextType {
   // Source selection callback (per-session) - provided by AppShell component
   onSessionSourcesChange?: (sessionId: string, sourceSlugs: string[]) => void
 
-  // Chat input ref (for focusing)
-  textareaRef?: React.RefObject<RichTextInputHandle>
-
   // Open a new chat with optional agent, name, and pre-filled input
   openNewChat?: (params?: NewChatActionParams) => Promise<void>
 
   // Right sidebar button (for page headers)
   rightSidebarButton?: React.ReactNode
+
+  /** Whether this panel is the focused panel (for multi-panel visual differentiation) */
+  isFocusedPanel?: boolean
 
   // Session list search state (for ChatDisplay highlighting)
   /** Current search query from session list - used to highlight matches in ChatDisplay */
@@ -139,6 +140,22 @@ export interface AppShellContextType {
   chatDisplayRef?: React.RefObject<ChatDisplayHandle>
   /** Callback when ChatDisplay match info changes (for immediate UI updates) */
   onChatMatchInfoChange?: (info: { count: number; index: number }) => void
+
+  // Automation management
+  /** Test an automation by ID — executes its actions and returns results */
+  onTestAutomation?: (automationId: string) => void
+  /** Toggle an automation's enabled state by ID */
+  onToggleAutomation?: (automationId: string) => void
+  /** Duplicate an automation by ID — clones config with " Copy" suffix */
+  onDuplicateAutomation?: (automationId: string) => void
+  /** Delete an automation by ID — removes from automations config */
+  onDeleteAutomation?: (automationId: string) => void
+  /** Map of automationId → last test result */
+  automationTestResults?: Record<string, import('../components/automations/types').TestResult>
+  /** Fetch execution history for an automation by ID */
+  getAutomationHistory?: (automationId: string) => Promise<import('../components/automations/types').ExecutionEntry[]>
+  /** Replay (re-execute) webhook actions for a failed automation */
+  onReplayAutomation?: (automationId: string, event: string) => void
 }
 
 const AppShellContext = createContext<AppShellContextType | null>(null)
@@ -206,15 +223,13 @@ export function usePendingCredential(sessionId: string): CredentialRequest | und
  * This is the primary way components should access session options.
  *
  * Usage:
- *   const { options, setPermissionMode, toggleUltrathink } = useSessionOptionsFor(sessionId)
- *   if (options.ultrathinkEnabled) { ... }
+ *   const { options, setPermissionMode } = useSessionOptionsFor(sessionId)
  *   setPermissionMode('safe')
  */
 export function useSessionOptionsFor(sessionId: string): {
   options: SessionOptions
   setOption: <K extends keyof SessionOptions>(key: K, value: SessionOptions[K]) => void
   setOptions: (updates: SessionOptionUpdates) => void
-  toggleUltrathink: () => void
   setPermissionMode: (mode: PermissionMode) => void
   isSafeModeActive: () => boolean
 } {
@@ -233,10 +248,6 @@ export function useSessionOptionsFor(sessionId: string): {
     onSessionOptionsChange(sessionId, updates)
   }, [sessionId, onSessionOptionsChange])
 
-  const toggleUltrathink = useCallback(() => {
-    setOption('ultrathinkEnabled', !options.ultrathinkEnabled)
-  }, [options.ultrathinkEnabled, setOption])
-
   const setPermissionMode = useCallback((mode: PermissionMode) => {
     setOption('permissionMode', mode)
   }, [setOption])
@@ -249,7 +260,6 @@ export function useSessionOptionsFor(sessionId: string): {
     options,
     setOption,
     setOptions,
-    toggleUltrathink,
     setPermissionMode,
     isSafeModeActive,
   }

@@ -10,13 +10,13 @@ import { join } from "path";
 const ROOT_DIR = join(import.meta.dir, "..");
 const DIST_DIR = join(ROOT_DIR, "apps/electron/dist");
 const OUTPUT_FILE = join(DIST_DIR, "main.cjs");
-const COPILOT_INTERCEPTOR_SOURCE = join(ROOT_DIR, "packages/shared/src/copilot-network-interceptor.ts");
-const COPILOT_INTERCEPTOR_OUTPUT = join(DIST_DIR, "copilot-interceptor.cjs");
-const BRIDGE_SERVER_DIR = join(ROOT_DIR, "packages/bridge-mcp-server");
-const BRIDGE_SERVER_OUTPUT = join(BRIDGE_SERVER_DIR, "dist/index.js");
+const INTERCEPTOR_SOURCE = join(ROOT_DIR, "packages/shared/src/unified-network-interceptor.ts");
+const INTERCEPTOR_OUTPUT = join(DIST_DIR, "interceptor.cjs");
 const SESSION_TOOLS_CORE_DIR = join(ROOT_DIR, "packages/session-tools-core");
 const SESSION_SERVER_DIR = join(ROOT_DIR, "packages/session-mcp-server");
 const SESSION_SERVER_OUTPUT = join(SESSION_SERVER_DIR, "dist/index.js");
+const PI_AGENT_SERVER_DIR = join(ROOT_DIR, "packages/pi-agent-server");
+const PI_AGENT_SERVER_OUTPUT = join(PI_AGENT_SERVER_DIR, "dist/index.js");
 
 // Load .env file if it exists
 function loadEnvFile(): void {
@@ -53,6 +53,7 @@ function getBuildDefines(): string[] {
     "MICROSOFT_OAUTH_CLIENT_ID",
     "MICROSOFT_OAUTH_CLIENT_SECRET",
     "SENTRY_ELECTRON_INGEST_URL",
+    "CRAFT_DEV_RUNTIME",
   ];
 
   return definedVars.map((varName) => {
@@ -132,18 +133,18 @@ function verifySessionToolsCore(): void {
   console.log("✅ Session tools core verified");
 }
 
-// Build the Copilot network interceptor (bundled CJS loaded via NODE_OPTIONS="--require ..." into Copilot CLI subprocess)
-async function buildCopilotInterceptor(): Promise<void> {
-  console.log("🔌 Building Copilot network interceptor...");
+// Build the unified network interceptor (bundled CJS loaded via --require into Node-based SDK subprocesses)
+async function buildInterceptor(): Promise<void> {
+  console.log("🔌 Building unified network interceptor...");
 
   const proc = spawn({
     cmd: [
       "bun", "run", "esbuild",
-      COPILOT_INTERCEPTOR_SOURCE,
+      INTERCEPTOR_SOURCE,
       "--bundle",
       "--platform=node",
       "--format=cjs",
-      `--outfile=${COPILOT_INTERCEPTOR_OUTPUT}`,
+      `--outfile=${INTERCEPTOR_OUTPUT}`,
     ],
     cwd: ROOT_DIR,
     stdout: "inherit",
@@ -153,55 +154,16 @@ async function buildCopilotInterceptor(): Promise<void> {
   const exitCode = await proc.exited;
 
   if (exitCode !== 0) {
-    console.error("❌ Copilot interceptor build failed with exit code", exitCode);
+    console.error("❌ Interceptor build failed with exit code", exitCode);
     process.exit(exitCode);
   }
 
-  if (!existsSync(COPILOT_INTERCEPTOR_OUTPUT)) {
-    console.error("❌ Copilot interceptor output not found at", COPILOT_INTERCEPTOR_OUTPUT);
+  if (!existsSync(INTERCEPTOR_OUTPUT)) {
+    console.error("❌ Interceptor output not found at", INTERCEPTOR_OUTPUT);
     process.exit(1);
   }
 
-  console.log("✅ Copilot interceptor built successfully");
-}
-
-// Build the Bridge MCP Server (used for API sources in Codex sessions)
-async function buildBridgeServer(): Promise<void> {
-  console.log("🌉 Building Bridge MCP Server...");
-
-  // Ensure dist directory exists
-  const distDir = join(BRIDGE_SERVER_DIR, "dist");
-  if (!existsSync(distDir)) {
-    mkdirSync(distDir, { recursive: true });
-  }
-
-  const proc = spawn({
-    cmd: [
-      "bun", "build",
-      join(BRIDGE_SERVER_DIR, "src/index.ts"),
-      "--outfile", BRIDGE_SERVER_OUTPUT,
-      "--target", "node",
-      "--format", "cjs",
-    ],
-    cwd: ROOT_DIR,
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-
-  const exitCode = await proc.exited;
-
-  if (exitCode !== 0) {
-    console.error("❌ Bridge server build failed with exit code", exitCode);
-    process.exit(exitCode);
-  }
-
-  // Verify output exists
-  if (!existsSync(BRIDGE_SERVER_OUTPUT)) {
-    console.error("❌ Bridge server output not found at", BRIDGE_SERVER_OUTPUT);
-    process.exit(1);
-  }
-
-  console.log("✅ Bridge server built successfully");
+  console.log("✅ Interceptor built successfully");
 }
 
 // Build the Session MCP Server (provides session-scoped tools like SubmitPlan for Codex sessions)
@@ -243,6 +205,55 @@ async function buildSessionServer(): Promise<void> {
   console.log("✅ Session server built successfully");
 }
 
+// Build the Pi Agent Server (subprocess for Pi SDK sessions)
+// Optional: skips if package directory is missing (e.g., not synced to OSS).
+async function buildPiAgentServer(): Promise<void> {
+  if (!existsSync(join(PI_AGENT_SERVER_DIR, "src"))) {
+    console.log("⏭️  Pi agent server skipped (package not found)");
+    return;
+  }
+
+  console.log("🥧 Building Pi Agent Server...");
+
+  // Ensure dist directory exists
+  const distDir = join(PI_AGENT_SERVER_DIR, "dist");
+  if (!existsSync(distDir)) {
+    mkdirSync(distDir, { recursive: true });
+  }
+
+  // Use --target=bun --format=esm because the Pi SDK (@mariozechner/pi-coding-agent)
+  // is ESM-only. --target=node --format=cjs leaves ESM deps as external require()
+  // calls that fail at runtime since there are no node_modules relative to dist/.
+  const proc = spawn({
+    cmd: [
+      "bun", "build",
+      join(PI_AGENT_SERVER_DIR, "src/index.ts"),
+      "--outfile", PI_AGENT_SERVER_OUTPUT,
+      "--target", "bun",
+      "--format", "esm",
+      "--external", "koffi",
+    ],
+    cwd: ROOT_DIR,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0) {
+    console.error("❌ Pi agent server build failed with exit code", exitCode);
+    process.exit(exitCode);
+  }
+
+  // Verify output exists
+  if (!existsSync(PI_AGENT_SERVER_OUTPUT)) {
+    console.error("❌ Pi agent server output not found at", PI_AGENT_SERVER_OUTPUT);
+    process.exit(1);
+  }
+
+  console.log("✅ Pi agent server built successfully");
+}
+
 async function main(): Promise<void> {
   loadEnvFile();
 
@@ -254,15 +265,15 @@ async function main(): Promise<void> {
   // Verify session tools core exists (shared utilities for session-scoped tools)
   verifySessionToolsCore();
 
-  // Build bridge server (needed for API sources in Codex sessions)
-  await buildBridgeServer();
-
-  // Build session server (provides session-scoped tools like SubmitPlan for Codex sessions)
+  // Build session server (provides session-scoped tools like SubmitPlan)
   // Depends on session-tools-core being built first
   await buildSessionServer();
 
-  // Build Copilot network interceptor (CJS bundle for Node.js --require)
-  await buildCopilotInterceptor();
+  // Build Pi agent server (subprocess for Pi SDK sessions)
+  await buildPiAgentServer();
+
+  // Build unified network interceptor (CJS bundle for Node.js --require)
+  await buildInterceptor();
 
   const buildDefines = getBuildDefines();
 

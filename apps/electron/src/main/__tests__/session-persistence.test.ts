@@ -5,7 +5,7 @@
  * 3. Orphaned llmConnection references must be detected
  */
 import { describe, it, expect } from 'bun:test'
-import { DEFAULT_MODEL, DEFAULT_CODEX_MODEL, isCodexModel } from '@craft-agent/shared/config'
+import { DEFAULT_MODEL } from '@craft-agent/shared/config'
 
 // ============================================================================
 // createdAt preservation during persistence
@@ -75,47 +75,6 @@ describe('model resolution with null connection', () => {
     })
   })
 
-  describe('Codex backend', () => {
-    it('falls back to DEFAULT_CODEX_MODEL when connection is null and session has no model', () => {
-      const managed = { model: undefined as string | undefined }
-      const connection = null as { defaultModel: string } | null
-
-      const rawCodexModel = managed.model || connection?.defaultModel
-      const codexModel = (rawCodexModel && isCodexModel(rawCodexModel))
-        ? rawCodexModel
-        : (connection?.defaultModel || DEFAULT_CODEX_MODEL)
-
-      expect(codexModel).toBe(DEFAULT_CODEX_MODEL)
-      expect(codexModel).toBeTruthy()
-    })
-
-    it('rejects non-codex model and falls back to DEFAULT_CODEX_MODEL', () => {
-      // Session has a Claude model (stale data from switching providers)
-      const managed = { model: 'claude-sonnet-4-20250514' }
-      const connection = null as { defaultModel: string } | null
-
-      const rawCodexModel = managed.model || connection?.defaultModel
-      const codexModel = (rawCodexModel && isCodexModel(rawCodexModel))
-        ? rawCodexModel
-        : (connection?.defaultModel || DEFAULT_CODEX_MODEL)
-
-      // Should NOT use the Claude model for Codex backend
-      expect(codexModel).toBe(DEFAULT_CODEX_MODEL)
-    })
-
-    it('uses valid codex model from session', () => {
-      // isCodexModel checks if model name contains "codex"
-      const managed = { model: DEFAULT_CODEX_MODEL }
-      const connection = null as { defaultModel: string } | null
-
-      const rawCodexModel = managed.model || connection?.defaultModel
-      const codexModel = (rawCodexModel && isCodexModel(rawCodexModel))
-        ? rawCodexModel
-        : (connection?.defaultModel || DEFAULT_CODEX_MODEL)
-
-      expect(codexModel).toBe(DEFAULT_CODEX_MODEL)
-    })
-  })
 })
 
 // ============================================================================

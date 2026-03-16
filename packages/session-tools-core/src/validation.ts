@@ -199,7 +199,9 @@ export const SkillMetadataSchema = z.object({
   description: z.string().min(1, "Add a 'description' field explaining what this skill does"),
   globs: z.array(z.string()).optional(),
   alwaysAllow: z.array(z.string()).optional(),
-});
+  icon: z.string().optional(),
+  requiredSources: z.array(z.string()).optional(),
+}).passthrough();
 
 /**
  * Validate skill SKILL.md content (without filesystem access).

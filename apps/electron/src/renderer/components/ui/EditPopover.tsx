@@ -84,6 +84,7 @@ export type EditContextKey =
   | 'add-label'
   | 'edit-views'
   | 'edit-tool-icons'
+  | 'automation-config'
 
 /**
  * Full edit configuration including context for agent and example for UI.
@@ -171,7 +172,7 @@ const EDIT_CONFIGS: Record<EditContextKey, (location: string) => EditConfig> = {
       filePath: `${location}/SKILL.md`,
       context:
         'The user is editing skill metadata in the YAML frontmatter of SKILL.md. ' +
-        'Frontmatter fields: name (required), description (required), globs (optional array), alwaysAllow (optional array). ' +
+        'Frontmatter fields: name (required), description (required), globs (optional array), alwaysAllow (optional array), requiredSources (optional array of source slugs), icon (optional string — emoji or URL). ' +
         'Keep the content after the frontmatter unchanged unless specifically requested. ' +
         'After editing, call skill_validate with the skill slug to verify the changes. ' +
         'Confirm clearly when done.',
@@ -365,7 +366,7 @@ const EDIT_CONFIGS: Record<EditContextKey, (location: string) => EditConfig> = {
         'The user wants to customize session statuses (workflow states). ' +
         'Statuses are stored in statuses/config.json with fields: id, label, icon, category (open/closed), order, isFixed, isDefault. ' +
         'Fixed statuses (todo, done, cancelled) cannot be deleted but can be reordered or have their label changed. ' +
-        'Icon can be { type: "file", value: "name.svg" } for custom icons in statuses/icons/ or { type: "lucide", value: "icon-name" } for Lucide icons. ' +
+        'Icon can be an emoji, an https URL, or a local filename like "name.svg" that maps to statuses/icons/name.svg. ' +
         'Category "open" shows in inbox, "closed" shows in archive. ' +
         'After editing, call config_validate with target "statuses" to verify the changes. ' +
         'Confirm clearly when done.',
@@ -447,7 +448,7 @@ const EDIT_CONFIGS: Record<EditContextKey, (location: string) => EditConfig> = {
         'The user wants to edit views (dynamic, expression-based filters). ' +
         'Views are stored in views.json at the workspace root under a "views" array. ' +
         'Each view has: id (unique slug), name (display text), description (optional), color (optional EntityColor), expression (Filtrex string). ' +
-        'Expressions are evaluated against session context fields: name, preview, todoState, permissionMode, model, lastMessageRole, ' +
+        'Expressions are evaluated against session context fields: name, preview, sessionStatus (also available as deprecated alias todoState), permissionMode, model, lastMessageRole, ' +
         'lastUsedAt, createdAt, messageCount, labelCount, isFlagged, hasUnread, isProcessing, hasPendingPlan, tokenUsage.*, labels. ' +
         'Available functions: daysSince(timestamp), contains(array, value). ' +
         'Colors use EntityColor format: string shorthand (e.g. "orange") or { light, dark } object. ' +
@@ -478,6 +479,23 @@ const EDIT_CONFIGS: Record<EditContextKey, (location: string) => EditConfig> = {
     model: 'haiku',               // Use fast model for quick config edits
     systemPromptPreset: 'mini',   // Use focused mini prompt
     inlineExecution: true,        // Execute inline in popover
+  }),
+
+  'automation-config': (location) => ({
+    context: {
+      label: 'Automation Configuration',
+      filePath: `${location}/automations.json`,
+      context:
+        'The user is editing automations.json which configures automations. ' +
+        'Structure: { version: 2, automations: { EventName: [{ name?, matcher?, cron?, timezone?, permissionMode?, labels?, actions: [...] }] } }. ' +
+        'Each event maps to an array of matcher entries. Each matcher has an actions array ({ type: "prompt", prompt }). ' +
+        'Read ~/.craft-agent/docs/automations.md for full format reference. ' +
+        'After editing, confirm clearly what changed.',
+    },
+    example: 'Change the cron schedule to every 30 minutes',
+    model: 'sonnet',
+    systemPromptPreset: 'mini',
+    inlineExecution: true,
   }),
 }
 
@@ -516,8 +534,8 @@ export interface EditPopoverProps {
   example?: string
   /** Context passed to the new chat session */
   context: EditContext
-  /** Permission mode for the new session (default: 'allow-all' for fast execution) */
-  permissionMode?: 'safe' | 'ask' | 'allow-all'
+  /** Permission mode for the new session (default: 'allow-all' / canonical: execute for fast execution) */
+  permissionMode?: CreateSessionOptions['permissionMode']
   /**
    * Working directory for the new session:
    * - 'none' (default): No working directory (session folder only) - best for config edits
@@ -940,11 +958,10 @@ export function EditPopover({
             {/* Container */}
             <div
               ref={popoverRef}
-              className="relative bg-foreground-2 overflow-hidden w-full h-full"
+              className="relative bg-foreground-2 overflow-hidden w-full h-full shadow-modal-small"
               style={{
                 transform: `translate(${dragOffset.x}px, ${dragOffset.y}px)`,
                 borderRadius: 16,
-                boxShadow: '0 4px 24px rgba(0, 0, 0, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.05)',
               }}
             >
               {/* Drag handle - floating overlay */}

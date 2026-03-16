@@ -18,6 +18,9 @@ import { CONFIG_DIR } from './paths.ts';
 import type { StoredAttachment, StoredMessage } from '@craft-agent/core/types';
 import type { Plan } from '../agent/plan-types.ts';
 import type { PermissionMode } from '../agent/mode-manager.ts';
+import type { ThinkingLevel } from '../agent/thinking-levels.ts';
+import { isValidThinkingLevel } from '../agent/thinking-levels.ts';
+import { parsePermissionMode, PERMISSION_MODE_ORDER } from '../agent/mode-types.ts';
 import { type ConfigDefaults } from './config-defaults-schema.ts';
 import { isValidThemeFile } from './validators.ts';
 
@@ -37,10 +40,9 @@ import type { Workspace, AuthType } from '@craft-agent/core/types';
 
 // Import LLM connection types and constants
 import type { LlmConnection } from './llm-connections.ts';
-import { isValidProviderAuthCombination, getDefaultModelsForConnection, getDefaultModelForConnection } from './llm-connections.ts';
+import { isValidProviderAuthCombination, getDefaultModelsForConnection, getDefaultModelForConnection, isPiProvider } from './llm-connections.ts';
 import {
   getModelProvider,
-  isCodexModel,
 } from './models.ts';
 
 // Config stored in JSON file (credentials stored in encrypted file, not here)
@@ -48,6 +50,7 @@ export interface StoredConfig {
   // LLM Connections (authoritative source for auth and model config)
   llmConnections?: LlmConnection[];
   defaultLlmConnection?: string;  // Slug of default connection for new sessions
+  defaultThinkingLevel?: ThinkingLevel;  // App-level default thinking level for new sessions
 
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
@@ -62,14 +65,14 @@ export interface StoredConfig {
   autoCapitalisation?: boolean;  // Auto-capitalize first letter when typing (default: true)
   sendMessageKey?: 'enter' | 'cmd-enter';  // Key to send messages (default: 'enter')
   spellCheck?: boolean;  // Enable spell check in input (default: false)
-  // Experimental: OpenAI backend variant for A/B testing
-  // 'responses' = Custom Responses API implementation (default)
-  // 'codex-sdk' = Forked @openai/codex-sdk with callback support
-  openaiVariant?: 'responses' | 'codex-sdk';
   // Power settings
   keepAwakeWhileRunning?: boolean;  // Prevent screen sleep while sessions are running (default: false)
   // Tool metadata
   richToolDescriptions?: boolean;  // Add intent/action metadata to all tool calls (default: true)
+  // Network proxy
+  networkProxy?: import('./types.ts').NetworkProxySettings;
+  // Windows: path to Git Bash (bash.exe) for the SDK subprocess
+  gitBashPath?: string;
 }
 
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -113,10 +116,36 @@ function syncConfigDefaults(): void {
  * This file is synced from bundled assets on every launch.
  */
 export function loadConfigDefaults(): ConfigDefaults {
-  if (existsSync(CONFIG_DEFAULTS_FILE)) {
-    return readJsonFileSync<ConfigDefaults>(CONFIG_DEFAULTS_FILE);
+  if (!existsSync(CONFIG_DEFAULTS_FILE)) {
+    throw new Error('config-defaults.json not found at ' + CONFIG_DEFAULTS_FILE + '. Ensure ensureConfigDir() was called at startup.');
   }
-  throw new Error('config-defaults.json not found at ' + CONFIG_DEFAULTS_FILE + '. Ensure ensureConfigDir() was called at startup.');
+
+  const defaults = readJsonFileSync<ConfigDefaults>(CONFIG_DEFAULTS_FILE);
+
+  const parsedPermissionMode =
+    typeof defaults.workspaceDefaults?.permissionMode === 'string'
+      ? parsePermissionMode(defaults.workspaceDefaults.permissionMode)
+      : null;
+  defaults.workspaceDefaults.permissionMode = parsedPermissionMode ?? 'ask';
+
+  const rawCyclable = Array.isArray(defaults.workspaceDefaults?.cyclablePermissionModes)
+    ? defaults.workspaceDefaults.cyclablePermissionModes
+    : [];
+
+  const normalizedCyclable: PermissionMode[] = [];
+  for (const mode of rawCyclable) {
+    if (typeof mode !== 'string') continue;
+    const parsed = parsePermissionMode(mode);
+    if (!parsed) continue;
+    if (!normalizedCyclable.includes(parsed)) {
+      normalizedCyclable.push(parsed);
+    }
+  }
+
+  defaults.workspaceDefaults.cyclablePermissionModes =
+    normalizedCyclable.length >= 2 ? normalizedCyclable : [...PERMISSION_MODE_ORDER];
+
+  return defaults;
 }
 
 /**
@@ -165,15 +194,21 @@ export function loadStoredConfig(): StoredConfig | null {
       config.activeWorkspaceId = config.workspaces[0]?.id || null;
     }
 
-    // Ensure workspace folder structure exists for all workspaces
+    // Ensure workspace folder structure exists for all workspaces.
+    // Failures here are non-fatal — the workspace will be re-created on next access.
     for (const workspace of config.workspaces) {
       if (!isValidWorkspace(workspace.rootPath)) {
-        createWorkspaceAtPath(workspace.rootPath, workspace.name);
+        try {
+          createWorkspaceAtPath(workspace.rootPath, workspace.name);
+        } catch (wsError) {
+          debug('[config] Failed to create workspace at', workspace.rootPath, ':', wsError instanceof Error ? wsError.message : wsError);
+        }
       }
     }
 
     return config;
-  } catch {
+  } catch (error) {
+    debug('[config] loadStoredConfig failed:', error instanceof Error ? error.message : error);
     return null;
   }
 }
@@ -339,6 +374,42 @@ export function setRichToolDescriptions(enabled: boolean): void {
   const config = loadStoredConfig();
   if (!config) return;
   config.richToolDescriptions = enabled;
+  saveConfig(config);
+}
+
+/**
+ * Get persisted Git Bash path (Windows only).
+ * Used to set CLAUDE_CODE_GIT_BASH_PATH for the SDK subprocess.
+ */
+export function getGitBashPath(): string | undefined {
+  const config = loadStoredConfig();
+  return config?.gitBashPath;
+}
+
+/**
+ * Set Git Bash path (Windows only).
+ * Persists to config so it survives app restarts.
+ * Returns false if the config could not be loaded (path not persisted).
+ */
+export function setGitBashPath(path: string): boolean {
+  const config = loadStoredConfig();
+  if (!config) {
+    console.warn('[storage] Failed to persist Git Bash path: config could not be loaded');
+    return false;
+  }
+  config.gitBashPath = path;
+  saveConfig(config);
+  return true;
+}
+
+/**
+ * Clear persisted Git Bash path (Windows only).
+ * Used when the stored path is stale or invalid.
+ */
+export function clearGitBashPath(): void {
+  const config = loadStoredConfig();
+  if (!config || !config.gitBashPath) return;
+  delete config.gitBashPath;
   saveConfig(config);
 }
 
@@ -847,6 +918,13 @@ import { readdirSync } from 'fs';
 const APP_THEME_FILE = join(CONFIG_DIR, 'theme.json');
 const APP_THEMES_DIR = join(CONFIG_DIR, 'themes');
 
+/**
+ * Get the path to the app-level theme override file (~/.craft-agent/theme.json).
+ */
+export function getAppThemePath(): string {
+  return APP_THEME_FILE;
+}
+
 // Track if preset themes have been synced this session (prevents re-init on hot reload)
 let presetsInitialized = false;
 
@@ -1178,28 +1256,225 @@ export type {
 } from './llm-connections.ts';
 
 /**
+ * Migrate Codex (OpenAI) and Copilot connections to Pi backend.
+ * Runs on startup — transparently routes existing users through PiAgent.
+ *
+ * No re-auth needed: credentials are keyed by connection slug (not provider),
+ * and PiAgent reads the same OAuth tokens via piAuthProvider.
+ *
+ * Migration rules:
+ * - openai + oauth       → pi + openai-codex
+ * - openai + api_key     → pi + openai
+ * - openai_compat        → pi + openai  (keep baseUrl)
+ * - copilot              → pi + github-copilot
+ * - defaultModel reset to Pi's default (stale Codex/Copilot model IDs dropped)
+ * - codexPath removed (no longer needed)
+ */
+function migrateCodexCopilotToPi(config: StoredConfig): boolean {
+  if (!config.llmConnections) return false;
+  let changed = false;
+
+  for (const connection of config.llmConnections) {
+    // Cast to string for legacy providerType values that were removed from LlmProviderType
+    // but may still exist on disk in old configs. Cast to any for legacy codexPath field.
+    const providerStr = connection.providerType as string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const connAny = connection as any;
+    if (providerStr === 'openai' && connection.authType === 'oauth') {
+      connection.providerType = 'pi';
+      connection.piAuthProvider = 'openai-codex';
+      connection.name = 'ChatGPT Plus (via Pi)';
+      delete connAny.codexPath;
+      connection.defaultModel = undefined; // reset — backfill picks Pi default
+      connection.models = undefined;
+      changed = true;
+    } else if (providerStr === 'openai' && (connection.authType === 'api_key' || connection.authType === 'api_key_with_endpoint')) {
+      connection.providerType = 'pi';
+      connection.piAuthProvider = 'openai';
+      connection.name = 'OpenAI API (via Pi)';
+      delete connAny.codexPath;
+      connection.defaultModel = undefined;
+      connection.models = undefined;
+      changed = true;
+    } else if (providerStr === 'openai_compat') {
+      connection.providerType = 'pi';
+      connection.piAuthProvider = 'openai';
+      // keep baseUrl for custom endpoints
+      delete connAny.codexPath;
+      connection.defaultModel = undefined;
+      connection.models = undefined;
+      changed = true;
+    } else if (providerStr === 'copilot') {
+      connection.providerType = 'pi';
+      connection.piAuthProvider = 'github-copilot';
+      connection.name = 'GitHub Copilot (via Pi)';
+      delete connAny.codexPath;
+      connection.defaultModel = undefined;
+      connection.models = undefined;
+      changed = true;
+    }
+  }
+
+  // Clean up openaiVariant config field (Codex-specific A/B testing, no longer relevant)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const configAny = config as any;
+  if (configAny.openaiVariant) {
+    delete configAny.openaiVariant;
+    changed = true;
+  }
+
+  return changed;
+}
+
+/**
  * Backfill models and defaultModel on ALL connections.
  * Ensures built-in connections (anthropic, openai) always have models populated,
  * not just compat connections.
  */
+export function shouldMigratePiOpenAiProvider(connection: Pick<LlmConnection, 'providerType' | 'piAuthProvider' | 'authType' | 'baseUrl'>): boolean {
+  // Legacy cleanup: old ChatGPT Plus OAuth connections may still be tagged as `openai`.
+  // Only migrate those to `openai-codex`.
+  //
+  // IMPORTANT: Do NOT migrate API-key or custom-endpoint connections:
+  // - `api_key` / `api_key_with_endpoint` with `openai` must remain regular OpenAI API auth.
+  // - forcing them to `openai-codex` routes requests to ChatGPT backend auth and breaks on restart.
+  if (!isPiProvider(connection.providerType)) return false;
+  if (connection.piAuthProvider !== 'openai') return false;
+  if (connection.authType !== 'oauth') return false;
+  if (typeof connection.baseUrl === 'string' && connection.baseUrl.trim().length > 0) return false;
+  return true;
+}
+
+export function shouldRepairPiApiKeyCodexProvider(connection: Pick<LlmConnection, 'providerType' | 'piAuthProvider' | 'authType'>): boolean {
+  // Repair broken state from previous startup migrations:
+  // API-key connections tagged as `openai-codex` try ChatGPT backend JWT auth and fail.
+  if (!isPiProvider(connection.providerType)) return false;
+  if (connection.piAuthProvider !== 'openai-codex') return false;
+  return connection.authType === 'api_key' || connection.authType === 'api_key_with_endpoint';
+}
+
+function normalizeModelIds(models?: Array<{ id: string } | string>): string[] {
+  if (!models) return [];
+  return models
+    .map(m => typeof m === 'string' ? m : m.id)
+    .filter((id): id is string => !!id && id.trim().length > 0);
+}
+
+function modelSetEquals(a: string[], b: string[]): boolean {
+  const as = new Set(a);
+  const bs = new Set(b);
+  if (as.size !== bs.size) return false;
+  for (const id of as) {
+    if (!bs.has(id)) return false;
+  }
+  return true;
+}
+
+export function inferModelSelectionMode(
+  connection: Pick<LlmConnection, 'models'>,
+  providerDefaultModelIds: string[],
+): 'automaticallySyncedFromProvider' | 'userDefined3Tier' {
+  const currentIds = normalizeModelIds(connection.models);
+  if (currentIds.length === 0) return 'automaticallySyncedFromProvider';
+  return modelSetEquals(currentIds, providerDefaultModelIds)
+    ? 'automaticallySyncedFromProvider'
+    : 'userDefined3Tier';
+}
+
 function backfillAllConnectionModels(config: StoredConfig): boolean {
   if (!config.llmConnections) return false;
   let changed = false;
   for (const connection of config.llmConnections) {
-    const defaultModels = getDefaultModelsForConnection(connection.providerType);
-    const defaultModel = getDefaultModelForConnection(connection.providerType);
+    // Repair previously broken API-key migration first.
+    if (shouldRepairPiApiKeyCodexProvider(connection)) {
+      connection.piAuthProvider = 'openai';
+      changed = true;
+    }
 
-    if (!connection.models || (Array.isArray(connection.models) && connection.models.length === 0)) {
+    // Migrate only legacy OAuth-backed Pi OpenAI connections to ChatGPT backend provider key.
+    if (shouldMigratePiOpenAiProvider(connection)) {
+      connection.piAuthProvider = 'openai-codex';
+      changed = true;
+    }
+
+    const defaultModels = getDefaultModelsForConnection(connection.providerType, connection.piAuthProvider);
+    const defaultModel = getDefaultModelForConnection(connection.providerType, connection.piAuthProvider);
+    const providerDefaultModelIds = normalizeModelIds(defaultModels as Array<{ id: string } | string>);
+
+    if (isPiProvider(connection.providerType) && connection.piAuthProvider) {
+      const mode = connection.modelSelectionMode
+        ?? inferModelSelectionMode(connection, providerDefaultModelIds);
+      if (connection.modelSelectionMode !== mode) {
+        debug('[storage] backfill mode inferred', {
+          slug: connection.slug,
+          piAuthProvider: connection.piAuthProvider,
+          from: connection.modelSelectionMode,
+          to: mode,
+          currentModelCount: normalizeModelIds(connection.models).length,
+        });
+        connection.modelSelectionMode = mode;
+        changed = true;
+      }
+
+      if (mode === 'automaticallySyncedFromProvider') {
+        const currentIds = normalizeModelIds(connection.models);
+        if (providerDefaultModelIds.length > 0 && !modelSetEquals(currentIds, providerDefaultModelIds)) {
+          connection.models = defaultModels;
+          changed = true;
+        }
+      } else {
+        const currentIds = normalizeModelIds(connection.models);
+        if (providerDefaultModelIds.length > 0) {
+          const allowedIds = new Set(providerDefaultModelIds);
+          const canonicalCurrentIds = currentIds.map((id) => {
+            if (allowedIds.has(id)) return id;
+            if (!id.startsWith('pi/')) {
+              const prefixed = `pi/${id}`;
+              if (allowedIds.has(prefixed)) return prefixed;
+            }
+            return id;
+          });
+          const filtered = canonicalCurrentIds.filter(id => allowedIds.has(id));
+
+          if (!modelSetEquals(canonicalCurrentIds, currentIds) || filtered.length !== currentIds.length) {
+            debug('[storage] backfill userDefined filtered', {
+              slug: connection.slug,
+              piAuthProvider: connection.piAuthProvider,
+              beforeCount: currentIds.length,
+              canonicalCount: canonicalCurrentIds.length,
+              afterCount: filtered.length,
+              beforeFirst5: currentIds.slice(0, 5),
+              afterFirst5: filtered.slice(0, 5),
+            });
+            connection.models = filtered;
+            changed = true;
+          }
+
+          if (filtered.length === 0) {
+            debug('[storage] backfill userDefined fallback-to-defaults', {
+              slug: connection.slug,
+              piAuthProvider: connection.piAuthProvider,
+              defaultCount: providerDefaultModelIds.length,
+            });
+            connection.models = defaultModels;
+            changed = true;
+          }
+        }
+      }
+    }
+
+    if (defaultModels.length > 0 && (!connection.models || (Array.isArray(connection.models) && connection.models.length === 0))) {
       connection.models = defaultModels;
       changed = true;
     }
-    if (!connection.defaultModel) {
+
+    if (!connection.defaultModel && defaultModel) {
       connection.defaultModel = defaultModel;
       changed = true;
     }
 
     // Validate that existing defaultModel is in the models list
-    if (connection.defaultModel && connection.models && Array.isArray(connection.models)) {
+    if (connection.defaultModel && connection.models && Array.isArray(connection.models) && connection.models.length > 0) {
       const modelIds = connection.models.map(m => typeof m === 'string' ? m : m.id);
       if (!modelIds.includes(connection.defaultModel)) {
         // Reset to first available model in the list
@@ -1239,23 +1514,114 @@ function migrateOpus45ToOpus46(config: StoredConfig): boolean {
 
     // Migrate models array
     if (connection.models && Array.isArray(connection.models)) {
-      for (let i = 0; i < connection.models.length; i++) {
-        const model = connection.models[i];
-        if (typeof model === 'string' && model === OPUS_45_ID) {
-          connection.models[i] = OPUS_46_ID;
-          changed = true;
-        } else if (typeof model === 'object' && model.id === OPUS_45_ID) {
-          model.id = OPUS_46_ID;
-          if (model.name?.includes('4.5')) {
-            model.name = model.name.replace('4.5', '4.6');
+      const hasNew = connection.models.some(m =>
+        (typeof m === 'string' ? m : m.id) === OPUS_46_ID
+      );
+
+      if (hasNew) {
+        // New model already exists — just remove the old entry to avoid duplicates
+        const before = connection.models.length;
+        connection.models = connection.models.filter(m =>
+          (typeof m === 'string' ? m : m.id) !== OPUS_45_ID
+        );
+        if (connection.models.length !== before) changed = true;
+      } else {
+        // New model doesn't exist — rename the old entry in place
+        for (let i = 0; i < connection.models.length; i++) {
+          const model = connection.models[i];
+          if (typeof model === 'string' && model === OPUS_45_ID) {
+            connection.models[i] = OPUS_46_ID;
+            changed = true;
+          } else if (typeof model === 'object' && model.id === OPUS_45_ID) {
+            model.id = OPUS_46_ID;
+            if (model.name?.includes('4.5')) {
+              model.name = model.name.replace('4.5', '4.6');
+            }
+            changed = true;
           }
-          changed = true;
         }
       }
     }
   }
 
   return changed;
+}
+
+/**
+ * Migrate Sonnet 4.5 to Sonnet 4.6 for direct Anthropic connections.
+ * Same pattern as migrateOpus45ToOpus46 — updates stored model IDs and names.
+ */
+function migrateSonnet45ToSonnet46(config: StoredConfig): boolean {
+  if (!config.llmConnections) return false;
+
+  const SONNET_45_ID = 'claude-sonnet-4-5-20250929';
+  const SONNET_46_ID = 'claude-sonnet-4-6';
+
+  let changed = false;
+
+  for (const connection of config.llmConnections) {
+    // Only migrate direct Anthropic connections (not compat/third-party)
+    if (connection.providerType !== 'anthropic') continue;
+
+    // Migrate defaultModel
+    if (connection.defaultModel === SONNET_45_ID) {
+      connection.defaultModel = SONNET_46_ID;
+      changed = true;
+    }
+
+    // Migrate models array
+    if (connection.models && Array.isArray(connection.models)) {
+      const hasNew = connection.models.some(m =>
+        (typeof m === 'string' ? m : m.id) === SONNET_46_ID
+      );
+
+      if (hasNew) {
+        // New model already exists — just remove the old entry to avoid duplicates
+        const before = connection.models.length;
+        connection.models = connection.models.filter(m =>
+          (typeof m === 'string' ? m : m.id) !== SONNET_45_ID
+        );
+        if (connection.models.length !== before) changed = true;
+      } else {
+        // New model doesn't exist — rename the old entry in place
+        for (let i = 0; i < connection.models.length; i++) {
+          const model = connection.models[i];
+          if (typeof model === 'string' && model === SONNET_45_ID) {
+            connection.models[i] = SONNET_46_ID;
+            changed = true;
+          } else if (typeof model === 'object' && model.id === SONNET_45_ID) {
+            model.id = SONNET_46_ID;
+            if (model.name?.includes('4.5')) {
+              model.name = model.name.replace('4.5', '4.6');
+            }
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  return changed;
+}
+
+/**
+ * Migrate Sonnet 4.5 to Sonnet 4.6 in workspace default models.
+ */
+function migrateWorkspaceSonnet45ToSonnet46(config: StoredConfig): void {
+  if (!config.workspaces) return;
+
+  const SONNET_45_ID = 'claude-sonnet-4-5-20250929';
+  const SONNET_46_ID = 'claude-sonnet-4-6';
+
+  for (const workspace of config.workspaces) {
+    const wsConfig = loadWorkspaceConfig(workspace.rootPath);
+    if (!wsConfig?.defaults?.model) continue;
+
+    if (wsConfig.defaults.model === SONNET_45_ID) {
+      wsConfig.defaults.model = SONNET_46_ID;
+      saveWorkspaceConfig(workspace.rootPath, wsConfig);
+    }
+  }
 }
 
 /**
@@ -1305,9 +1671,10 @@ function migrateModelDefaultsToConnections(config: StoredConfig): boolean {
   }
 
   // Apply openai model default to the default openai connection
+  // Cast providerType to string for legacy values removed from LlmProviderType
   if (configAny.modelDefaults.openai) {
     const openaiConn = config.llmConnections.find(c =>
-      c.providerType === 'openai' || c.providerType === 'openai_compat'
+      (c.providerType as string) === 'openai' || (c.providerType as string) === 'openai_compat'
     );
     if (openaiConn) {
       openaiConn.defaultModel = configAny.modelDefaults.openai;
@@ -1349,7 +1716,9 @@ export function migrateLegacyLlmConnectionsConfig(): void {
     if (!target.llmConnections) return false;
     let changed = false;
     for (const connection of target.llmConnections) {
-      if (connection.providerType !== 'anthropic_compat' && connection.providerType !== 'openai_compat') {
+      // Cast to string for legacy 'openai_compat' values that may still exist on disk
+      const providerStr = connection.providerType as string;
+      if (providerStr !== 'anthropic_compat' && providerStr !== 'openai_compat') {
         continue;
       }
       const compatDefaults = getDefaultModelsForConnection(connection.providerType).map(
@@ -1408,7 +1777,7 @@ export function migrateLegacyLlmConnectionsConfig(): void {
     if ('model' in config) {
       const legacyModel = configAny.model as string | undefined;
       if (legacyModel) {
-        const provider = getModelProvider(legacyModel) ?? (isCodexModel(legacyModel) ? 'openai' : 'anthropic');
+        const provider = getModelProvider(legacyModel) ?? 'anthropic';
         configAny.modelDefaults = { ...(configAny.modelDefaults ?? {}), [provider]: legacyModel };
       }
       delete configAny.model;
@@ -1419,6 +1788,11 @@ export function migrateLegacyLlmConnectionsConfig(): void {
     // silently extend or override the user's model list on every startup.
     // Compat defaults are only applied during fresh connection creation or
     // first-time legacy migration (the config.llmConnections === undefined path below).
+
+    // Phase 1a-bis: Migrate Codex/Copilot connections to Pi backend
+    if (migrateCodexCopilotToPi(config)) {
+      needsSave = true;
+    }
 
     // Phase 1b: Backfill models/defaultModel on ALL connections (not just compat)
     // This ensures built-in connections (anthropic, openai) always have models populated
@@ -1435,6 +1809,12 @@ export function migrateLegacyLlmConnectionsConfig(): void {
     }
     // Phase 1e: Migrate Opus 4.5 → Opus 4.6 in workspace default models
     migrateWorkspaceOpus45ToOpus46(config);
+    // Phase 1f: Migrate Sonnet 4.5 → Sonnet 4.6 for direct Anthropic connections
+    if (migrateSonnet45ToSonnet46(config)) {
+      needsSave = true;
+    }
+    // Phase 1g: Migrate Sonnet 4.5 → Sonnet 4.6 in workspace default models
+    migrateWorkspaceSonnet45ToSonnet46(config);
 
     if (needsSave) {
       saveConfig(config);
@@ -1467,25 +1847,27 @@ export function migrateLegacyLlmConnectionsConfig(): void {
         createdAt: Date.now(),
       };
     } else if (legacyAuthType === 'codex_oauth') {
-      // ChatGPT Plus OAuth (Codex)
+      // ChatGPT Plus OAuth → Pi backend
       migrated = {
         slug: 'codex',
-        name: 'Codex (ChatGPT Plus)',
-        providerType: 'openai',
+        name: 'ChatGPT Plus (via Pi)',
+        providerType: 'pi',
         authType: 'oauth',
-        models: getDefaultModelsForConnection('openai'),
+        piAuthProvider: 'openai-codex',
+        modelSelectionMode: 'automaticallySyncedFromProvider',
+        models: getDefaultModelsForConnection('pi', 'openai-codex'),
         createdAt: Date.now(),
       };
     } else if (legacyAuthType === 'codex_api_key') {
-      // OpenAI API Key via Codex (OpenRouter, Vercel AI Gateway compatible)
-      // Always use openai_compat for API key connections (5.3 is OAuth-only)
-      const hasCustomEndpoint = !!legacyBaseUrl;
+      // OpenAI API Key → Pi backend
       migrated = {
         slug: 'codex-api',
-        name: hasCustomEndpoint ? 'Codex (Custom Endpoint)' : 'Codex (OpenAI API Key)',
-        providerType: 'openai_compat',
-        authType: hasCustomEndpoint ? 'api_key_with_endpoint' : 'api_key',
-        models: getDefaultModelsForConnection('openai_compat'),
+        name: 'OpenAI API (via Pi)',
+        providerType: 'pi',
+        authType: 'api_key',
+        piAuthProvider: 'openai',
+        modelSelectionMode: 'automaticallySyncedFromProvider',
+        models: getDefaultModelsForConnection('pi', 'openai'),
         createdAt: Date.now(),
       };
     } else if (legacyAuthType === 'api_key') {
@@ -1534,11 +1916,12 @@ export function migrateLegacyLlmConnectionsConfig(): void {
   delete configAny.model;
 
   if (legacyModel) {
-    const provider = getModelProvider(legacyModel) ?? (isCodexModel(legacyModel) ? 'openai' : 'anthropic');
+    const provider = getModelProvider(legacyModel) ?? 'anthropic';
     configAny.modelDefaults = { ...(configAny.modelDefaults ?? {}), [provider]: legacyModel };
   }
 
   // Run the same backfill and migration on newly created connections
+  migrateCodexCopilotToPi(config);
   backfillAllConnectionModels(config);
   migrateModelDefaultsToConnections(config);
 
@@ -1748,6 +2131,9 @@ export function updateLlmConnection(slug: string, updates: Partial<Omit<LlmConne
   if (index === -1) return false;
 
   const existing = connections[index]!;
+  const toModelIds = (models?: Array<{ id: string } | string>): string[] =>
+    (models ?? []).map(m => typeof m === 'string' ? m : m.id);
+
   connections[index] = {
     // Preserve required fields from existing
     slug: existing.slug,
@@ -1760,14 +2146,54 @@ export function updateLlmConnection(slug: string, updates: Partial<Omit<LlmConne
     baseUrl: updates.baseUrl !== undefined ? updates.baseUrl : existing.baseUrl,
     models: updates.models !== undefined ? updates.models : existing.models,
     defaultModel: updates.defaultModel !== undefined ? updates.defaultModel : existing.defaultModel,
-    codexPath: updates.codexPath !== undefined ? updates.codexPath : existing.codexPath,
+    modelSelectionMode: updates.modelSelectionMode !== undefined ? updates.modelSelectionMode : existing.modelSelectionMode,
     // Cloud provider fields
     awsRegion: updates.awsRegion !== undefined ? updates.awsRegion : existing.awsRegion,
     gcpProjectId: updates.gcpProjectId !== undefined ? updates.gcpProjectId : existing.gcpProjectId,
     gcpRegion: updates.gcpRegion !== undefined ? updates.gcpRegion : existing.gcpRegion,
+    // Pi auth provider
+    piAuthProvider: updates.piAuthProvider !== undefined ? updates.piAuthProvider : existing.piAuthProvider,
+    // Custom endpoint protocol (Anthropic/OpenAI compatible)
+    customEndpoint: updates.customEndpoint !== undefined ? updates.customEndpoint : existing.customEndpoint,
     // Timestamps
     lastUsedAt: updates.lastUsedAt !== undefined ? updates.lastUsedAt : existing.lastUsedAt,
   };
+
+  const updated = connections[index]!;
+  if (updated.providerType === 'pi') {
+    const beforeModelIds = toModelIds(existing.models);
+    const afterModelIds = toModelIds(updated.models);
+    const changed =
+      existing.defaultModel !== updated.defaultModel ||
+      existing.modelSelectionMode !== updated.modelSelectionMode ||
+      !modelSetEquals(beforeModelIds, afterModelIds);
+
+    if (changed) {
+      const stack = (new Error().stack ?? '').split('\n').slice(2, 7).map(s => s.trim());
+      debug('[storage] updateLlmConnection(pi) changed', {
+        slug,
+        before: {
+          mode: existing.modelSelectionMode,
+          defaultModel: existing.defaultModel,
+          modelCount: beforeModelIds.length,
+          modelsFirst5: beforeModelIds.slice(0, 5),
+        },
+        after: {
+          mode: updated.modelSelectionMode,
+          defaultModel: updated.defaultModel,
+          modelCount: afterModelIds.length,
+          modelsFirst5: afterModelIds.slice(0, 5),
+        },
+        updates: {
+          keys: Object.keys(updates),
+          defaultModel: updates.defaultModel,
+          modelSelectionMode: updates.modelSelectionMode,
+          modelsCount: Array.isArray(updates.models) ? updates.models.length : undefined,
+        },
+        stack,
+      });
+    }
+  }
 
   saveConfig(config);
   return true;
@@ -1868,6 +2294,32 @@ export function setDefaultLlmConnection(slug: string): boolean {
 }
 
 /**
+ * Get the app-level default thinking level for new sessions.
+ * Falls back to bundled config-defaults when unset.
+ */
+export function getDefaultThinkingLevel(): ThinkingLevel {
+  const config = loadStoredConfig();
+  if (config?.defaultThinkingLevel && isValidThinkingLevel(config.defaultThinkingLevel)) {
+    return config.defaultThinkingLevel;
+  }
+  const defaults = loadConfigDefaults();
+  return defaults.workspaceDefaults.thinkingLevel;
+}
+
+/**
+ * Set the app-level default thinking level for new sessions.
+ * @returns true if persisted, false if config could not be loaded
+ */
+export function setDefaultThinkingLevel(level: ThinkingLevel): boolean {
+  const config = loadStoredConfig();
+  if (!config) return false;
+
+  config.defaultThinkingLevel = level;
+  saveConfig(config);
+  return true;
+}
+
+/**
  * Update the lastUsedAt timestamp for a connection.
  * @param slug - Connection slug
  */
@@ -1883,6 +2335,57 @@ export function touchLlmConnection(slug: string): void {
     connection.lastUsedAt = Date.now();
     saveConfig(config);
   }
+}
+
+// ============================================
+// Network Proxy Settings
+// ============================================
+
+import type { NetworkProxySettings } from './types.ts';
+
+function normalizeProxyString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+function normalizeNetworkProxySettings(
+  settings: NetworkProxySettings,
+): NetworkProxySettings {
+  return {
+    enabled: Boolean(settings.enabled),
+    httpProxy: normalizeProxyString(settings.httpProxy),
+    httpsProxy: normalizeProxyString(settings.httpsProxy),
+    noProxy: normalizeProxyString(settings.noProxy),
+  };
+}
+
+/**
+ * Get the current network proxy settings.
+ * Returns undefined if not configured.
+ */
+export function getNetworkProxySettings(): NetworkProxySettings | undefined {
+  const config = loadStoredConfig();
+  return config?.networkProxy;
+}
+
+/**
+ * Persist network proxy settings.
+ * Deletes the key when disabled and all proxy fields are empty.
+ */
+export function setNetworkProxySettings(settings: NetworkProxySettings): void {
+  const config = loadStoredConfig();
+  if (!config) return;
+
+  const normalized = normalizeNetworkProxySettings(settings);
+
+  // Remove the key entirely when proxy is disabled and all fields are blank
+  if (!normalized.enabled && !normalized.httpProxy && !normalized.httpsProxy && !normalized.noProxy) {
+    delete config.networkProxy;
+  } else {
+    config.networkProxy = normalized;
+  }
+
+  saveConfig(config);
 }
 
 // ============================================

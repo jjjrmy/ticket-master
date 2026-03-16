@@ -44,8 +44,8 @@ export interface SessionMeta {
   labels?: string[]
   /** Permission mode ('safe', 'ask', 'allow-all') — used by view expressions */
   permissionMode?: string
-  /** Todo state for filtering */
-  todoState?: string
+  /** Session status for filtering */
+  sessionStatus?: string
   /** Role/type of the last message (for badge display without loading messages) */
   lastMessageRole?: 'user' | 'assistant' | 'plan' | 'tool' | 'error'
   /** Whether an async operation is ongoing (sharing, updating share, revoking, title regeneration) */
@@ -74,11 +74,6 @@ export interface SessionMeta {
   isArchived?: boolean
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number
-  // Sub-session hierarchy (1 level max)
-  /** Parent session ID (if this is a sub-session). Null/undefined = root session. */
-  parentSessionId?: string
-  /** Explicit sibling order (lazy - only populated when user reorders). */
-  siblingOrder?: number
 }
 
 /**
@@ -100,45 +95,23 @@ function findLastFinalMessageId(messages: Message[]): string | undefined {
  */
 export function extractSessionMeta(session: Session): SessionMeta {
   const messages = session.messages || []
-  // Prefer pre-computed lastFinalMessageId from session storage (available without loading messages).
-  // Fall back to computing from messages for newly created sessions or when messages are loaded.
-  const lastFinalMessageId = session.lastFinalMessageId ?? findLastFinalMessageId(messages)
+
+  // Destructure fields that don't exist on SessionMeta or need overrides
+  const {
+    messages: _msgs, sessionFolderPath: _sf, supportsBranching: _sb,
+    workspaceName: _wn, thinkingLevel: _tl, currentStatus: _cs,
+    isAsyncOperationOngoing, isRegeneratingTitle,
+    messageCount, lastFinalMessageId: sessionLastFinal,
+    ...sessionFields
+  } = session
 
   return {
-    id: session.id,
-    name: session.name,
-    preview: session.preview,
-    workspaceId: session.workspaceId,
-    lastMessageAt: session.lastMessageAt,
-    isProcessing: session.isProcessing,
-    isFlagged: session.isFlagged,
-    lastReadMessageId: session.lastReadMessageId,
-    workingDirectory: session.workingDirectory,
-    enabledSourceSlugs: session.enabledSourceSlugs,
-    sharedUrl: session.sharedUrl,
-    sharedId: session.sharedId,
-    lastFinalMessageId,
-    // Explicit unread flag - source of truth for NEW badge
-    hasUnread: session.hasUnread,
-    labels: session.labels,
-    permissionMode: session.permissionMode,
-    todoState: session.todoState,
-    lastMessageRole: session.lastMessageRole,
-    // Use isAsyncOperationOngoing if available, fall back to deprecated isRegeneratingTitle
-    isAsyncOperationOngoing: session.isAsyncOperationOngoing ?? session.isRegeneratingTitle,
-    isRegeneratingTitle: session.isRegeneratingTitle,
-    // Fields needed by view expressions (messageCount, model, createdAt, tokenUsage)
-    messageCount: session.messageCount ?? session.messages?.length ?? 0,
-    model: session.model,
-    llmConnection: session.llmConnection,
-    createdAt: session.createdAt,
-    tokenUsage: session.tokenUsage,
-    // Hidden sessions (e.g., mini edit sessions in EditPopover)
-    hidden: session.hidden,
-    // Archive state
-    isArchived: session.isArchived,
-    archivedAt: session.archivedAt,
-  }
+    ...sessionFields,
+    lastFinalMessageId: sessionLastFinal ?? findLastFinalMessageId(messages),
+    messageCount: messageCount ?? messages.length ?? 0,
+    isAsyncOperationOngoing: isAsyncOperationOngoing ?? isRegeneratingTitle,
+    isRegeneratingTitle,
+  } as SessionMeta
 }
 
 /**
@@ -461,7 +434,7 @@ export const syncSessionsToAtomsAtom = atom(
  * Uses promise deduplication to prevent redundant IPC calls from concurrent requests.
  *
  * IMPORTANT: This only merges messages into the existing session atom.
- * UI state fields (hasUnread, isFlagged, todoState, etc.) are preserved from
+ * UI state fields (hasUnread, isFlagged, sessionStatus, etc.) are preserved from
  * the in-memory atom, NOT overwritten with potentially stale disk data.
  * This prevents a race condition where optimistic updates (e.g., clearing the
  * NEW badge on session view) get clobbered by async message loading that reads
@@ -500,7 +473,16 @@ export const ensureSessionMessagesLoadedAtom = atom(
       const mergedSession = existingSession
         ? {
             ...existingSession,
-            messages: loadedSession.messages,
+            // CRITICAL: Don't clobber messages if session is actively streaming
+            // AND already has messages in the atom. Streaming events update the atom
+            // directly and may contain messages the IPC response doesn't know about
+            // (race window between IPC request and response).
+            // The `messages.length > 0` guard ensures Cmd+R reload works: after reload,
+            // the atom starts with messages=[] from getSessions(), so IPC response
+            // (which has full history from main process memory) must be used.
+            messages: existingSession.isProcessing && existingSession.messages.length > 0
+              ? existingSession.messages
+              : loadedSession.messages,
             tokenUsage: loadedSession.tokenUsage ?? existingSession.tokenUsage,
             sessionFolderPath: loadedSession.sessionFolderPath ?? existingSession.sessionFolderPath,
           }
@@ -574,4 +556,3 @@ export const backgroundTasksAtomFamily = atomFamily(
  * Written by App on workspace switch, read by Root to keep the theme in sync.
  */
 export const windowWorkspaceIdAtom = atom<string | null>(null)
-

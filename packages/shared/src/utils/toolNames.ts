@@ -27,6 +27,16 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
 };
 
 /**
+ * Set of tool names that represent parent task tools (subagent launchers).
+ * The SDK renamed 'Task' to 'Agent' in v0.2.72 — both must be recognised.
+ * Add future renames here instead of scattering checks across the codebase.
+ */
+export const PARENT_TASK_TOOLS: ReadonlySet<string> = new Set(['Task', 'Agent']);
+
+/** Check whether a tool name is a parent task tool (Task or Agent). */
+export const isParentTaskTool = (name: string): boolean => PARENT_TASK_TOOLS.has(name);
+
+/**
  * Tools that should be hidden from the UI (purely internal state changes)
  */
 export const HIDDEN_TOOLS = new Set<string>([

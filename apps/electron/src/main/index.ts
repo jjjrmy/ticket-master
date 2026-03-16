@@ -3,8 +3,8 @@
 import { loadShellEnv } from './shell-env'
 loadShellEnv()
 
-import { app, BrowserWindow } from 'electron'
-import { createHash } from 'crypto'
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, nativeTheme, shell } from 'electron'
+import { createHash, randomUUID } from 'crypto'
 import { hostname, homedir } from 'os'
 import * as Sentry from '@sentry/electron/main'
 
@@ -63,10 +63,17 @@ Sentry.init({
 const machineId = createHash('sha256').update(hostname() + homedir()).digest('hex').slice(0, 16)
 Sentry.setUser({ id: machineId })
 
-import { join } from 'path'
+import { join, delimiter } from 'path'
 import { existsSync } from 'fs'
-import { SessionManager } from './sessions'
-import { registerIpcHandlers } from './ipc'
+import { SessionManager, setSessionPlatform, setSessionRuntimeHooks } from '@craft-agent/server-core/sessions'
+import { registerAllRpcHandlers } from './handlers/index'
+import { cleanupSessionFileWatchForClient } from '@craft-agent/server-core/handlers/rpc'
+import type { PlatformServices } from '../runtime/platform'
+import type { HandlerDeps } from './handlers/handler-deps'
+import type { RpcServer } from '@craft-agent/server-core/transport'
+import { WsRpcServer } from '../transport/server'
+import { initModelRefreshService, getModelRefreshService, setFetcherPlatform } from '@craft-agent/server-core/model-fetchers'
+import { setSearchPlatform, setImageProcessor } from '@craft-agent/server-core/services'
 import { createApplicationMenu } from './menu'
 import { WindowManager } from './window-manager'
 import { loadWindowState, saveWindowState } from './window-state'
@@ -77,14 +84,20 @@ import { initializeReleaseNotes } from '@craft-agent/shared/release-notes'
 import { ensureDefaultPermissions } from '@craft-agent/shared/agent/permissions-config'
 import { ensureToolIcons, ensurePresetThemes } from '@craft-agent/shared/config'
 import { setBundledAssetsRoot } from '@craft-agent/shared/utils'
-import { setVendorRoot } from '@craft-agent/shared/codex'
+import { initializeBackendHostRuntime } from '@craft-agent/shared/agent/backend'
 import { setPowerShellValidatorRoot } from '@craft-agent/shared/agent'
 import { handleDeepLink } from './deep-link'
+import { BrowserPaneManager } from './browser-pane-manager'
+import { OAuthFlowStore } from '@craft-agent/shared/auth'
 import { registerThumbnailScheme, registerThumbnailHandler } from './thumbnail-protocol'
 import log, { isDebugMode, mainLog, getLogFilePath } from './logger'
 import { setPerfEnabled, enableDebug } from '@craft-agent/shared/utils'
-import { initNotificationService, clearBadgeCount, initBadgeIcon, initInstanceBadge } from './notifications'
-import { checkForUpdatesOnLaunch, setWindowManager as setAutoUpdateWindowManager, isUpdating } from './auto-update'
+import { registerPiModelResolver } from '@craft-agent/shared/config'
+import { getPiModelsForAuthProvider, getAllPiModels } from '@craft-agent/shared/config'
+import { initNotificationService, initBadgeIcon, initInstanceBadge, updateBadgeCount } from './notifications'
+import { checkForUpdatesOnLaunch, setAutoUpdateEventSink, isUpdating } from './auto-update'
+import type { EventSink } from '@craft-agent/server-core/transport'
+import { validateGitBashPath } from '@craft-agent/server-core/services'
 
 // Initialize electron-log for renderer process support
 log.initialize()
@@ -96,12 +109,82 @@ if (isDebugMode) {
   setPerfEnabled(true)
 }
 
+// Bundle CLI tools: resolve platform-specific uv binary and wrapper scripts.
+// These are available to all agent Bash sessions via CRAFT_UV, CRAFT_SCRIPTS env vars
+// and PATH prepend. uv auto-downloads Python 3.12 on first use (~5s, then cached).
+{
+  // In packaged app: resources are at process.resourcesPath/app/resources/
+  // In dev: resources are at __dirname/../resources/ (sibling of dist/)
+  const resourcesBase = app.isPackaged
+    ? join(process.resourcesPath, 'app')
+    : join(__dirname, '..')
+  const platformKey = `${process.platform}-${process.arch}`
+  const uvPlatformDir = join(resourcesBase, 'resources', 'bin', platformKey)
+  const uvBinary = join(uvPlatformDir, process.platform === 'win32' ? 'uv.exe' : 'uv')
+  const binDir = join(resourcesBase, 'resources', 'bin')
+  const scriptsDir = join(resourcesBase, 'resources', 'scripts')
+
+  const bundledUvExists = existsSync(uvBinary)
+  const fallbackUv = bundledUvExists ? null : 'uv'
+
+  // Runtime resolver hints for shared session tools
+  process.env.CRAFT_IS_PACKAGED = app.isPackaged ? '1' : '0'
+  process.env.CRAFT_RESOURCES_BASE = resourcesBase
+  process.env.CRAFT_APP_ROOT = app.isPackaged ? app.getAppPath() : process.cwd()
+
+  process.env.CRAFT_UV = bundledUvExists ? uvBinary : (fallbackUv ?? uvBinary)
+
+  // Bun runtime (packaged builds should prefer bundled runtime over PATH)
+  const bunBinary = join(resourcesBase, 'vendor', 'bun', process.platform === 'win32' ? 'bun.exe' : 'bun')
+  if (existsSync(bunBinary)) {
+    process.env.CRAFT_BUN = bunBinary
+  }
+
+  process.env.CRAFT_SCRIPTS = scriptsDir
+  process.env.CRAFT_COMMANDS_ENTRY = app.isPackaged
+    ? join(app.getAppPath(), 'packages', 'craft-agents-commands', 'src', 'main.ts')
+    : join(process.cwd(), 'packages', 'craft-agents-commands', 'src', 'main.ts')
+  process.env.CRAFT_CLI_ENTRY = app.isPackaged
+    ? join(app.getAppPath(), 'packages', 'craft-cli', 'src', 'cli.ts')
+    : join(process.cwd(), 'packages', 'craft-cli', 'src', 'cli.ts')
+  process.env.CRAFT_COMMANDS_DOC_PATH = app.isPackaged
+    ? join(resourcesBase, 'resources', 'docs', 'craft-cli.md')
+    : join(process.cwd(), 'apps', 'electron', 'resources', 'docs', 'craft-cli.md')
+  process.env.CRAFT_CLI_DOC_PATH = process.env.CRAFT_COMMANDS_DOC_PATH
+  process.env.CRAFT_AGENT_VERSION = app.getVersion()
+  // Prepend both generic wrappers dir and platform uv dir:
+  // - binDir exposes wrapper commands (pdf-tool, docx-tool, ...)
+  // - uvPlatformDir exposes raw `uv` for direct shell usage / debugging
+  process.env.PATH = `${binDir}${delimiter}${uvPlatformDir}${delimiter}${process.env.PATH}`
+
+  if (!bundledUvExists) {
+    mainLog.warn('Bundled uv binary missing, CLI document tools may fail unless uv is available on PATH.', {
+      expectedUvPath: uvBinary,
+      usingCraftUv: process.env.CRAFT_UV,
+    })
+  }
+
+  if (isDebugMode) {
+    mainLog.info('CLI tools configured:', { uvBinary: process.env.CRAFT_UV, binDir, scriptsDir, bundledUvExists })
+  }
+}
+
+// Register Pi model resolver so llm-connections.ts can resolve Pi models
+// without importing @mariozechner/pi-ai (which breaks the Vite renderer build)
+registerPiModelResolver((piAuthProvider) =>
+  piAuthProvider ? getPiModelsForAuthProvider(piAuthProvider) : getAllPiModels()
+)
+
 // Custom URL scheme for deeplinks (e.g., craftagents://auth-complete)
 // Supports multi-instance dev: CRAFT_DEEPLINK_SCHEME env var (craftagents1, craftagents2, etc.)
 const DEEPLINK_SCHEME = process.env.CRAFT_DEEPLINK_SCHEME || 'craftagents'
 
 let windowManager: WindowManager | null = null
 let sessionManager: SessionManager | null = null
+let browserPaneManager: BrowserPaneManager | null = null
+let oauthFlowStore: OAuthFlowStore | null = null
+let moduleSink: EventSink | null = null
+let moduleClientResolver: ((webContentsId: number) => string | undefined) | null = null
 
 // Store pending deep link if app not ready yet (cold start)
 let pendingDeepLink: string | null = null
@@ -122,6 +205,47 @@ if (process.defaultApp) {
   app.setAsDefaultProtocolClient(DEEPLINK_SCHEME)
 }
 
+// Apply network proxy settings early (Node-level only — Electron sessions require app.whenReady)
+import { applyConfiguredProxySettings } from './network-proxy'
+void applyConfiguredProxySettings()
+
+// Accept self-signed / untrusted certificates when connecting to a user-configured remote server.
+// Only bypasses cert validation for the exact CRAFT_SERVER_URL origin — all other connections
+// use standard certificate verification. Without this, wss:// to self-signed servers fails with
+// ERR_CERT_AUTHORITY_INVALID because Chromium's WebSocket rejects untrusted certs.
+//
+// Electron's certificate-error always reports URLs with https:// scheme, so we normalize
+// wss:// → https:// (and ws:// → http://) to ensure origins compare correctly.
+function normalizeOriginForCert(urlStr: string): string {
+  const u = new URL(urlStr)
+  if (u.protocol === 'wss:') u.protocol = 'https:'
+  else if (u.protocol === 'ws:') u.protocol = 'http:'
+  return u.origin
+}
+
+if (process.env.CRAFT_SERVER_URL) {
+  let serverOrigin: string | undefined
+  try {
+    serverOrigin = normalizeOriginForCert(process.env.CRAFT_SERVER_URL)
+  } catch {
+    // Invalid URL — will fail later during connection, no need to handle here
+  }
+  if (serverOrigin) {
+    app.on('certificate-error', (event, _webContents, url, _error, _certificate, callback) => {
+      try {
+        if (normalizeOriginForCert(url) === serverOrigin) {
+          event.preventDefault()
+          callback(true)
+          return
+        }
+      } catch {
+        // URL parse failure — fall through to default rejection
+      }
+      callback(false)
+    })
+  }
+}
+
 // Register thumbnail:// custom protocol for file preview thumbnails in the sidebar.
 // Must happen before app.whenReady() — Electron requires early scheme registration.
 registerThumbnailScheme()
@@ -132,7 +256,7 @@ app.on('open-url', (event, url) => {
   mainLog.info('Received deeplink:', url)
 
   if (windowManager) {
-    handleDeepLink(url, windowManager).catch(err => {
+    handleDeepLink(url, windowManager, moduleSink ?? undefined, moduleClientResolver ?? undefined).catch(err => {
       mainLog.error('Failed to handle deep link:', err)
     })
   } else {
@@ -152,7 +276,7 @@ if (!gotTheLock) {
     const url = commandLine.find(arg => arg.startsWith(`${DEEPLINK_SCHEME}://`))
     if (url && windowManager) {
       mainLog.info('Received deeplink from second instance:', url)
-      handleDeepLink(url, windowManager).catch(err => {
+      handleDeepLink(url, windowManager, moduleSink ?? undefined, moduleClientResolver ?? undefined).catch(err => {
         mainLog.error('Failed to handle deep link:', err)
       })
     } else if (windowManager) {
@@ -221,13 +345,21 @@ async function createInitialWindows(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  // Export packaged state as env var so logger.ts (and headless Bun) don't need 'electron'
+  process.env.CRAFT_IS_PACKAGED = app.isPackaged ? 'true' : 'false'
+
   // Register bundled assets root so all seeding functions can find their files
   // (docs, permissions, themes, tool-icons resolve via getBundledAssetsDir)
   setBundledAssetsRoot(__dirname)
 
-  // Register vendor root so the Codex binary resolver can find bundled binaries
-  // (Codex binary resolves via resolveCodexBinary() which checks vendor/codex/)
-  setVendorRoot(__dirname)
+  // Initialize backend runtime bootstrapping (Codex vendor root, Claude SDK runtime paths).
+  initializeBackendHostRuntime({
+    hostRuntime: {
+      appRootPath: app.isPackaged ? app.getAppPath() : process.cwd(),
+      resourcesPath: process.resourcesPath,
+      isPackaged: app.isPackaged,
+    },
+  })
 
   // Register PowerShell validator root so it can find the bundled parser script
   // (Windows only: validates PowerShell commands in Explore mode using AST analysis)
@@ -250,6 +382,10 @@ app.whenReady().then(async () => {
 
   // Register thumbnail:// protocol handler (scheme was registered earlier, before app.whenReady)
   registerThumbnailHandler()
+
+  // Re-apply proxy settings now that Electron sessions are available
+  // (first call before app.whenReady only configured Node-level proxy)
+  await applyConfiguredProxySettings()
 
   // Note: electron-updater handles pending updates internally via autoInstallOnAppQuit
 
@@ -288,39 +424,315 @@ app.whenReady().then(async () => {
     // Create the application menu (needs windowManager for New Window action)
     createApplicationMenu(windowManager)
 
-    // Initialize session manager
-    sessionManager = new SessionManager()
-    sessionManager.setWindowManager(windowManager)
+    // When CRAFT_SERVER_URL is set, this Electron instance is a thin client —
+    // it only creates windows whose preload connects to the remote server.
+    // Skip server-side initialization (SessionManager, model refresh, platform injection).
+    const isClientOnly = !!process.env.CRAFT_SERVER_URL
+    const isHeadless = !!process.env.CRAFT_HEADLESS
 
-    // Initialize notification service
+    if (isClientOnly) {
+      mainLog.info(`Client-only mode: CRAFT_SERVER_URL=${process.env.CRAFT_SERVER_URL} (server initialization skipped)`)
+    }
+
+    // Initialize session manager (server-side only — thin client delegates to remote server)
+    let modelRefreshService: ReturnType<typeof initModelRefreshService> | null = null
+    if (!isClientOnly) {
+      sessionManager = new SessionManager()
+
+      // Restore persisted Git Bash path on Windows (must happen before any SDK subprocess spawn)
+      if (process.platform === 'win32') {
+        const { getGitBashPath, clearGitBashPath } = await import('@craft-agent/shared/config')
+        const gitBashPath = getGitBashPath()
+        if (gitBashPath) {
+          const validation = await validateGitBashPath(gitBashPath)
+          if (validation.valid) {
+            process.env.CLAUDE_CODE_GIT_BASH_PATH = validation.path
+          } else {
+            clearGitBashPath()
+            delete process.env.CLAUDE_CODE_GIT_BASH_PATH
+            mainLog.warn(`Cleared invalid persisted Git Bash path: ${gitBashPath}`)
+          }
+        }
+      }
+
+      // Initialize model refresh service BEFORE IPC handlers —
+      // getModelRefreshService() is called from IPC handlers, so it must be ready
+      // before any renderer can send messages.
+      modelRefreshService = initModelRefreshService(async (slug: string) => {
+        const { getCredentialManager } = await import('@craft-agent/shared/credentials')
+        const manager = getCredentialManager()
+        const [apiKey, oauth] = await Promise.all([
+          manager.getLlmApiKey(slug).catch(() => null),
+          manager.getLlmOAuth(slug).catch(() => null),
+        ])
+        return {
+          apiKey: apiKey ?? undefined,
+          oauthAccessToken: oauth?.accessToken,
+          oauthRefreshToken: oauth?.refreshToken,
+          oauthIdToken: oauth?.idToken,
+        }
+      })
+    }
+
+    // Initialize notification service (always — triggered by server push events)
     initNotificationService(windowManager)
 
-    // Register IPC handlers (must happen before window creation)
-    registerIpcHandlers(sessionManager, windowManager)
+    // Initialize browser pane manager
+    browserPaneManager = new BrowserPaneManager()
+    browserPaneManager.setWindowManager(windowManager)
+    browserPaneManager.registerToolbarIpc()
+    sessionManager?.setBrowserPaneManager(browserPaneManager)
+
+    // Build real PlatformServices from Electron APIs
+    const platform: PlatformServices = {
+      appRootPath: app.isPackaged ? app.getAppPath() : process.cwd(),
+      resourcesPath: process.resourcesPath,
+      isPackaged: app.isPackaged,
+      appVersion: app.getVersion(),
+      openExternal: (url) => shell.openExternal(url),
+      openPath: (p) => shell.openPath(p).then(() => {}),
+      showItemInFolder: (p) => shell.showItemInFolder(p),
+      quit: () => app.quit(),
+      systemDarkMode: () => nativeTheme.shouldUseDarkColors,
+      imageProcessor: {
+        async getMetadata(buffer) {
+          const img = nativeImage.createFromBuffer(buffer)
+          if (img.isEmpty()) return null
+          const { width, height } = img.getSize()
+          return (width && height) ? { width, height } : null
+        },
+        async process(input, opts = {}) {
+          const img = typeof input === 'string'
+            ? nativeImage.createFromPath(input)
+            : nativeImage.createFromBuffer(input)
+          if (img.isEmpty()) throw new Error('Invalid image input')
+
+          let result = img
+          if (opts.resize) {
+            const { width: tw, height: th } = opts.resize
+            const fit = opts.fit ?? 'inside'
+            if (fit === 'inside') {
+              const { width: sw, height: sh } = result.getSize()
+              const scale = Math.min(tw / sw, th / sh, 1)
+              result = result.resize({
+                width: Math.round(sw * scale),
+                height: Math.round(sh * scale),
+              })
+            } else {
+              result = result.resize({ width: tw, height: th })
+            }
+          }
+          return (opts.format === 'jpeg')
+            ? result.toJPEG(opts.quality ?? 90)
+            : result.toPNG()
+        },
+      },
+      logger: log,
+      isDebugMode,
+      getLogFilePath,
+      captureError: (err) => Sentry.captureException(err),
+    }
+
+    // Inject platform into server-side subsystems (skip in thin-client mode)
+    if (!isClientOnly) {
+      setFetcherPlatform(platform)
+      setSessionPlatform(platform)
+      const { onSessionStarted, onSessionStopped } = await import('./power-manager')
+      setSessionRuntimeHooks({
+        updateBadgeCount,
+        onSessionStarted,
+        onSessionStopped,
+        captureException: (error, context) => {
+          Sentry.captureException(error instanceof Error ? error : new Error(String(error)), {
+            tags: {
+              ...(context?.errorSource ? { errorSource: context.errorSource } : {}),
+              ...(context?.sessionId ? { sessionId: context.sessionId } : {}),
+            },
+          })
+        },
+      })
+      setSearchPlatform(platform)
+      setImageProcessor(platform.imageProcessor)
+    }
+
+    // Bootstrap IPC handlers — preload uses sendSync for window-local details
+    ipcMain.on('__get-web-contents-id', (e) => {
+      e.returnValue = e.sender.id
+    })
+    ipcMain.on('__get-workspace-id', (e) => {
+      e.returnValue = windowManager?.getWorkspaceForWindow(e.sender.id) ?? ''
+    })
+
+    // Transport diagnostics bridge — preload reports remote WS connection state changes
+    // so failures are visible in terminal/main.log (not only renderer console).
+    ipcMain.on('__transport:status', (_event, payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as {
+        level?: 'info' | 'warn' | 'error'
+        message?: string
+        status?: string
+        attempt?: number
+        nextRetryInMs?: number
+        error?: unknown
+        close?: unknown
+        url?: string
+      }
+
+      const level = p.level ?? 'info'
+      const message = p.message ?? '[transport] status update'
+      const context = {
+        status: p.status,
+        attempt: p.attempt,
+        nextRetryInMs: p.nextRetryInMs,
+        error: p.error,
+        close: p.close,
+        url: p.url,
+      }
+
+      if (level === 'error') {
+        mainLog.error(message, context)
+      } else if (level === 'warn') {
+        mainLog.warn(message, context)
+      } else {
+        mainLog.info(message, context)
+      }
+    })
+
+    // Dialog bridge — preload capability handlers use ipcRenderer.invoke to
+    // call main-process-only dialog APIs (dialog, BrowserWindow).
+    ipcMain.handle('__dialog:showMessageBox', async (event, spec) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+        || BrowserWindow.getFocusedWindow()
+        || BrowserWindow.getAllWindows()[0]
+      const result = await dialog.showMessageBox(win, spec)
+      return { response: result.response }
+    })
+    ipcMain.handle('__dialog:showOpenDialog', async (event, spec) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+        || BrowserWindow.getFocusedWindow()
+        || BrowserWindow.getAllWindows()[0]
+      const result = await dialog.showOpenDialog(win, spec)
+      return { canceled: result.canceled, filePaths: result.filePaths }
+    })
+
+    if (!isClientOnly) {
+      // Create WS RPC server (local WebSocket transport)
+      // CRAFT_RPC_HOST / CRAFT_RPC_PORT allow binding to a custom address for remote access.
+      const rpcHost = process.env.CRAFT_RPC_HOST ?? '127.0.0.1'
+      const rpcPort = process.env.CRAFT_RPC_PORT ? parseInt(process.env.CRAFT_RPC_PORT, 10) : 0
+
+      const clientMap = new Map<number, string>()
+      const resolveClientId = (wcId: number) => clientMap.get(wcId)
+      const localToken = randomUUID()
+
+      const wsServer = new WsRpcServer({
+        host: rpcHost,
+        port: rpcPort,
+        requireAuth: true,
+        validateToken: async (t) => t === localToken,
+        serverId: 'local',
+        onClientConnected: ({ clientId, webContentsId }) => {
+          if (webContentsId != null) clientMap.set(webContentsId, clientId)
+        },
+        onClientDisconnected: (clientId) => {
+          for (const [wcId, cId] of clientMap) {
+            if (cId === clientId) { clientMap.delete(wcId); break }
+          }
+          cleanupSessionFileWatchForClient(clientId)
+        },
+      })
+      await wsServer.listen()
+      const server: RpcServer = wsServer
+      mainLog.info(`WS RPC server listening on ${rpcHost}:${wsServer.port}`)
+
+      // In headless mode, print connection details so a remote client can connect
+      if (isHeadless) {
+        console.log(`CRAFT_SERVER_URL=ws://${rpcHost}:${wsServer.port}`)
+        console.log(`CRAFT_SERVER_TOKEN=${localToken}`)
+      }
+
+      // Module-level EventSink/client resolver — used by deep-link handlers defined before app.whenReady
+      moduleSink = server.push.bind(server)
+      moduleClientResolver = resolveClientId
+
+      // Bootstrap IPC handlers — preload uses sendSync to get WS connection details
+      ipcMain.on('__get-ws-port', (e) => {
+        e.returnValue = wsServer.port
+      })
+      ipcMain.on('__get-ws-token', (e) => {
+        e.returnValue = localToken
+      })
+
+      oauthFlowStore = new OAuthFlowStore()
+
+      // Ensure global config.json exists before handlers can be called.
+      // In GUI mode, createInitialWindows() also ensures this, but in headless
+      // mode that function is skipped — so we must do it here.
+      if (!loadStoredConfig()) {
+        saveConfig({ workspaces: [], activeWorkspaceId: null, activeSessionId: null })
+        mainLog.info('Initialized missing global config')
+      }
+
+      const deps: HandlerDeps = {
+        sessionManager: sessionManager!,
+        platform,
+        windowManager,
+        browserPaneManager,
+        oauthFlowStore,
+      }
+
+      // Register RPC handlers (must happen before window creation)
+      registerAllRpcHandlers(server, deps)
+
+      // Wire EventSink so SessionManager pushes events via the RPC server
+      sessionManager!.setEventSink(server.push.bind(server))
+
+      // Wire EventSink to services that broadcast events to renderers
+      // Must happen BEFORE createInitialWindows() so event handlers use WS from the start
+      windowManager.setRpcEventSink(moduleSink!, resolveClientId)
+      const { setMenuEventSink } = await import('./menu')
+      setMenuEventSink(moduleSink!, resolveClientId)
+      const { setNotificationEventSink } = await import('./notifications')
+      setNotificationEventSink(moduleSink!, resolveClientId)
+
+      // Initialize auth (must happen after window creation for error reporting)
+      await sessionManager!.initialize()
+
+      // Start periodic model refresh after auth is initialized
+      modelRefreshService!.startAll()
+    }
 
     // Create initial windows (restores from saved state or opens first workspace)
-    await createInitialWindows()
-
-    // Initialize auth (must happen after window creation for error reporting)
-    await sessionManager.initialize()
+    // In headless mode the server runs without any UI — skip window creation.
+    if (!isHeadless) {
+      await createInitialWindows()
+    }
 
     // Run credential health check at startup to detect issues early
     // (corruption, machine migration, missing credentials for default connection)
-    try {
-      const { getCredentialManager } = await import('@craft-agent/shared/credentials')
-      const credentialManager = getCredentialManager()
-      const health = await credentialManager.checkHealth()
-      if (!health.healthy) {
-        mainLog.warn('Credential health check failed:', health.issues)
-        // Issues will be displayed in Settings → AI when user navigates there
+    // Skip in thin-client mode — credentials are managed by the remote server.
+    if (!isClientOnly) {
+      try {
+        const { getCredentialManager } = await import('@craft-agent/shared/credentials')
+        const credentialManager = getCredentialManager()
+        const health = await credentialManager.checkHealth()
+        if (!health.healthy) {
+          mainLog.warn('Credential health check failed:', health.issues)
+          // Issues will be displayed in Settings → AI when user navigates there
+        }
+      } catch (err) {
+        mainLog.error('Credential health check error:', err)
       }
-    } catch (err) {
-      mainLog.error('Credential health check error:', err)
     }
 
     // Initialize power manager (loads setting, must happen after config is available)
-    const { initPowerManager } = await import('./power-manager')
-    await initPowerManager()
+    // Non-critical — powerSaveBlocker may not work on headless/xvfb setups
+    try {
+      const { initPowerManager } = await import('./power-manager')
+      await initPowerManager()
+    } catch (err) {
+      mainLog.warn('[power] Power manager init failed (non-critical):', err instanceof Error ? err.message : err)
+    }
 
     // Set Sentry context tags for error grouping (no PII — just config classification).
     // Runs after init so config and auth state are available.
@@ -341,7 +753,7 @@ app.whenReady().then(async () => {
 
     // Initialize auto-update (check immediately on launch)
     // Skip in dev mode to avoid replacing /Applications app and launching it instead
-    setAutoUpdateWindowManager(windowManager)
+    if (moduleSink) setAutoUpdateEventSink(moduleSink)
     if (app.isPackaged) {
       checkForUpdatesOnLaunch().catch(err => {
         mainLog.error('[auto-update] Launch check failed:', err)
@@ -353,7 +765,7 @@ app.whenReady().then(async () => {
     // Process pending deep link from cold start
     if (pendingDeepLink) {
       mainLog.info('Processing pending deep link:', pendingDeepLink)
-      await handleDeepLink(pendingDeepLink, windowManager)
+      await handleDeepLink(pendingDeepLink, windowManager, moduleSink ?? undefined, moduleClientResolver ?? undefined)
       pendingDeepLink = null
     }
 
@@ -362,16 +774,16 @@ app.whenReady().then(async () => {
       mainLog.info('Debug mode enabled - logs at:', getLogFilePath())
     }
   } catch (error) {
-    mainLog.error('Failed to initialize app:', error)
+    mainLog.error('Failed to initialize app:', error instanceof Error ? error.message : error, (error as any)?.stack)
     // Continue anyway - the app will show errors in the UI
   }
 
   // macOS: Re-create window when dock icon is clicked
   app.on('activate', () => {
-    if (!windowManager?.hasWindows()) {
+    if (BrowserWindow.getAllWindows().length === 0 && windowManager) {
       // Open first workspace or last focused
       const workspaces = getWorkspaces()
-      if (workspaces.length > 0 && windowManager) {
+      if (workspaces.length > 0) {
         const savedState = loadWindowState()
         const wsId = savedState?.lastFocusedWorkspaceId || workspaces[0].id
         // Verify workspace still exists
@@ -386,6 +798,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
+  if (process.env.CRAFT_HEADLESS) return  // headless server stays alive
   // On macOS, apps typically stay active until explicitly quit
   if (process.platform !== 'darwin') {
     app.quit()
@@ -400,6 +813,9 @@ app.on('before-quit', async (event) => {
   // Avoid re-entry when we call app.exit()
   if (isQuitting) return
   isQuitting = true
+
+  // Ensure Cmd+Q/app quit bypasses layered window close interception (Cmd+W behavior).
+  windowManager?.setAppQuitting(true)
 
   if (windowManager) {
     // Get full window states (includes bounds, type, and query)
@@ -430,6 +846,19 @@ app.on('before-quit', async (event) => {
     }
     // Clean up SessionManager resources (file watchers, timers, etc.)
     sessionManager.cleanup()
+
+    // Clean up browser pane instances
+    if (browserPaneManager) {
+      browserPaneManager.destroyAll()
+    }
+
+    // Clean up OAuth flow store (stop periodic cleanup timer)
+    if (oauthFlowStore) {
+      oauthFlowStore.dispose()
+    }
+
+    // Stop all model refresh timers
+    getModelRefreshService().stopAll()
 
     // Clean up power manager (release power blocker)
     const { cleanup: cleanupPowerManager } = await import('./power-manager')

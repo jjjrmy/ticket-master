@@ -11,6 +11,7 @@
  * - New Session (model selector group names)
  */
 
+import { Brain } from 'lucide-react'
 import { getProviderIcon } from '@/lib/provider-icons'
 import { getModelDisplayName } from '@config/models'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@craft-agent/ui'
@@ -18,7 +19,7 @@ import type { LlmConnectionWithStatus } from '../../../shared/types'
 
 interface ConnectionIconProps {
   /** The connection to display an icon for */
-  connection: Pick<LlmConnectionWithStatus, 'name' | 'providerType' | 'baseUrl'> & { type?: string; defaultModel?: string }
+  connection: Pick<LlmConnectionWithStatus, 'name' | 'providerType' | 'baseUrl' | 'piAuthProvider'> & { type?: string; defaultModel?: string }
   /** Size in pixels (default: 16) */
   size?: number
   /** Additional CSS classes */
@@ -30,7 +31,8 @@ interface ConnectionIconProps {
 export function ConnectionIcon({ connection, size = 16, className = '', showTooltip = false }: ConnectionIconProps) {
   const providerIcon = getProviderIcon(
     connection.providerType || connection.type || '',
-    connection.baseUrl
+    connection.baseUrl,
+    connection.piAuthProvider
   )
 
   const iconElement = providerIcon ? (
@@ -47,12 +49,10 @@ export function ConnectionIcon({ connection, size = 16, className = '', showTool
       className={`rounded-[3px] bg-foreground/10 flex items-center justify-center flex-shrink-0 ${className}`}
       style={{ width: size, height: size }}
     >
-      <span
-        className="font-medium text-foreground/50"
-        style={{ fontSize: Math.max(8, Math.round(size * 0.6)) }}
-      >
-        {connection.name?.charAt(0).toUpperCase() || '?'}
-      </span>
+      <Brain
+        className="text-foreground/50 flex-shrink-0"
+        style={{ width: Math.round(size * 0.7), height: Math.round(size * 0.7) }}
+      />
     </div>
   )
 

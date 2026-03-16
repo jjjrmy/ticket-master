@@ -7,11 +7,31 @@
  */
 
 // Import model types and lists from centralized registry
+// NOTE: Pi SDK functions (getPiModelsForAuthProvider, getAllPiModels) are NOT imported
+// here because @mariozechner/pi-ai transitively pulls in @aws-sdk which uses Node.js
+// `stream` module — breaking the Vite renderer build. Instead, Pi model resolution is
+// injected at app startup via registerPiModelResolver().
 import {
   type ModelDefinition,
   ANTHROPIC_MODELS,
-  OPENAI_MODELS,
 } from './models';
+import type { CredentialManager } from '../credentials/manager.ts';
+
+// ============================================================
+// Pi Model Resolver (dependency injection to avoid Pi SDK in renderer)
+// ============================================================
+
+type PiModelResolver = (piAuthProvider?: string) => ModelDefinition[];
+let _piModelResolver: PiModelResolver = () => [];
+
+/**
+ * Register the Pi model resolver function.
+ * Must be called from main process at app startup (before any Pi connections are used).
+ * This avoids pulling @mariozechner/pi-ai into the renderer bundle.
+ */
+export function registerPiModelResolver(resolver: PiModelResolver): void {
+  _piModelResolver = resolver;
+}
 
 // ============================================================
 // Types
@@ -23,20 +43,18 @@ import {
  *
  * - 'anthropic': Direct Anthropic API (api.anthropic.com)
  * - 'anthropic_compat': Anthropic-format compatible endpoints (OpenRouter, etc.)
- * - 'openai': Direct OpenAI API (Codex via app-server)
- * - 'openai_compat': OpenAI-format compatible endpoints (Ollama, OpenRouter, etc.)
  * - 'bedrock': AWS Bedrock (Claude models via AWS)
  * - 'vertex': Google Vertex AI (Claude models via GCP)
- * - 'copilot': GitHub Copilot (via @github/copilot-sdk)
+ * - 'pi': Pi unified LLM API (20+ providers via @mariozechner/pi-ai)
+ * - 'pi_compat': Pi with custom endpoint (Ollama, self-hosted models)
  */
 export type LlmProviderType =
   | 'anthropic'
   | 'anthropic_compat'
-  | 'openai'
-  | 'openai_compat'
   | 'bedrock'
   | 'vertex'
-  | 'copilot';
+  | 'pi'
+  | 'pi_compat';
 
 /**
  * @deprecated Use LlmProviderType instead. Kept for migration compatibility.
@@ -74,6 +92,27 @@ export type LlmAuthType =
   | 'none';
 
 /**
+ * Ownership mode for a connection's model list.
+ * - automaticallySyncedFromProvider: provider defaults are synced automatically.
+ * - userDefined3Tier: user-picked Best/Balanced/Fast list is preserved.
+ */
+export type ModelSelectionMode = 'automaticallySyncedFromProvider' | 'userDefined3Tier';
+
+/**
+ * Protocol for custom API endpoints.
+ * Determines which streaming adapter the Pi SDK uses for requests.
+ */
+export type CustomEndpointApi = 'openai-completions' | 'anthropic-messages';
+
+/**
+ * Custom endpoint protocol config.
+ * Set when user configures an arbitrary API endpoint (Ollama, DashScope, vLLM, etc.).
+ */
+export interface CustomEndpointConfig {
+  api: CustomEndpointApi;
+}
+
+/**
  * LLM Connection configuration.
  * Stored in config.llmConnections array.
  */
@@ -106,13 +145,25 @@ export interface LlmConnection {
   defaultModel?: string;
 
   /**
-   * Path to the Codex binary (for 'openai' provider connections).
-   * If not set, defaults to 'codex' in PATH.
-   *
-   * For Craft Agents fork with PreToolUse support, download from:
-   * https://github.com/lukilabs/craft-agents-codex/releases
+   * Ownership mode for the model list.
+   * - automaticallySyncedFromProvider: provider defaults are kept in sync.
+   * - userDefined3Tier: preserve user-selected Best/Balanced/Fast list.
    */
-  codexPath?: string;
+  modelSelectionMode?: ModelSelectionMode;
+
+  /**
+   * Pi auth provider name (e.g., 'anthropic', 'openai', 'github-copilot').
+   * Determines which provider credential Pi SDK uses for LLM calls.
+   * Only relevant for 'pi' providerType connections.
+   */
+  piAuthProvider?: string;
+
+  /**
+   * Custom endpoint protocol config.
+   * Set when user configures an arbitrary API endpoint (Ollama, DashScope, vLLM, etc.).
+   * Determines which streaming adapter the Pi SDK uses for requests.
+   */
+  customEndpoint?: CustomEndpointConfig;
 
   // --- Cloud provider specific fields ---
 
@@ -155,36 +206,83 @@ export interface LlmConnectionWithStatus extends LlmConnection {
 
 /**
  * Get the mini/utility model ID for a connection.
- * Convention: last model in connection.models = mini model.
- * Used for mini agent (Codex).
+ * Provider-aware search:
+ *   - Anthropic (incl. bedrock/vertex): find any model with "haiku" in its id/name
+ *   - OpenAI: find any model with "mini" in its id/name
+ *   - Otherwise: last model in the list
  *
- * Same logic as getSummarizationModel() for now, but separate
- * so mini agent and summarization models can diverge independently.
+ * Used for mini agent, title generation, and mini completions.
  *
- * @param connection - LLM connection (or partial with models array)
+ * @param connection - LLM connection (or partial with models + providerType)
  * @returns Model ID string, or undefined if no models available
  */
-export function getMiniModel(connection: Pick<LlmConnection, 'models'>): string | undefined {
-  if (!connection.models || connection.models.length === 0) return undefined;
-  const last = connection.models[connection.models.length - 1];
-  return last == null ? undefined : typeof last === 'string' ? last : last.id;
+export function getMiniModel(connection: Pick<LlmConnection, 'models' | 'providerType'>): string | undefined {
+  return findSmallModel(connection);
 }
 
 /**
  * Get the summarization model ID for a connection.
- * Convention: last model in connection.models = summarization model.
- * Used for response summarization, title generation, and API tool summarization.
- *
- * Same logic as getMiniModel() for now, but separate
+ * Same provider-aware logic as getMiniModel(), but separate
  * so summarization and mini agent models can diverge independently.
  *
- * @param connection - LLM connection (or partial with models array)
+ * Used for response summarization and API tool summarization.
+ *
+ * @param connection - LLM connection (or partial with models + providerType)
  * @returns Model ID string, or undefined if no models available
  */
-export function getSummarizationModel(connection: Pick<LlmConnection, 'models'>): string | undefined {
+export function getSummarizationModel(connection: Pick<LlmConnection, 'models' | 'providerType'>): string | undefined {
+  return findSmallModel(connection);
+}
+
+/**
+ * Provider-aware small model resolution.
+ * Shared implementation for getMiniModel() and getSummarizationModel().
+ *
+ *   - Anthropic (incl. bedrock/vertex/compat): find "haiku"
+ *   - Pi: find "mini" or "flash"
+ *   - Otherwise: last model in the list
+ */
+function findSmallModel(connection: Pick<LlmConnection, 'models' | 'providerType'>): string | undefined {
   if (!connection.models || connection.models.length === 0) return undefined;
-  const last = connection.models[connection.models.length - 1];
-  return last == null ? undefined : typeof last === 'string' ? last : last.id;
+
+  const toId = (m: ModelDefinition | string) => typeof m === 'string' ? m : m.id;
+
+  const toSearchStr = (m: ModelDefinition | string) =>
+    typeof m === 'string' ? m.toLowerCase() : `${m.id} ${m.name} ${m.shortName}`.toLowerCase();
+
+  const isDeniedSmallModel = (modelId: string): boolean => {
+    const bare = modelId.startsWith('pi/') ? modelId.slice(3) : modelId;
+    return bare === 'codex-mini-latest';
+  };
+
+  const isAllowedModel = (m: ModelDefinition | string): boolean => !isDeniedSmallModel(toId(m));
+
+  // Provider-aware keyword search
+  const keywords: string[] = [];
+
+  if (isAnthropicProvider(connection.providerType)) {
+    keywords.push('haiku');
+  } else if (isPiProvider(connection.providerType)) {
+    keywords.push('mini', 'flash');
+  } else {
+    // Aggregator providers (copilot, etc.) — try all common small-model keywords
+    keywords.push('mini', 'haiku', 'flash');
+  }
+
+  if (keywords.length > 0) {
+    const match = connection.models.find(m => {
+      if (!isAllowedModel(m)) return false;
+      const searchStr = toSearchStr(m);
+      return keywords.some(k => searchStr.includes(k));
+    });
+    if (match) {
+      return toId(match);
+    }
+  }
+
+  // Fallback: last allowed model in the list, otherwise final entry.
+  const fallback = [...connection.models].reverse().find(isAllowedModel);
+  return fallback ? toId(fallback) : toId(connection.models[connection.models.length - 1]!);
 }
 
 /**
@@ -280,10 +378,10 @@ export function authTypeRequiresEndpoint(authType: LlmAuthType): boolean {
  * Check if a provider type is a "compat" provider.
  * Compat providers use custom endpoints and require explicit model lists.
  * @param providerType - Provider type to check
- * @returns true if this is a compat provider (anthropic_compat or openai_compat)
+ * @returns true if this is a compat provider (anthropic_compat or pi_compat)
  */
 export function isCompatProvider(providerType: LlmProviderType): boolean {
-  return providerType === 'anthropic_compat' || providerType === 'openai_compat';
+  return providerType === 'anthropic_compat' || providerType === 'pi_compat';
 }
 
 /**
@@ -301,22 +399,14 @@ export function isAnthropicProvider(providerType: LlmProviderType): boolean {
   );
 }
 
-/**
- * Check if a provider type uses OpenAI models (Codex).
- * @param providerType - Provider type to check
- * @returns true if this provider uses OpenAI/Codex models
- */
-export function isOpenAIProvider(providerType: LlmProviderType): boolean {
-  return providerType === 'openai' || providerType === 'openai_compat';
-}
 
 /**
- * Check if a provider type uses GitHub Copilot.
+ * Check if a provider type uses Pi unified API.
  * @param providerType - Provider type to check
- * @returns true if this provider uses the Copilot SDK
+ * @returns true if this provider uses Pi
  */
-export function isCopilotProvider(providerType: LlmProviderType): boolean {
-  return providerType === 'copilot';
+export function isPiProvider(providerType: LlmProviderType): boolean {
+  return providerType === 'pi' || providerType === 'pi_compat';
 }
 
 /**
@@ -324,21 +414,18 @@ export function isCopilotProvider(providerType: LlmProviderType): boolean {
  * For *_compat providers, returns empty array - those should use connection.models instead.
  *
  * @param providerType - Provider type
+ * @param piAuthProvider - Optional Pi auth provider for filtering Pi models
  * @returns Model list from registry, or empty array for compat providers
  */
-export function getModelsForProviderType(providerType: LlmProviderType): ModelDefinition[] {
+export function getModelsForProviderType(providerType: LlmProviderType, piAuthProvider?: string): ModelDefinition[] {
   // Compat providers require explicit model lists from the connection
   if (isCompatProvider(providerType)) {
     return [];
   }
 
-  // Standard providers use registry models
-  if (providerType === 'openai') {
-    return OPENAI_MODELS;
-  }
-
-  if (providerType === 'copilot') {
-    return []; // Copilot models are dynamic — fetched via listModels(), no hardcoded fallbacks
+  // Pi: fetch models via registered resolver (avoids Pi SDK import in renderer)
+  if (providerType === 'pi') {
+    return _piModelResolver(piAuthProvider);
   }
 
   // Anthropic, Bedrock, Vertex all use Claude models
@@ -353,20 +440,43 @@ export function getModelsForProviderType(providerType: LlmProviderType): ModelDe
  * Use this whenever you need to populate or backfill a connection's models.
  *
  * @param providerType - Provider type from the connection
+ * @param piAuthProvider - Optional Pi auth provider for filtering Pi models
  * @returns Default model list (ModelDefinition[] for standard, string[] for compat)
  */
-export function getDefaultModelsForConnection(providerType: LlmProviderType): Array<ModelDefinition | string> {
-  if (providerType === 'openai_compat') return [
-    'openai/gpt-5.2-codex',
-    'openai/gpt-5.1-codex-mini',
-  ];
-  if (providerType === 'openai') return OPENAI_MODELS;
-  if (providerType === 'copilot') return []; // Dynamic — fetched via listModels()
-  if (providerType === 'anthropic_compat') return [
-    'anthropic/claude-opus-4.6',
-    'anthropic/claude-sonnet-4.5',
-    'anthropic/claude-haiku-4.5',
-  ];
+/**
+ * Preferred default model IDs per Pi auth provider.
+ * The Pi SDK returns models in arbitrary order (alphabetical by ID), which means
+ * deprecated models like claude-3-5-haiku-20241022 can end up first.
+ * This map ensures getDefaultModelForConnection() picks a modern, capable model.
+ *
+ * Format: bare model IDs (without pi/ prefix). Matched against pi/{id} or pi/{id}-*.
+ */
+export const PI_PREFERRED_DEFAULTS: Record<string, string[]> = {
+  anthropic: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
+  openai: ['gpt-5.2', 'gpt-5.1', 'gpt-5', 'o4-mini', 'o3', 'gpt-4o'],
+  'openai-codex': ['gpt-5.2', 'gpt-5.1', 'gpt-5', 'o4-mini', 'o3', 'gpt-4o'],
+  google: ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+  'github-copilot': ['claude-sonnet-4-6', 'gpt-5', 'o4-mini', 'claude-haiku-4-5'],
+};
+
+export function getDefaultModelsForConnection(providerType: LlmProviderType, piAuthProvider?: string): Array<ModelDefinition | string> {
+  if (providerType === 'pi') {
+    const models = _piModelResolver(piAuthProvider);
+    // Sort preferred defaults first so getDefaultModelForConnection picks a modern model
+    const preferred = (piAuthProvider && PI_PREFERRED_DEFAULTS[piAuthProvider]) || [];
+    if (preferred.length > 0) {
+      models.sort((a, b) => {
+        const aIdx = preferred.findIndex(p => a.id === `pi/${p}` || a.id.startsWith(`pi/${p}-`));
+        const bIdx = preferred.findIndex(p => b.id === `pi/${p}` || b.id.startsWith(`pi/${p}-`));
+        const aPrio = aIdx >= 0 ? aIdx : preferred.length;
+        const bPrio = bIdx >= 0 ? bIdx : preferred.length;
+        return aPrio - bPrio;
+      });
+    }
+    return models;
+  }
+  if (providerType === 'pi_compat') return [];  // Dynamic — user specifies
+  if (providerType === 'anthropic_compat') return [];  // Dynamic — user specifies
   // anthropic, bedrock, vertex
   return ANTHROPIC_MODELS;
 }
@@ -376,12 +486,13 @@ export function getDefaultModelsForConnection(providerType: LlmProviderType): Ar
  * Derived from the first entry in getDefaultModelsForConnection() — single source of truth.
  *
  * @param providerType - Provider type from the connection
+ * @param piAuthProvider - Optional Pi auth provider for filtering Pi models
  * @returns Default model ID string
  */
-export function getDefaultModelForConnection(providerType: LlmProviderType): string {
-  const models = getDefaultModelsForConnection(providerType);
+export function getDefaultModelForConnection(providerType: LlmProviderType, piAuthProvider?: string): string {
+  const models = getDefaultModelsForConnection(providerType, piAuthProvider);
   const first = models[0];
-  if (!first) return ANTHROPIC_MODELS[0]!.id;
+  if (!first) return '';  // Dynamic provider — no default
   return typeof first === 'string' ? first : first.id;
 }
 
@@ -452,52 +563,13 @@ export function isValidProviderAuthCombination(
   const validCombinations: Record<LlmProviderType, LlmAuthType[]> = {
     anthropic: ['api_key', 'oauth'],
     anthropic_compat: ['api_key_with_endpoint'],
-    openai: ['api_key', 'oauth'],
-    openai_compat: ['api_key_with_endpoint', 'none'],
     bedrock: ['bearer_token', 'iam_credentials', 'environment'],
     vertex: ['oauth', 'service_account_file', 'environment'],
-    copilot: ['oauth'],
+    pi: ['api_key', 'oauth', 'none'],
+    pi_compat: ['api_key_with_endpoint', 'none'],
   };
 
   return validCombinations[providerType]?.includes(authType) ?? false;
-}
-
-/**
- * Validate that codexPath exists for OpenAI/Codex connections.
- * Only checks path existence - does not verify executability (that happens at runtime).
- *
- * @param connection - LLM connection to validate
- * @returns Object with isValid boolean and optional error message
- */
-export function validateCodexPath(connection: LlmConnection): { isValid: boolean; error?: string } {
-  // Only validate for OpenAI provider type (Codex)
-  if (connection.providerType !== 'openai') {
-    return { isValid: true };
-  }
-
-  // If no custom codexPath, it will use 'codex' from PATH - that's valid
-  if (!connection.codexPath) {
-    return { isValid: true };
-  }
-
-  // Check if the custom path exists
-  // Dynamic import to avoid bundling fs in browser contexts
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { existsSync } = require('fs');
-    if (!existsSync(connection.codexPath)) {
-      return {
-        isValid: false,
-        error: `Codex binary not found at path: ${connection.codexPath}. ` +
-               `Please verify the path or remove it to use 'codex' from PATH.`,
-      };
-    }
-  } catch {
-    // If fs is not available (browser), skip validation
-    return { isValid: true };
-  }
-
-  return { isValid: true };
 }
 
 // ============================================================
@@ -516,9 +588,9 @@ export function migrateConnectionType(legacyType: LlmConnectionType): LlmProvide
     case 'anthropic':
       return 'anthropic';
     case 'openai':
-      return 'openai';
+      return 'pi';
     case 'openai-compat':
-      return 'openai_compat';
+      return 'pi_compat';
   }
 }
 
@@ -545,6 +617,96 @@ export function migrateAuthType(
   }
 }
 
+// ============================================================
+// Auth Environment Variable Resolution
+// ============================================================
+
+/**
+ * Result of resolving auth env vars for an LLM connection.
+ */
+export interface ResolvedAuthEnvVars {
+  /** Environment variables to set (e.g., ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN) */
+  envVars: Record<string, string>;
+  /** Whether credentials were successfully resolved */
+  success: boolean;
+  /** Warning message if auth resolution encountered issues */
+  warning?: string;
+}
+
+/**
+ * Resolve authentication environment variables for an LLM connection.
+ *
+ * Provider-agnostic: switches on providerType to determine which env vars
+ * to set and how to retrieve credentials. Shared by:
+ * - `SessionManager.reinitializeAuth()` (applies to process.env)
+ * - `ClaudeAgent.postInit()` (applies to process.env + envOverrides)
+ *
+ * Providers that handle auth internally (openai, copilot, pi) return
+ * empty envVars — their auth is managed in postInit() via native mechanisms.
+ *
+ * @param connection - The LLM connection config
+ * @param connectionSlug - Connection slug for credential lookup
+ * @param credentialManager - Credential manager instance
+ * @param getValidOAuthToken - Function to get a valid (refreshed) OAuth token
+ * @returns Resolved env vars and status
+ */
+export async function resolveAuthEnvVars(
+  connection: LlmConnection,
+  connectionSlug: string,
+  credentialManager: CredentialManager,
+  getValidOAuthToken: (slug: string) => Promise<{ accessToken?: string | null }>,
+): Promise<ResolvedAuthEnvVars> {
+  const envVars: Record<string, string> = {};
+
+  // Only Anthropic-SDK-based providers use env var auth
+  // OpenAI (Codex), Copilot, and Pi handle auth internally in their postInit()
+  if (!isAnthropicProvider(connection.providerType)) {
+    return { envVars, success: true };
+  }
+
+  // Set base URL if configured
+  if (connection.baseUrl) {
+    envVars.ANTHROPIC_BASE_URL = connection.baseUrl;
+  }
+
+  const authType = connection.authType;
+
+  if (authType === 'api_key' || authType === 'api_key_with_endpoint' || authType === 'bearer_token') {
+    const apiKey = await credentialManager.getLlmApiKey(connectionSlug);
+    if (apiKey) {
+      envVars.ANTHROPIC_API_KEY = apiKey;
+    } else if (connection.baseUrl) {
+      // Keyless provider (e.g. Ollama)
+      envVars.ANTHROPIC_API_KEY = 'not-needed';
+    } else {
+      return { envVars, success: false, warning: `No API key found for: ${connectionSlug}` };
+    }
+  } else if (authType === 'oauth') {
+    if (connection.providerType === 'anthropic') {
+      // Anthropic OAuth uses getValidClaudeOAuthToken which handles token refresh
+      const tokenResult = await getValidOAuthToken(connectionSlug);
+      if (tokenResult.accessToken) {
+        envVars.CLAUDE_CODE_OAUTH_TOKEN = tokenResult.accessToken;
+      } else {
+        return { envVars, success: false, warning: `Failed to get OAuth token for: ${connectionSlug}` };
+      }
+    } else {
+      // Non-Anthropic OAuth (e.g. anthropic_compat with OAuth)
+      const llmOAuth = await credentialManager.getLlmOAuth(connectionSlug);
+      if (llmOAuth?.accessToken) {
+        envVars.CLAUDE_CODE_OAUTH_TOKEN = llmOAuth.accessToken;
+      } else {
+        return { envVars, success: false, warning: `No OAuth token found for: ${connectionSlug}` };
+      }
+    }
+  } else if (authType === 'environment') {
+    // Environment auth — credentials come from process.env, nothing to inject
+    return { envVars, success: true };
+  }
+
+  return { envVars, success: true };
+}
+
 /**
  * Migrate a legacy LlmConnection to the new format.
  * Creates a new connection object with providerType instead of type.
@@ -560,7 +722,6 @@ export function migrateLlmConnection(legacy: {
   authType: 'api_key' | 'oauth' | 'none';
   models?: ModelDefinition[];
   defaultModel?: string;
-  codexPath?: string;
   createdAt: number;
   lastUsedAt?: number;
 }): LlmConnection {
@@ -577,7 +738,6 @@ export function migrateLlmConnection(legacy: {
     authType,
     models: legacy.models,
     defaultModel: legacy.defaultModel,
-    codexPath: legacy.codexPath,
     createdAt: legacy.createdAt,
     lastUsedAt: legacy.lastUsedAt,
   };

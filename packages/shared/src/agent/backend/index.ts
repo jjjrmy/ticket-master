@@ -1,12 +1,12 @@
 /**
  * Agent Backend Abstraction Layer
  *
- * This module provides a unified interface for AI agents (Claude, Codex, etc.)
+ * This module provides a unified interface for AI agents (Claude, Pi)
  * allowing seamless provider switching.
  *
  * Naming convention:
  * - ClaudeAgent: Claude SDK implementation (implements AgentBackend directly)
- * - CodexAgent: OpenAI Codex app-server implementation
+ * - PiAgent: Pi unified API implementation
  * - AgentBackend: Interface that all agents implement
  * - createAgent: Factory function to create agents
  *
@@ -17,7 +17,7 @@
  * const agent = createAgent({
  *   provider: 'anthropic',
  *   workspace: myWorkspace,
- *   model: 'claude-sonnet-4-5-20250929',
+ *   model: 'claude-sonnet-4-6',
  * });
  *
  * for await (const event of agent.chat('Hello')) {
@@ -30,7 +30,9 @@
 export type {
   AgentBackend,
   AgentProvider,
+  CoreBackendConfig,
   BackendConfig,
+  BackendHostRuntimeContext,
   PermissionCallback,
   PlanCallback,
   AuthCallback,
@@ -41,6 +43,7 @@ export type {
   SdkMcpServerConfig,
   LlmAuthType,
   LlmProviderType,
+  PostInitResult,
 } from './types.ts';
 
 // Enums need to be exported as values, not just types
@@ -57,13 +60,33 @@ export {
   connectionTypeToProvider,
   connectionAuthTypeToBackendAuthType,
   resolveSessionConnection,
+  resolveBackendContext,
+  resolveSetupTestConnectionHint,
   createConfigFromConnection,
   createBackendFromConnection,
+  createBackendFromResolvedContext,
+  initializeBackendHostRuntime,
+  resolveBackendHostTooling,
+  fetchBackendModels,
+  validateStoredBackendConnection,
   providerTypeToAgentProvider,
+  // Capabilities and utilities
+  BACKEND_CAPABILITIES,
+  resolveModelForProvider,
+  getDefaultAuthType,
+  cleanupSourceRuntimeArtifacts,
+  testBackendConnection,
+  // Connection validation
+  validateConnection,
 } from './factory.ts';
 
-// Agent implementations
-// Both agents implement AgentBackend directly
-export { ClaudeAgent } from '../claude-agent.ts';
-export { CodexAgent, CodexBackend } from '../codex-agent.ts';
-export { CopilotAgent, CopilotBackend } from '../copilot-agent.ts';
+// Shared infrastructure
+export { BaseEventAdapter } from './base-event-adapter.ts';
+export { EventQueue } from './event-queue.ts';
+
+// Provider-specific event adapters
+export { ClaudeEventAdapter } from './claude/event-adapter.ts';
+export { PiEventAdapter } from './pi/event-adapter.ts';
+
+// Agent implementations are imported directly by factory.ts
+// Consumers should use createAgent() / createBackend() instead of concrete classes

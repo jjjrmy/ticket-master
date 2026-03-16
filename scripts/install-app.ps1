@@ -1,6 +1,7 @@
 # Craft Agents Windows Installer
 # Usage: irm https://agents.craft.do/install-app.ps1 | iex
 
+& {
 $ErrorActionPreference = "Stop"
 
 $VERSIONS_URL = "https://agents.craft.do/electron"
@@ -28,32 +29,31 @@ Write-Info "Detected platform: $platform (arch: $arch)"
 # Create download directory
 New-Item -ItemType Directory -Force -Path $DOWNLOAD_DIR | Out-Null
 
-# Get latest version
-Write-Info "Fetching latest version..."
-try {
-    $latestJson = Invoke-RestMethod -Uri "$VERSIONS_URL/latest" -UseBasicParsing
-    $version = $latestJson.version
-} catch {
-    Write-Err "Failed to fetch latest version: $_"
-}
-
-if (-not $version) {
-    Write-Err "Failed to get latest version"
-}
-
-Write-Info "Latest version: $version"
-
-# Download YAML manifest and extract checksum
+# Fetch YAML manifest directly from /electron/latest/ (no version endpoint needed)
 Write-Info "Fetching release info..."
+$yamlPath = Join-Path $DOWNLOAD_DIR "latest.yml"
 try {
-    $yamlContent = (Invoke-WebRequest -Uri "$VERSIONS_URL/$version/latest.yml" -UseBasicParsing).Content
+    Invoke-WebRequest -Uri "$VERSIONS_URL/latest/latest.yml" -OutFile $yamlPath -UseBasicParsing
 } catch {
     Write-Err "Failed to fetch release info: $_"
 }
 
+$yamlContent = Get-Content $yamlPath -Raw
 if (-not $yamlContent) {
     Write-Err "Failed to fetch release info from latest.yml"
 }
+
+# Extract version from YAML manifest
+$version = $null
+if ($yamlContent -match '(?m)^version:\s*(.+)') {
+    $version = $Matches[1].Trim()
+}
+
+if (-not $version) {
+    Write-Err "Failed to extract version from manifest"
+}
+
+Write-Info "Latest version: $version"
 
 # Parse YAML to extract sha512, url (filename), and size for our architecture
 # YAML format:
@@ -111,7 +111,7 @@ if (-not $filename) {
     $filename = "Craft-Agent-$arch.exe"
 }
 
-$installerUrl = "$VERSIONS_URL/$version/$filename"
+$installerUrl = "$VERSIONS_URL/latest/$filename"
 
 Write-Info "Expected sha512: $($checksum.Substring(0, 20))..."
 
@@ -261,3 +261,4 @@ Write-Host "  Launch from:"
 Write-Host "    - Start Menu or desktop shortcut"
 Write-Host "    - Command line: craft-agents (restart terminal first)"
 Write-Host ""
+}

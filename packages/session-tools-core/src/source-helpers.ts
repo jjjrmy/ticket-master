@@ -6,7 +6,7 @@
  * packages/shared infrastructure.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SourceConfig } from './types.ts';
 
@@ -143,6 +143,38 @@ export function listSkillSlugs(workspaceRootPath: string): string[] {
   }
 }
 
+// ============================================================
+// Session State Helpers
+// ============================================================
+
+/**
+ * Read the session's workingDirectory from the persisted session.jsonl header.
+ * Returns undefined if the session file doesn't exist, can't be parsed,
+ * or has no workingDirectory set. Never throws.
+ */
+export function resolveSessionWorkingDirectory(
+  workspacePath: string,
+  sessionId: string
+): string | undefined {
+  try {
+    const sessionFile = join(workspacePath, 'sessions', sessionId, 'session.jsonl');
+    if (!existsSync(sessionFile)) return undefined;
+    // Read first line only (header) — 8KB buffer is plenty
+    const fd = openSync(sessionFile, 'r');
+    try {
+      const buffer = Buffer.alloc(8192);
+      const bytesRead = readSync(fd, buffer, 0, 8192, 0);
+      const firstLine = buffer.toString('utf-8', 0, bytesRead).split('\n')[0] ?? '';
+      const header = JSON.parse(firstLine);
+      return header.workingDirectory || undefined;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return undefined; // Never fail — caller handles missing gracefully
+  }
+}
+
 /**
  * Generate a unique request ID for auth requests
  */
@@ -155,6 +187,7 @@ export function generateRequestId(prefix: string = 'req'): string {
 // ============================================================
 
 import type { CredentialInputMode } from './types.ts';
+export type { CredentialInputMode } from './types.ts';
 
 /**
  * Detect the effective credential input mode based on source config and requested mode.
@@ -169,12 +202,12 @@ import type { CredentialInputMode } from './types.ts';
  * @returns Effective mode to use
  */
 export function detectCredentialMode(
-  source: { api?: { headerNames?: string[] } } | null,
+  source: { api?: { headerNames?: string[] }; mcp?: { headerNames?: string[] } } | null,
   requestedMode: CredentialInputMode,
   requestedHeaderNames?: string[]
 ): CredentialInputMode {
-  // Use provided headerNames or fall back to source config
-  const effectiveHeaderNames = requestedHeaderNames || source?.api?.headerNames;
+  // Use provided headerNames or fall back to source config (API or MCP)
+  const effectiveHeaderNames = requestedHeaderNames || source?.api?.headerNames || source?.mcp?.headerNames;
 
   // If we have headerNames, always use multi-header mode
   if (effectiveHeaderNames && effectiveHeaderNames.length > 0) {
@@ -192,8 +225,8 @@ export function detectCredentialMode(
  * @returns Array of header names or undefined
  */
 export function getEffectiveHeaderNames(
-  source: { api?: { headerNames?: string[] } } | null,
+  source: { api?: { headerNames?: string[] }; mcp?: { headerNames?: string[] } } | null,
   requestedHeaderNames?: string[]
 ): string[] | undefined {
-  return requestedHeaderNames || source?.api?.headerNames;
+  return requestedHeaderNames || source?.api?.headerNames || source?.mcp?.headerNames;
 }

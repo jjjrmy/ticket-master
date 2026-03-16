@@ -15,10 +15,14 @@
  */
 
 import type { AgentEvent } from '@craft-agent/core/types';
-import { toolMetadataStore } from '../network-interceptor.ts';
+import { toolMetadataStore } from '../interceptor-common.ts';
 import { createLogger } from '../utils/debug.ts';
+import { isParentTaskTool } from '../utils/toolNames.ts';
 
 const log = createLogger('tool-matching');
+
+// Re-export from browser-safe module (no Node deps) for backward compatibility
+export { PARENT_TASK_TOOLS, isParentTaskTool } from '../utils/toolNames.ts';
 
 // ============================================================================
 // Tool Index — append-only, order-independent lookup
@@ -103,6 +107,12 @@ export type ContentBlock = ToolUseBlock | ToolResultBlock | TextBlock | { type: 
 // Pure extraction functions
 // ============================================================================
 
+/** Strip internal metadata fields (_displayName, _intent) from tool input */
+function stripInternalFields(input: unknown): Record<string, unknown> {
+  const { _displayName, _intent, ...clean } = input as Record<string, unknown>;
+  return clean;
+}
+
 /**
  * Extract tool_start events from assistant message content blocks.
  *
@@ -161,16 +171,18 @@ export function extractToolStarts(
     // Dedup: stream_event arrives before assistant message, both have the same tool_use block.
     // The Set is append-only and order-independent (same ID always deduplicates the same way).
     if (emittedToolStartIds.has(toolBlock.id)) {
-      // Already emitted via stream — but check if we now have complete input
+      // Already emitted via stream — re-emit only when we have newly useful data.
+      // 1) Complete input arrived on assistant message (stream starts with {})
+      // 2) Metadata became available later in toolMetadataStore (race-safe)
       const hasNewInput = Object.keys(toolBlock.input).length > 0;
-      if (hasNewInput) {
-        // Re-emit with complete input (assistant message has full input, stream has {})
-        const { intent, displayName } = extractToolMetadata(toolBlock, sessionDir);
+      const { intent, displayName } = extractToolMetadata(toolBlock, sessionDir);
+      const hasMetadataUpdate = !!intent || !!displayName;
+      if (hasNewInput || hasMetadataUpdate) {
         events.push({
           type: 'tool_start',
           toolName: toolBlock.name,
           toolUseId: toolBlock.id,
-          input: toolBlock.input,
+          input: stripInternalFields(toolBlock.input),
           intent,
           displayName,
           turnId,
@@ -188,7 +200,7 @@ export function extractToolStarts(
       type: 'tool_start',
       toolName: toolBlock.name,
       toolUseId: toolBlock.id,
-      input: toolBlock.input,
+      input: stripInternalFields(toolBlock.input),
       intent,
       displayName,
       turnId,
@@ -303,7 +315,7 @@ export function extractToolResults(
  * Extract intent and displayName metadata for a tool call.
  *
  * Sources (checked in priority order):
- * 1. toolMetadataStore — populated by the SSE stripping stream in network-interceptor.ts
+ * 1. toolMetadataStore — populated by the SSE stripping stream in unified-network-interceptor.ts
  * 2. toolBlock.input._intent / _displayName — fallback for Codex backend or if SSE interception didn't run
  * 3. Bash description field — fallback for intent on Bash tools
  */
@@ -311,8 +323,16 @@ function extractToolMetadata(toolBlock: ToolUseBlock, sessionDir?: string): { in
   // 1. Check the metadata store first (populated by SSE interceptor)
   // Pass sessionDir to ensure we read from the correct session's file even when
   // the singleton _sessionDir has been clobbered by a concurrent session.
-  const stored = toolMetadataStore.get(toolBlock.id, sessionDir);
-  if (stored) {
+  const idCandidates = new Set<string>([toolBlock.id]);
+  if (toolBlock.id.includes('|')) {
+    const [base] = toolBlock.id.split('|');
+    if (base) idCandidates.add(base);
+  }
+
+  for (const candidate of idCandidates) {
+    const stored = toolMetadataStore.get(candidate, sessionDir);
+    if (!stored) continue;
+
     let intent = stored.intent;
     const displayName = stored.displayName;
 
@@ -325,7 +345,11 @@ function extractToolMetadata(toolBlock: ToolUseBlock, sessionDir?: string): { in
   }
 
   // Log when metadata store misses — helps diagnose cross-process sync issues
-  log.debug(`extractToolMetadata: store miss for ${toolBlock.name} (${toolBlock.id})`);
+  const argsHasIntent = typeof toolBlock.input._intent === 'string';
+  const argsHasDisplayName = typeof toolBlock.input._displayName === 'string';
+  log.debug(
+    `extractToolMetadata: store miss for ${toolBlock.name} (${toolBlock.id}); candidates=${Array.from(idCandidates).join(' -> ')}; argsIntent=${argsHasIntent}; argsDisplayName=${argsHasDisplayName}`,
+  );
 
   // 2. Fallback: read directly from tool input (Codex backend, non-streaming, etc.)
   let intent = toolBlock.input._intent as string | undefined;
@@ -354,7 +378,7 @@ export function serializeResult(value: unknown): string {
 export function isToolResultError(result: unknown): boolean {
   if (typeof result === 'string') {
     // Check for common error patterns
-    return result.startsWith('Error:') || result.startsWith('error:');
+    return /^\s*(\[ERROR\]|Error:|error:)/.test(result);
   }
   if (result && typeof result === 'object') {
     // Check for error flag in result object
@@ -374,8 +398,13 @@ function detectBackgroundEvents(
 ): AgentEvent[] {
   const events: AgentEvent[] = [];
 
-  // Background Task detection — Task tool with agentId in result
-  if (entry.name === 'Task' && !isError && resultStr) {
+  // Background Task detection — Task/Agent tool with agentId in result.
+  // Only trigger when the tool was explicitly launched with run_in_background: true.
+  // Without this guard, foreground Agent tools whose result text happens to contain
+  // "agentId:" would be spuriously marked as backgrounded — and since no task_completed
+  // event ever arrives for them, they'd stay stuck in 'backgrounded' status forever.
+  const wasRunInBackground = entry.input?.run_in_background === true;
+  if (isParentTaskTool(entry.name) && wasRunInBackground && !isError && resultStr) {
     const agentIdMatch = resultStr.match(/agentId:\s*([a-zA-Z0-9_-]+)/);
     if (agentIdMatch?.[1]) {
       const intentValue = entry.input._intent;

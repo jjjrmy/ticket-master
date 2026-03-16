@@ -101,6 +101,7 @@ export function createMockBackendConfig(overrides: Partial<BackendConfig> = {}):
  * Provides minimal implementations of abstract methods.
  */
 export class TestAgent extends BaseAgent {
+  protected backendName = 'Test';
   // Track calls for verification
   public chatCalls: Array<{ message: string; attachments?: unknown[]; options?: ChatOptions }> = [];
   public abortCalls: Array<{ reason?: string }> = [];
@@ -113,7 +114,7 @@ export class TestAgent extends BaseAgent {
     super(config, 'test-model', 100_000);
   }
 
-  async *chat(
+  protected async *chatImpl(
     message: string,
     attachments?: unknown[],
     options?: ChatOptions
@@ -147,6 +148,10 @@ export class TestAgent extends BaseAgent {
 
   async runMiniCompletion(_prompt: string): Promise<string | null> {
     return 'Test Response';
+  }
+
+  async queryLlm(_request: import('../llm-tool.ts').LLMQueryRequest): Promise<import('../llm-tool.ts').LLMQueryResult> {
+    return { text: 'Test LLM Response' };
   }
 
   // Helper to reset tracking

@@ -5,12 +5,11 @@ import { StepFormLayout, BackButton, ContinueButton } from "./primitives"
 import type { LlmAuthType, LlmProviderType } from "@craft-agent/shared/config/llm-connections"
 
 /** Provider segment for the segmented control */
-export type ProviderSegment = 'anthropic' | 'openai' | 'copilot'
+export type ProviderSegment = 'anthropic' | 'pi'
 
 const SEGMENT_LABELS: Record<ProviderSegment, string> = {
   anthropic: 'Claude',
-  openai: 'Codex',
-  copilot: 'GitHub Copilot',
+  pi: 'Craft Agents Backend',
 }
 
 const BetaBadge = () => (
@@ -21,8 +20,7 @@ const BetaBadge = () => (
 
 const SEGMENT_DESCRIPTIONS: Record<ProviderSegment, React.ReactNode> = {
   anthropic: <>Use Claude Agent SDK as the main agent.<br />Configure with your Claude subscription or API key.</>,
-  openai: <>Use Codex CLI as the main agent.<BetaBadge /><br />Configure with your ChatGPT subscription or OpenAI API key.</>,
-  copilot: <>Use Copilot Agent as the main agent.<BetaBadge /><br />Configure with your GitHub Copilot subscription.</>,
+  pi: <>Use Craft Agents Backend as the main agent.<BetaBadge /><br />Configure with your API key, OAuth subscription, or custom endpoint.</>,
 }
 
 /**
@@ -31,10 +29,16 @@ const SEGMENT_DESCRIPTIONS: Record<ProviderSegment, React.ReactNode> = {
  *
  * - 'claude_oauth' → anthropic + oauth
  * - 'anthropic_api_key' → anthropic + api_key
- * - 'chatgpt_oauth' → openai + oauth
- * - 'openai_api_key' → openai + api_key
+ * - 'pi_chatgpt_oauth' → pi + oauth
+ * - 'pi_copilot_oauth' → pi + oauth
+ * - 'pi_api_key' → pi + api_key
  */
-export type ApiSetupMethod = 'anthropic_api_key' | 'claude_oauth' | 'chatgpt_oauth' | 'openai_api_key' | 'copilot_oauth'
+export type ApiSetupMethod =
+  | 'anthropic_api_key'
+  | 'claude_oauth'
+  | 'pi_chatgpt_oauth'
+  | 'pi_copilot_oauth'
+  | 'pi_api_key'
 
 /**
  * Map ApiSetupMethod to the underlying LLM connection types.
@@ -48,12 +52,12 @@ export function apiSetupMethodToConnectionTypes(method: ApiSetupMethod): {
       return { providerType: 'anthropic', authType: 'oauth' };
     case 'anthropic_api_key':
       return { providerType: 'anthropic', authType: 'api_key' };
-    case 'chatgpt_oauth':
-      return { providerType: 'openai', authType: 'oauth' };
-    case 'openai_api_key':
-      return { providerType: 'openai', authType: 'api_key' };
-    case 'copilot_oauth':
-      return { providerType: 'copilot', authType: 'oauth' };
+    case 'pi_chatgpt_oauth':
+      return { providerType: 'pi', authType: 'oauth' };
+    case 'pi_copilot_oauth':
+      return { providerType: 'pi', authType: 'oauth' };
+    case 'pi_api_key':
+      return { providerType: 'pi', authType: 'api_key' };
   }
 }
 
@@ -81,25 +85,25 @@ const API_SETUP_OPTIONS: ApiSetupOption[] = [
     providerType: 'anthropic',
   },
   {
-    id: 'chatgpt_oauth',
-    name: 'Codex · ChatGPT Plus/Pro',
-    description: 'Use your ChatGPT Plus or Pro subscription with Codex.',
+    id: 'pi_chatgpt_oauth',
+    name: 'ChatGPT Plus',
+    description: 'Use your ChatGPT subscription with Craft Agents Backend.',
     icon: <Cpu className="size-4" />,
-    providerType: 'openai',
+    providerType: 'pi',
   },
   {
-    id: 'openai_api_key',
-    name: 'Codex · OpenAI API Key',
-    description: 'Pay-as-you-go via the OpenAI Platform API.',
+    id: 'pi_copilot_oauth',
+    name: 'GitHub Copilot',
+    description: 'Use your GitHub Copilot subscription with Craft Agents Backend.',
+    icon: <Cpu className="size-4" />,
+    providerType: 'pi',
+  },
+  {
+    id: 'pi_api_key',
+    name: 'API Key',
+    description: 'Use provider presets (Anthropic, OpenAI, Google, etc.) via Craft Agents Backend.',
     icon: <Key className="size-4" />,
-    providerType: 'openai',
-  },
-  {
-    id: 'copilot_oauth',
-    name: 'Copilot · GitHub',
-    description: 'Use your GitHub Copilot subscription.',
-    icon: <Cpu className="size-4" />,
-    providerType: 'copilot',
+    providerType: 'pi',
   },
 ]
 
@@ -181,7 +185,7 @@ function ProviderSegmentedControl({
   activeSegment: ProviderSegment
   onSegmentChange: (segment: ProviderSegment) => void
 }) {
-  const segments: ProviderSegment[] = ['anthropic', 'openai', 'copilot']
+  const segments: ProviderSegment[] = ['anthropic', 'pi']
 
   return (
     <div className="flex rounded-xl bg-foreground/[0.03] p-1 mb-4">

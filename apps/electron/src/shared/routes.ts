@@ -16,6 +16,7 @@
  */
 
 import type { SettingsSubpage } from './settings-registry'
+import type { PermissionMode } from '@craft-agent/shared/agent/mode-types'
 
 // Helper to build query strings from params
 function toQueryString(params?: Record<string, string | undefined>): string {
@@ -79,7 +80,7 @@ export const routes = {
     /** Set permission mode for a session */
     setPermissionMode: (
       sessionId: string,
-      mode: 'safe' | 'ask' | 'allow-all'
+      mode: PermissionMode
     ) => `action/set-mode/${sessionId}?mode=${mode}` as const,
 
     /** Copy text to clipboard */
@@ -155,6 +156,26 @@ export const routes = {
       if (!skillSlug) return 'skills' as const
       return `skills/skill/${skillSlug}` as const
     },
+
+    /** Automations view (automations navigator) - supports type filtering */
+    automations: (params?: { automationId?: string; type?: 'scheduled' | 'event' | 'agentic' }) => {
+      const { automationId, type } = params ?? {}
+      const base = type ? `automations/${type}` : 'automations'
+      if (automationId) return `${base}/automation/${automationId}` as const
+      return base as 'automations' | `automations/${'scheduled' | 'event' | 'agentic'}`
+    },
+
+    /** Scheduled automations view (automations navigator, scheduled filter) */
+    automationsScheduled: (automationId?: string) =>
+      automationId ? `automations/scheduled/automation/${automationId}` as const : 'automations/scheduled' as const,
+
+    /** Event-based automations view (automations navigator, event filter) */
+    automationsEvent: (automationId?: string) =>
+      automationId ? `automations/event/automation/${automationId}` as const : 'automations/event' as const,
+
+    /** Agentic automations view (automations navigator, agentic filter) */
+    automationsAgentic: (automationId?: string) =>
+      automationId ? `automations/agentic/automation/${automationId}` as const : 'automations/agentic' as const,
 
     /** Settings view (settings navigator) - uses SettingsSubpage from registry */
     settings: (subpage?: SettingsSubpage) =>

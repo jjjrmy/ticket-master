@@ -18,9 +18,11 @@
 
 import { watch, existsSync, readdirSync, statSync, readFileSync, mkdirSync } from 'fs';
 import { join, dirname, basename, relative } from 'path';
+import { platform } from 'os';
 import type { FSWatcher } from 'fs';
 import { CONFIG_DIR } from './paths.ts';
 import { debug } from '../utils/debug.ts';
+import { expandPath } from '../utils/paths.ts';
 import { readJsonFileSync } from '../utils/files.ts';
 import { perf } from '../utils/perf.ts';
 import { loadStoredConfig, type StoredConfig } from './storage.ts';
@@ -41,7 +43,7 @@ import {
 import { permissionsConfigCache, getAppPermissionsDir } from '../agent/permissions-config.ts';
 import { getWorkspacePath, getWorkspaceSourcesPath, getWorkspaceSkillsPath } from '../workspaces/storage.ts';
 import type { LoadedSkill } from '../skills/types.ts';
-import { loadSkill, loadWorkspaceSkills, skillNeedsIconDownload, downloadSkillIcon } from '../skills/storage.ts';
+import { loadSkill, loadAllSkills, skillNeedsIconDownload, downloadSkillIcon } from '../skills/storage.ts';
 import {
   loadStatusConfig,
   statusNeedsIconDownload,
@@ -49,6 +51,7 @@ import {
 } from '../statuses/storage.ts';
 import { readSessionHeader } from '../sessions/jsonl.ts';
 import type { SessionHeader } from '../sessions/types.ts';
+import { AUTOMATIONS_CONFIG_FILE } from '../automations/constants.ts';
 import { loadAppTheme, loadPresetThemes, loadPresetTheme, getAppThemesDir } from './storage.ts';
 import type { ThemeOverrides, PresetTheme } from './theme.ts';
 
@@ -61,6 +64,10 @@ const PREFERENCES_FILE = join(CONFIG_DIR, 'preferences.json');
 
 // Debounce delay in milliseconds
 const DEBOUNCE_MS = 100;
+
+// Longer debounce for session metadata on Windows where fs.watch() fires
+// aggressively for atomic writes (unlink + rename = 2+ events)
+const SESSION_META_DEBOUNCE_MS = platform() === 'win32' ? 300 : DEBOUNCE_MS;
 
 // ============================================================
 // Types
@@ -125,9 +132,9 @@ export interface ConfigWatcherCallbacks {
   /** Called when labels config.json changes */
   onLabelConfigChange?: (workspaceId: string) => void;
 
-  // Hooks callbacks
-  /** Called when hooks.json changes */
-  onHooksConfigChange?: (workspaceId: string) => void;
+  // Automations callbacks
+  /** Called when automations.json changes */
+  onAutomationsConfigChange?: (workspaceId: string) => void;
 
   // Session callbacks
   /** Called when a session's JSONL header is modified externally (labels, name, flags, etc.) */
@@ -202,7 +209,7 @@ export class ConfigWatcher {
     // Paths contain '/' or '\\' (Windows) while IDs don't
     const isPath = workspaceIdOrPath.includes('/') || workspaceIdOrPath.includes('\\');
     if (isPath) {
-      this.workspaceDir = workspaceIdOrPath;
+      this.workspaceDir = expandPath(workspaceIdOrPath);
       // Extract workspace ID from path (last segment) - handle both separators
       this.workspaceId = workspaceIdOrPath.split(/[/\\]/).pop() || workspaceIdOrPath;
     } else {
@@ -285,6 +292,19 @@ export class ConfigWatcher {
   }
 
   /**
+   * Manually notify the watcher of a file change.
+   * Workaround: Bun's fs.watch({ recursive: true }) on Linux doesn't track
+   * files in directories created after the watcher started.
+   * See: https://github.com/oven-sh/bun/issues/15939
+   * See: https://github.com/oven-sh/bun/issues/15085
+   * When these are fixed, this method and its call sites can be removed.
+   */
+  notifyFileChange(relativePath: string): void {
+    if (!this.isRunning) return;
+    this.handleWorkspaceFileChange(relativePath, 'change');
+  }
+
+  /**
    * Stop watching all files
    */
   stop(): void {
@@ -350,7 +370,6 @@ export class ConfigWatcher {
     debug('[ConfigWatcher] Setting up workspace watcher for:', this.workspaceDir);
     try {
       const watcher = watch(this.workspaceDir, { recursive: true }, (eventType, filename) => {
-        debug('[ConfigWatcher] RAW FILE EVENT:', eventType, filename);
         if (!filename) return;
 
         // Normalize path separators
@@ -377,10 +396,10 @@ export class ConfigWatcher {
       return;
     }
 
-    // Workspace-level hooks.json
-    if (relativePath === 'hooks.json') {
-      debug('[ConfigWatcher] hooks.json change detected');
-      this.debounce('hooks-config', () => this.handleHooksConfigChange());
+    // Workspace-level automations config file
+    if (relativePath === AUTOMATIONS_CONFIG_FILE) {
+      debug('[ConfigWatcher] automations config change detected:', relativePath);
+      this.debounce('automations-config', () => this.handleAutomationsConfigChange());
       return;
     }
 
@@ -436,7 +455,7 @@ export class ConfigWatcher {
 
       // Only watch actual session files, ignore .tmp (atomic write intermediates)
       if (file === 'session.jsonl') {
-        this.debounce(`session-meta:${sessionId}`, () => this.handleSessionMetadataChange(sessionId));
+        this.debounce(`session-meta:${sessionId}`, () => this.handleSessionMetadataChange(sessionId), SESSION_META_DEBOUNCE_MS);
       }
       return;
     }
@@ -479,7 +498,7 @@ export class ConfigWatcher {
   /**
    * Debounce a handler by key
    */
-  private debounce(key: string, handler: () => void): void {
+  private debounce(key: string, handler: () => void, delayMs: number = DEBOUNCE_MS): void {
     const existing = this.debounceTimers.get(key);
     if (existing) {
       clearTimeout(existing);
@@ -488,7 +507,7 @@ export class ConfigWatcher {
     const timer = setTimeout(() => {
       this.debounceTimers.delete(key);
       handler();
-    }, DEBOUNCE_MS);
+    }, delayMs);
 
     this.debounceTimers.set(key, timer);
   }
@@ -732,7 +751,7 @@ export class ConfigWatcher {
       }
 
       // Notify list change
-      const allSkills = loadWorkspaceSkills(this.workspaceDir);
+      const allSkills = loadAllSkills(this.workspaceDir);
       this.callbacks.onSkillsListChange?.(allSkills);
     } catch (error) {
       debug('[ConfigWatcher] Error handling skills dir change:', error);
@@ -893,11 +912,11 @@ export class ConfigWatcher {
   }
 
   /**
-   * Handle hooks.json change.
+   * Handle automations config change.
    */
-  private handleHooksConfigChange(): void {
-    debug('[ConfigWatcher] hooks.json changed:', this.workspaceId);
-    this.callbacks.onHooksConfigChange?.(this.workspaceId);
+  private handleAutomationsConfigChange(): void {
+    debug('[ConfigWatcher] automations config changed:', this.workspaceId);
+    this.callbacks.onAutomationsConfigChange?.(this.workspaceId);
   }
 
   // ============================================================

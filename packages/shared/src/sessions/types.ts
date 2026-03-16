@@ -29,11 +29,11 @@ export const SESSION_PERSISTENT_FIELDS = [
   // Timestamps
   'createdAt', 'lastUsedAt', 'lastMessageAt',
   // Display
-  'name', 'isFlagged', 'todoState', 'labels', 'hidden',
+  'name', 'isFlagged', 'sessionStatus', 'labels', 'hidden',
   // Read tracking
   'lastReadMessageId', 'hasUnread',
   // Config
-  'enabledSourceSlugs', 'permissionMode', 'workingDirectory',
+  'enabledSourceSlugs', 'permissionMode', 'previousPermissionMode', 'workingDirectory',
   // Model/Connection
   'model', 'llmConnection', 'connectionLocked', 'thinkingLevel',
   // Sharing
@@ -42,20 +42,26 @@ export const SESSION_PERSISTENT_FIELDS = [
   'pendingPlanExecution',
   // Archive
   'isArchived', 'archivedAt',
-  // Hierarchy
-  'parentSessionId', 'siblingOrder',
+  // Branching
+  'branchFromMessageId',
+  'branchFromSdkSessionId',
+  'branchFromSessionPath',
+  'branchFromSdkCwd',
+  'branchFromSdkTurnId',
+  // Automation origin
+  'triggeredBy',
 ] as const;
 
 export type SessionPersistentField = typeof SESSION_PERSISTENT_FIELDS[number];
 
 /**
- * Todo state for sessions (user-controlled, never automatic)
+ * Session status (user-controlled, never automatic)
  *
  * Dynamic status ID referencing workspace status config.
  * Validated at runtime via validateSessionStatus().
  * Falls back to 'todo' if status doesn't exist.
  */
-export type TodoState = string;
+export type SessionStatus = string;
 
 /**
  * Built-in status IDs (for TypeScript consumers)
@@ -104,8 +110,10 @@ export interface SessionConfig {
   isFlagged?: boolean;
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */
   permissionMode?: PermissionMode;
-  /** User-controlled todo state - determines inbox vs completed */
-  todoState?: TodoState;
+  /** Previous permission mode (used to preserve modeTransition context across restarts) */
+  previousPermissionMode?: PermissionMode;
+  /** User-controlled session status - determines inbox vs completed */
+  sessionStatus?: SessionStatus;
   /** Labels applied to this session (bare IDs or "id::value" entries) */
   labels?: string[];
   /** ID of last message user has read */
@@ -142,6 +150,8 @@ export interface SessionConfig {
   pendingPlanExecution?: {
     /** Path to the plan file to execute */
     planPath: string;
+    /** Optional snapshot of draft input captured at accept time */
+    draftInputSnapshot?: string;
     /** Whether we're still waiting for compaction to complete */
     awaitingCompaction: boolean;
   };
@@ -151,11 +161,33 @@ export interface SessionConfig {
   isArchived?: boolean;
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number;
-  // Sub-session hierarchy (1 level max)
-  /** Parent session ID (if this is a sub-session). Null/undefined = root session. */
-  parentSessionId?: string;
-  /** Explicit sibling order (lazy - only populated when user reorders). */
-  siblingOrder?: number;
+  /**
+   * Message ID this session was branched from.
+   * Branching semantics are a hard cutoff: model context must not include parent messages after this message.
+   */
+  branchFromMessageId?: string;
+  /**
+   * Parent session's SDK session ID (optional, only for provider strategies that support strict SDK-level forking).
+   */
+  branchFromSdkSessionId?: string;
+  /**
+   * Parent session's storage path (optional, only when provider-level forking needs parent session files).
+   */
+  branchFromSessionPath?: string;
+  /**
+   * Parent session's sdkCwd (optional). SDK session files are stored per-CWD
+   * (`~/.claude/projects/{cwd-hash}/`), so forking requires the child subprocess
+   * to use the parent's CWD to locate the parent's session file.
+   */
+  branchFromSdkCwd?: string;
+  /**
+   * Provider-native branch anchor at the branch point.
+   * - Claude: assistant message UUID (used as `resumeSessionAt`)
+   * - Pi: session entry ID (used with SessionManager.branch(anchor))
+   */
+  branchFromSdkTurnId?: string;
+  /** Metadata for sessions created by automations */
+  triggeredBy?: { automationName?: string; event?: string; timestamp?: number };
 }
 
 /**
@@ -188,8 +220,10 @@ export interface SessionHeader {
   isFlagged?: boolean;
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */
   permissionMode?: PermissionMode;
-  /** User-controlled todo state - determines inbox vs completed */
-  todoState?: TodoState;
+  /** Previous permission mode (used to preserve modeTransition context across restarts) */
+  previousPermissionMode?: PermissionMode;
+  /** User-controlled session status - determines inbox vs completed */
+  sessionStatus?: SessionStatus;
   /** Labels applied to this session (bare IDs or "id::value" entries) */
   labels?: string[];
   /** ID of last message user has read */
@@ -226,6 +260,8 @@ export interface SessionHeader {
   pendingPlanExecution?: {
     /** Path to the plan file to execute */
     planPath: string;
+    /** Optional snapshot of draft input captured at accept time */
+    draftInputSnapshot?: string;
     /** Whether we're still waiting for compaction to complete */
     awaitingCompaction: boolean;
   };
@@ -235,11 +271,8 @@ export interface SessionHeader {
   isArchived?: boolean;
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number;
-  // Sub-session hierarchy (1 level max)
-  /** Parent session ID (if this is a sub-session). Null/undefined = root session. */
-  parentSessionId?: string;
-  /** Explicit sibling order (lazy - only populated when user reorders). */
-  siblingOrder?: number;
+  /** Metadata for sessions created by automations */
+  triggeredBy?: { automationName?: string; event?: string; timestamp?: number };
   // Pre-computed fields for fast list loading
   /** Number of messages in session */
   messageCount: number;
@@ -270,12 +303,14 @@ export interface SessionMetadata {
   sdkSessionId?: string;
   /** Whether this session is flagged */
   isFlagged?: boolean;
-  /** User-controlled todo state */
-  todoState?: TodoState;
+  /** User-controlled session status */
+  sessionStatus?: SessionStatus;
   /** Labels applied to this session (bare IDs or "id::value" entries) */
   labels?: string[];
   /** Permission mode for this session */
   permissionMode?: PermissionMode;
+  /** Previous permission mode (used to preserve modeTransition context across restarts) */
+  previousPermissionMode?: PermissionMode;
   /** Number of plan files for this session */
   planCount?: number;
   /** Shared viewer URL (if shared via viewer) */
@@ -314,9 +349,6 @@ export interface SessionMetadata {
   isArchived?: boolean;
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number;
-  // Sub-session hierarchy (1 level max)
-  /** Parent session ID (if this is a sub-session). Null/undefined = root session. */
-  parentSessionId?: string;
-  /** Explicit sibling order (lazy - only populated when user reorders). */
-  siblingOrder?: number;
+  /** Message ID that this session was branched from (hard context cutoff marker). */
+  branchFromMessageId?: string;
 }

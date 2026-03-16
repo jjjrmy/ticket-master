@@ -2,6 +2,10 @@
 
 This guide explains how to configure custom permission rules for Explore mode.
 
+> **CLI-first workflow (recommended):** Use `craft-agent permission ...` commands instead of editing JSON directly.
+> - `craft-agent permission --help`
+> - Canonical command reference: [craft-cli.md](./craft-cli.md)
+
 ## Overview
 
 Explore mode is a read-only mode that blocks potentially destructive operations.
@@ -47,6 +51,23 @@ The system converts it to `mcp__<sourceSlug>__.*list` internally. This means:
   "allowedWritePaths": [
     "/tmp/**",
     "~/.craft-agent/**"
+  ],
+  "blockedCommandHints": [
+    {
+      "command": "printf",
+      "reason": "printf is not in the default Explore-mode allowlist.",
+      "context": "Explore mode keeps a narrow read-only command set.",
+      "tryInstead": [
+        "Use echo for simple output",
+        "Switch to Ask mode for this command"
+      ],
+      "example": "echo '--- separator ---'"
+    },
+    {
+      "command": "sed",
+      "reason": "Only print-only sed is allowed by default.",
+      "whenNotMatching": "^sed\\s+-n\\b"
+    }
   ]
 }
 ```
@@ -129,6 +150,41 @@ Glob patterns for directories where writes are allowed.
 }
 ```
 
+### blockedCommandHints
+
+Command-specific guidance shown when a Bash command is blocked in Explore mode.
+This provides deterministic explanations for known commands instead of relying only on closest-pattern heuristics.
+
+```json
+{
+  "blockedCommandHints": [
+    {
+      "command": "printf",
+      "reason": "printf is not in the default Explore-mode allowlist.",
+      "context": "Explore mode keeps a narrow read-only command set.",
+      "tryInstead": [
+        "Use echo for simple output",
+        "Switch to Ask mode for this command"
+      ],
+      "example": "echo '--- separator ---'"
+    },
+    {
+      "command": "sed",
+      "reason": "Only print-only sed is allowed by default.",
+      "whenNotMatching": "^sed\\s+-n\\b"
+    }
+  ]
+}
+```
+
+Fields:
+- `command` (required): Base command name (e.g. `printf`, `sed`)
+- `reason` (required): Primary explanation shown to the user
+- `context` (optional): Additional policy/risk context
+- `tryInstead` (optional): Suggested alternatives
+- `example` (optional): Example command
+- `whenNotMatching` (optional): Regex condition; hint applies only when command does **not** match this pattern
+
 ## Default Behavior in Explore Mode
 
 **Blocked by default:**
@@ -141,6 +197,7 @@ Glob patterns for directories where writes are allowed.
 - Read, Glob, Grep
 - WebFetch, WebSearch
 - TodoWrite
+- Browser tools (`browser_*` and `mcp__session__browser_*`)
 - MCP tools with read semantics (list, get, search)
 - Plans folder writes (session plans only)
 
@@ -150,15 +207,21 @@ These commands are allowed in Explore mode without custom configuration:
 
 | Category | Commands |
 |----------|----------|
-| **File exploration** | `ls`, `tree`, `cat`, `head`, `tail`, `file`, `stat`, `wc`, `du`, `df` |
+| **File exploration** | `ls`, `tree`, `cat`, `head`, `tail`, `nl`, `file`, `stat`, `wc`, `du`, `df` |
 | **Search** | `find`, `grep`, `rg`, `ag`, `fd`, `locate`, `which` |
 | **Git (read-only)** | `git status`, `git log`, `git diff`, `git show`, `git branch`, `git blame`, `git reflog` |
 | **GitHub CLI** | `gh pr view/list`, `gh issue view/list`, `gh repo view` |
 | **Package managers** | `npm ls/list/outdated`, `yarn list`, `pip list`, `cargo tree` |
-| **System info** | `pwd`, `whoami`, `env`, `ps`, `uname`, `hostname`, `date` |
-| **Text processing** | `jq`, `yq`, `sort`, `uniq`, `cut`, `column` |
+| **Quality checks (read-only)** | `bun run typecheck`, `bun run typecheck:all`, `bunx tsc --noEmit`, `tsc --noEmit`, `npm run typecheck`, `yarn typecheck`, `pnpm typecheck` |
+| **Browser helper** | `bun run browser-tool --help`, `bun run browser-tool list`, `bun run browser-tool template ...`, `bun run browser-tool parse-url <url>` |
+| **System info** | `pwd`, `whoami`, `env`, `ps`, `uname`, `hostname`, `date`, `echo` |
+| **Text processing** | `awk`/`gawk`/`mawk`/`nawk` (safe forms), `jq`, `yq`, `sort`, `uniq`, `cut`, `column` |
 | **Network diagnostics** | `ping`, `dig`, `nslookup`, `netstat` |
 | **Version checks** | `node --version`, `python --version`, etc. |
+
+Notes:
+- `echo` is allowed for literal output formatting (e.g. `echo ---`), but redirects and command substitution are still blocked.
+- `awk` family commands are allowed for read-only text processing, but dangerous execution primitives (for example `system(...)`, command-pipe `getline`, or `print | "cmd"`) are blocked.
 
 ### Compound Commands
 

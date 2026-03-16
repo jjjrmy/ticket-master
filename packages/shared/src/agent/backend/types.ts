@@ -18,8 +18,10 @@ import type { ThinkingLevel } from '../thinking-levels.ts';
 import type { PermissionMode } from '../mode-manager.ts';
 import type { LoadedSource } from '../../sources/types.ts';
 import type { AuthRequest } from '../session-scoped-tools.ts';
+import type { McpClientPool } from '../../mcp/mcp-pool.ts';
 import type { Workspace } from '../../config/storage.ts';
 import type { SessionConfig as Session } from '../../sessions/storage.ts';
+import type { SourceManager } from '../core/source-manager.ts';
 
 // Import AbortReason and RecoveryMessage from core module (single source of truth)
 import { AbortReason, type RecoveryMessage } from '../core/index.ts';
@@ -30,6 +32,7 @@ import type { ModelProvider } from '../../config/models.ts';
 // Import LLM connection types for auth
 import type { LlmAuthType, LlmProviderType } from '../../config/llm-connections.ts';
 export type { LlmAuthType, LlmProviderType } from '../../config/llm-connections.ts';
+import type { AutomationSystem } from '../../automations/index.ts';
 
 /**
  * Provider identifier for AI backends.
@@ -45,7 +48,7 @@ export type AgentProvider = ModelProvider;
 /**
  * Permission prompt types for different tool categories.
  */
-export type PermissionRequestType = 'bash' | 'file_write' | 'mcp_mutation' | 'api_mutation';
+export type PermissionRequestType = 'bash' | 'file_write' | 'mcp_mutation' | 'api_mutation' | 'admin_approval';
 
 /**
  * Permission request callback signature.
@@ -57,6 +60,13 @@ export type PermissionCallback = (request: {
   command?: string;
   description: string;
   type?: PermissionRequestType;
+  appName?: string;
+  reason?: string;
+  impact?: string;
+  requiresSystemPrompt?: boolean;
+  rememberForMinutes?: number;
+  commandHash?: string;
+  approvalTtlSeconds?: number;
 }) => void;
 
 /**
@@ -82,6 +92,153 @@ export type SourceChangeCallback = (slug: string, source: LoadedSource | null) =
  * Returns true if source was successfully activated.
  */
 export type SourceActivationCallback = (sourceSlug: string) => Promise<boolean>;
+
+// ============================================================
+// Lifecycle Types
+// ============================================================
+
+/**
+ * Result of backend post-initialization (auth injection, config setup).
+ * Returned by postInit() so the session layer can surface warnings.
+ */
+export interface PostInitResult {
+  /** Whether auth credentials were successfully injected */
+  authInjected: boolean;
+  /** Optional warning message to surface in UI */
+  authWarning?: string;
+  /** Severity level for the warning */
+  authWarningLevel?: 'error' | 'warning' | 'info';
+}
+
+/**
+ * Context for applying bridge/config updates mid-session.
+ * Used when sources change, tokens refresh, or auth completes.
+ */
+export interface BridgeUpdateContext {
+  /** Path to the session folder */
+  sessionPath: string;
+  /** Currently enabled sources */
+  enabledSources: LoadedSource[];
+  /** Pre-built MCP server configs */
+  mcpServers: Record<string, SdkMcpServerConfig>;
+  /** Session ID */
+  sessionId: string;
+  /** Workspace root path */
+  workspaceRootPath: string;
+  /** Descriptive context for logging (e.g., 'token refresh', 'source enable') */
+  context: string;
+  /** URL of the McpPoolServer HTTP endpoint */
+  poolServerUrl?: string;
+}
+
+/**
+ * Host runtime context passed from the application shell (Electron/CLI/etc.).
+ * This is intentionally provider-agnostic metadata; backend drivers resolve
+ * provider-specific paths from this context internally.
+ */
+export interface BackendHostRuntimeContext {
+  /** App root path (packaged app path or repository root in development) */
+  appRootPath: string;
+  /** Optional resources path (needed for packaged Windows runtime resolution) */
+  resourcesPath?: string;
+  /** Whether the host app is running as a packaged build */
+  isPackaged: boolean;
+  /** Optional runtime override for Node/Bun executable */
+  nodeRuntimePath?: string;
+  /** Optional interceptor bundle override (CJS bundle loaded via --require) */
+  interceptorBundlePath?: string;
+}
+
+/**
+ * Provider-agnostic backend configuration used by the session layer.
+ * Provider-specific runtime details are resolved by backend drivers internally.
+ */
+export interface CoreBackendConfig {
+  /** Workspace configuration */
+  workspace: Workspace;
+
+  /** Session configuration (for resume) */
+  session?: Session;
+
+  /** Initial model ID */
+  model?: string;
+
+  /** Mini/utility model for summarization/title generation/mini-completions */
+  miniModel?: string;
+
+  /** Initial thinking level */
+  thinkingLevel?: ThinkingLevel;
+
+  /** Headless mode flag (disables interactive tools) */
+  isHeadless?: boolean;
+
+  /** Debug mode configuration */
+  debugMode?: {
+    enabled: boolean;
+    logFilePath?: string;
+  };
+
+  /** System prompt preset ('default' | 'mini' | custom string) */
+  systemPromptPreset?: 'default' | 'mini' | string;
+
+  /** Workspace-level automation system for user-defined automations (automations.json) */
+  automationSystem?: AutomationSystem;
+
+  /**
+   * Per-session environment variable overrides for the SDK subprocess.
+   * Spread after process.env in backend-specific option builders.
+   */
+  envOverrides?: Record<string, string>;
+
+  /**
+   * Centralized MCP client pool for source tool execution.
+   * Owns all MCP source connections in the main process.
+   */
+  mcpPool?: McpClientPool;
+
+  /**
+   * URL of the McpPoolServer HTTP endpoint for this session.
+   * External SDK subprocesses connect here to access pool-managed MCP tools.
+   */
+  poolServerUrl?: string;
+
+  /** Callback when SDK session ID is captured/updated */
+  onSdkSessionIdUpdate?: (sdkSessionId: string) => void;
+
+  /** Callback when SDK session ID is cleared (e.g., after failed resume) */
+  onSdkSessionIdCleared?: () => void;
+
+  /** Callback to get recent messages for recovery context */
+  getRecoveryMessages?: () => RecoveryMessage[];
+
+  /**
+   * Callback to get branch seed messages (up to branch cutoff) for first turn in seeded branch mode.
+   * When provided and non-empty, BaseAgent injects a hidden context block before the first user turn.
+   */
+  getBranchSeedMessages?: () => RecoveryMessage[];
+
+  /** Callback invoked after branch seed context has been injected. */
+  markBranchSeedApplied?: () => void;
+
+  /**
+   * Optional callback to resize an oversized image for API compatibility.
+   * Called from PreToolUse when Read targets an image exceeding the base64 size limit.
+   * Returns path to the resized temp file, or null if resize not possible.
+   * Provided by the host app (Electron uses nativeImage, server could use sharp, etc.).
+   */
+  onImageResize?: (filePath: string, maxSizeBytes: number) => Promise<string | null>;
+
+  /**
+   * Pre-computed source configurations for initial setup.
+   * Passed at construction so backends can set up sources in postInit().
+   */
+  initialSources?: {
+    enabledSources: LoadedSource[];
+    mcpServers: Record<string, SdkMcpServerConfig>;
+    apiServers: Record<string, unknown>;
+    enabledSlugs: string[];
+  };
+}
 
 // ============================================================
 // Backend Interface
@@ -166,9 +323,63 @@ export interface AgentBackend {
   forceAbort(reason: AbortReason): void;
 
   /**
+   * Redirect the agent mid-stream with a new user message.
+   * Called when the user sends a message while the agent is still processing.
+   *
+   * Each backend decides its own strategy:
+   * - Backends with native steering (e.g., Pi) inject the message into the
+   *   current stream and return true — events continue through the existing
+   *   generator, no abort needed.
+   * - Backends without steering call forceAbort(Redirect) internally and
+   *   return false — the session layer queues the message for re-send.
+   *
+   * @param message - The new user message
+   * @returns true if steered (events flow through existing stream),
+   *          false if aborted (session layer must queue + re-send)
+   */
+  redirect(message: string): boolean;
+
+  /**
+   * Run a simple text completion using the backend's auth infrastructure.
+   * Used for connection testing, title generation, and summarization.
+   */
+  runMiniCompletion(prompt: string): Promise<string | null>;
+
+  /**
    * Clean up resources (MCP connections, watchers, etc.)
    */
   destroy(): void;
+
+  /**
+   * Alias for destroy() for consistency.
+   */
+  dispose(): void;
+
+  /**
+   * Post-construction initialization.
+   * Handles auth injection, initial config generation, etc.
+   * Called after construction and callback wiring, before first chat().
+   */
+  postInit(): Promise<PostInitResult>;
+
+  /**
+   * Apply bridge/config updates mid-session.
+   * Called when sources change, tokens refresh, or auth completes.
+   * Each backend implements its own strategy:
+   * - Codex: regenerates config.toml and queues reconnect
+   * - Copilot: writes bridge-config.json and credential cache
+   * - Claude/Pi: no-op (they don't use bridge-mcp-server)
+   */
+  applyBridgeUpdates(context: BridgeUpdateContext): Promise<void>;
+
+  /**
+   * Ensure branch sessions are backend-ready before first user message.
+   * Called at branch creation time to avoid creating "fake branches" that have
+   * copied transcript history but no actual backend branch context.
+   *
+   * Default behavior can be a no-op for providers that don't need preflight.
+   */
+  ensureBranchReady(): Promise<void>;
 
   /**
    * Check if currently processing a query.
@@ -191,9 +402,6 @@ export interface AgentBackend {
   /** Set thinking level */
   setThinkingLevel(level: ThinkingLevel): void;
 
-  /** Enable/disable ultrathink override for next message */
-  setUltrathinkOverride(enabled: boolean): void;
-
   // ============================================================
   // Permission Mode
   // ============================================================
@@ -214,6 +422,9 @@ export interface AgentBackend {
   /** Get SDK session ID (for resume, null if no session) */
   getSessionId(): string | null;
 
+  /** Whether this backend supports session branching */
+  readonly supportsBranching: boolean;
+
   // ============================================================
   // Source Management
   // ============================================================
@@ -230,7 +441,7 @@ export interface AgentBackend {
     mcpServers: Record<string, SdkMcpServerConfig>,
     apiServers: Record<string, unknown>,
     intendedSlugs?: string[]
-  ): void;
+  ): void | Promise<void>;
 
   /**
    * Get currently active source slugs.
@@ -241,6 +452,46 @@ export interface AgentBackend {
    * Get all sources (for context injection).
    */
   getAllSources(): LoadedSource[];
+
+  /**
+   * Set all sources (for context injection).
+   */
+  setAllSources(sources: LoadedSource[]): void;
+
+  /**
+   * Mark a source as unseen (will show introduction text again).
+   */
+  markSourceUnseen(sourceSlug: string): void;
+
+  /**
+   * Get a bound summarize callback for passing to API tool builders.
+   */
+  getSummarizeCallback(): (prompt: string) => Promise<string | null>;
+
+  // ============================================================
+  // Session & Workspace State
+  // ============================================================
+
+  /** Update the working directory */
+  updateWorkingDirectory(path: string): void;
+
+  /** Update the SDK cwd (transcript storage location) */
+  updateSdkCwd(path: string): void;
+
+  /** Set workspace configuration */
+  setWorkspace(workspace: Workspace): void;
+
+  /** Set session ID */
+  setSessionId(sessionId: string | null): void;
+
+  /** Get SourceManager for advanced queries */
+  getSourceManager(): SourceManager;
+
+  /** Generate a session title from user message */
+  generateTitle(message: string, options?: { language?: string }): Promise<string | null>;
+
+  /** Regenerate a session title from recent conversation */
+  regenerateTitle(recentUserMessages: string[], lastAssistantResponse: string, options?: { language?: string }): Promise<string | null>;
 
   // ============================================================
   // Permission Resolution
@@ -279,18 +530,29 @@ export interface AgentBackend {
 
   /** Called when a source tool is used but source isn't active */
   onSourceActivationRequest: SourceActivationCallback | null;
+
+  /**
+   * Called when backend-specific authentication is required.
+   * Replaces per-backend callbacks (onChatGptAuthRequired, onGithubAuthRequired).
+   * The session layer wires this to surface auth warnings in the UI.
+   */
+  onBackendAuthRequired: ((reason: string) => void) | null;
+
+  /** Called when agent requests spawning a new session */
+  onSpawnSession: ((request: import('../base-agent.ts').SpawnSessionRequest) => Promise<import('../base-agent.ts').SpawnSessionResult>) | null;
 }
 
 /**
  * Configuration for creating a backend.
  */
-export interface BackendConfig {
+export interface BackendConfig extends CoreBackendConfig {
   /**
    * Provider/SDK to use for this backend.
    * Determines which agent class is instantiated:
    * - 'anthropic' → ClaudeAgent (Anthropic SDK)
    * - 'openai' → CodexAgent (OpenAI via app-server)
    * - 'copilot' → CopilotAgent (GitHub Copilot via @github/copilot-sdk)
+   * - 'pi' → PiAgent (Pi via @mariozechner/pi-coding-agent)
    */
   provider: AgentProvider;
 
@@ -312,96 +574,8 @@ export interface BackendConfig {
    */
   legacyAuthType?: 'api_key' | 'oauth_token';
 
-  /** Workspace configuration */
-  workspace: Workspace;
-
-  /** Session configuration (for resume) */
-  session?: Session;
-
-  /** Initial model ID */
-  model?: string;
-
-  /** Initial thinking level */
-  thinkingLevel?: ThinkingLevel;
-
   /** MCP token override (for testing) */
   mcpToken?: string;
-
-  /** Headless mode flag (disables interactive tools) */
-  isHeadless?: boolean;
-
-  /** Debug mode configuration */
-  debugMode?: {
-    enabled: boolean;
-    logFilePath?: string;
-  };
-
-  /** System prompt preset ('default' | 'mini' | custom string) */
-  systemPromptPreset?: 'default' | 'mini' | string;
-
-  /**
-   * Custom CODEX_HOME directory for per-session configuration (Codex backend only).
-   * When set, the Codex app-server will read config.toml from this directory
-   * instead of ~/.codex, enabling per-session MCP server configuration.
-   *
-   * Typically set to: `{sessionPath}/.codex-home`
-   */
-  codexHome?: string;
-
-  /**
-   * Path to the @github/copilot CLI entry point (CopilotAgent only).
-   * Required because esbuild bundles break `import.meta.resolve()` used by the SDK.
-   * Resolved in the Electron main process and passed here.
-   */
-  copilotCliPath?: string;
-
-  /**
-   * Path to the Copilot network interceptor (CopilotAgent only).
-   * Loaded via NODE_OPTIONS="--require ..." into the Copilot CLI subprocess.
-   * Intercepts fetch() to inject tool metadata and capture it from responses.
-   */
-  copilotInterceptorPath?: string;
-
-  /**
-   * Per-session config directory for Copilot SDK (CopilotAgent only).
-   * When set, the Copilot CLI will use this directory for storing config and state.
-   */
-  copilotConfigDir?: string;
-
-  /**
-   * Path to session-mcp-server executable (stdio MCP server for session-scoped tools).
-   * Provides SubmitPlan, config_validate, source_test, source_oauth_trigger, etc.
-   * Used by Codex (via config.toml) and Copilot (via mcpServers runtime config).
-   */
-  sessionServerPath?: string;
-
-  /**
-   * Path to Node/Bun executable for spawning MCP server subprocesses.
-   * Used to run session-mcp-server and bridge-mcp-server.
-   */
-  nodePath?: string;
-
-  /**
-   * Path to bridge-mcp-server executable (stdio MCP server for API sources).
-   * Bridges REST API sources to the agent via MCP protocol.
-   * Used by Codex (via config.toml) and Copilot (via mcpServers runtime config).
-   */
-  bridgeServerPath?: string;
-
-  /** Callback when SDK session ID is captured/updated */
-  onSdkSessionIdUpdate?: (sdkSessionId: string) => void;
-
-  /** Callback when SDK session ID is cleared (e.g., after failed resume) */
-  onSdkSessionIdCleared?: () => void;
-
-  /** Callback to get recent messages for recovery context */
-  getRecoveryMessages?: () => RecoveryMessage[];
-
-  /**
-   * Mini/utility model for summarization, title generation, and mini agent.
-   * Resolved from the connection's miniModel field (last model in models array).
-   */
-  miniModel?: string;
 
   /**
    * Connection slug for credential routing.
@@ -409,4 +583,13 @@ export interface BackendConfig {
    * Used to read/write credentials under the correct key.
    */
   connectionSlug?: string;
+
+  /** Workspace-level automation system for user-defined SDK hooks (automations.json) */
+  automationSystem?: AutomationSystem;
+
+  /**
+   * Opaque runtime payload resolved by backend drivers.
+   * This keeps provider-specific runtime details out of the public config surface.
+   */
+  runtime?: Record<string, unknown>;
 }

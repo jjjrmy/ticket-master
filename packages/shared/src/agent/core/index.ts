@@ -13,6 +13,7 @@
  * - ConfigWatcherManager: Hot-reload config file watching
  * - SessionLifecycleManager: Session state and abort handling
  * - UsageTracker: Token usage and context window tracking
+ * - PrerequisiteManager: Prerequisite reading enforcement (guide.md before source tools)
  */
 
 // Types
@@ -115,6 +116,11 @@ export {
   type SkillQualificationResult,
   type MetadataStrippingResult,
   type ConfigValidationResult as PreToolUseConfigValidationResult,
+  // Centralized pipeline types
+  type PreToolUseCheckResult,
+  type PreToolUseInput,
+  type PermissionManagerLike,
+  type PrerequisiteManagerLike,
   // Constants
   BUILT_IN_TOOLS,
   FILE_PATH_TOOLS,
@@ -125,4 +131,18 @@ export {
   stripToolMetadata,
   stripMcpMetadata, // deprecated alias for backwards compatibility
   validateConfigWrite,
+  // Centralized pipeline
+  runPreToolUseChecks,
+  shouldPromptInAskMode,
 } from './pre-tool-use.ts';
+
+// Prerequisite Manager
+export { PrerequisiteManager } from './prerequisite-manager.ts';
+export type {
+  PrerequisiteRule,
+  PrerequisiteCheckResult,
+  PrerequisiteManagerConfig,
+} from './prerequisite-manager.ts';
+
+// Re-export skill plugin constant (used by renderer for mention qualification)
+export { AGENTS_PLUGIN_NAME } from '../../skills/types.ts';

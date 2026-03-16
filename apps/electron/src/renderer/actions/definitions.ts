@@ -11,6 +11,13 @@ export const actions = {
     defaultHotkey: 'mod+n',
     category: 'General',
   },
+  'app.newChatInPanel': {
+    id: 'app.newChatInPanel',
+    label: 'New Chat in Panel',
+    description: 'Create a new chat session in a new panel',
+    defaultHotkey: 'mod+t',
+    category: 'General',
+  },
   'app.settings': {
     id: 'app.settings',
     label: 'Settings',
@@ -63,9 +70,9 @@ export const actions = {
     defaultHotkey: 'mod+1',
     category: 'Navigation',
   },
-  'nav.focusSessionList': {
-    id: 'nav.focusSessionList',
-    label: 'Focus Session List',
+  'nav.focusNavigator': {
+    id: 'nav.focusNavigator',
+    label: 'Focus Navigator',
     defaultHotkey: 'mod+2',
     category: 'Navigation',
   },
@@ -80,6 +87,7 @@ export const actions = {
     label: 'Focus Next Zone',
     defaultHotkey: 'tab',
     category: 'Navigation',
+    when: '!inputFocus',  // Tab should work normally in text inputs
   },
   'nav.goBack': {
     id: 'nav.goBack',
@@ -101,6 +109,7 @@ export const actions = {
     description: 'Navigate to previous session (arrow key)',
     defaultHotkey: 'mod+left',
     category: 'Navigation',
+    when: '!inputFocus',  // CMD+Left = cursor to line start in text inputs
   },
   'nav.goForwardAlt': {
     id: 'nav.goForwardAlt',
@@ -108,6 +117,7 @@ export const actions = {
     description: 'Navigate to next session (arrow key)',
     defaultHotkey: 'mod+right',
     category: 'Navigation',
+    when: '!inputFocus',  // CMD+Right = cursor to line end in text inputs
   },
 
   // ═══════════════════════════════════════════
@@ -128,22 +138,41 @@ export const actions = {
   },
 
   // ═══════════════════════════════════════════
-  // Session List (scoped)
+  // Navigator (scoped — active entity list in middle panel)
   // ═══════════════════════════════════════════
-  'sessionList.selectAll': {
-    id: 'sessionList.selectAll',
-    label: 'Select All Sessions',
+  'navigator.selectAll': {
+    id: 'navigator.selectAll',
+    label: 'Select All',
     defaultHotkey: 'mod+a',
-    category: 'Session List',
-    scope: 'session-list',
+    category: 'Navigator',
+    scope: 'navigator',
+    when: 'navigatorFocus',  // CMD+A = select all text when in input
   },
-  'sessionList.clearSelection': {
-    id: 'sessionList.clearSelection',
+  'navigator.clearSelection': {
+    id: 'navigator.clearSelection',
     label: 'Clear Selection',
     defaultHotkey: 'escape',
-    category: 'Session List',
-    scope: 'session-list',
-    inputSafe: true,  // Works even when typing in search/chat input
+    category: 'Navigator',
+    scope: 'navigator',
+    when: 'navigatorFocus',
+  },
+
+  // ═══════════════════════════════════════════
+  // Panels
+  // ═══════════════════════════════════════════
+  'panel.focusNext': {
+    id: 'panel.focusNext',
+    label: 'Focus Next Panel',
+    description: 'Move focus to the next panel',
+    defaultHotkey: 'mod+shift+]',
+    category: 'Navigation',
+  },
+  'panel.focusPrev': {
+    id: 'panel.focusPrev',
+    label: 'Focus Previous Panel',
+    description: 'Move focus to the previous panel',
+    defaultHotkey: 'mod+shift+[',
+    category: 'Navigation',
   },
 
   // ═══════════════════════════════════════════
@@ -156,7 +185,7 @@ export const actions = {
     defaultHotkey: 'escape',
     category: 'Chat',
     scope: 'chat',
-    inputSafe: true,  // Must work while typing in chat input
+    when: '!hasSelection',  // Let browser clear selection first; overlays handled by hasOpenOverlay() in enabled callback
   },
   'chat.cyclePermissionMode': {
     id: 'chat.cyclePermissionMode',
@@ -170,14 +199,12 @@ export const actions = {
     label: 'Next Search Match',
     defaultHotkey: 'mod+g',
     category: 'Chat',
-    inputSafe: true,  // Must work while typing in search input
   },
   'chat.prevSearchMatch': {
     id: 'chat.prevSearchMatch',
     label: 'Previous Search Match',
     defaultHotkey: 'mod+shift+g',
     category: 'Chat',
-    inputSafe: true,  // Must work while typing in search input
   },
 
 } as const satisfies Record<string, ActionDefinition>

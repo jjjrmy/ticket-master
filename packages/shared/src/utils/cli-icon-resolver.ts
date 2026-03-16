@@ -170,7 +170,14 @@ export function splitCommands(commandStr: string): string[] {
  */
 export function extractCommandName(subCommand: string): string | undefined {
   // Use shell-quote for proper tokenization (handles quotes, escapes, etc.)
-  const parsed = shellParse(subCommand);
+  // shell-quote doesn't support all bash syntax (e.g. ${var%pattern} suffix matching)
+  // and throws on unsupported constructs — gracefully bail out on parse failures
+  let parsed: ReturnType<typeof shellParse>;
+  try {
+    parsed = shellParse(subCommand);
+  } catch {
+    return undefined;
+  }
 
   // Filter to string tokens only (shell-quote can return operator objects)
   const tokens = parsed.filter((t): t is string => typeof t === 'string');

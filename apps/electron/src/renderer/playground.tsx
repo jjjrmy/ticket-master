@@ -5,6 +5,7 @@ import { ThemeProvider } from './context/ThemeContext'
 import { Toaster } from './components/ui/sonner'
 import { PlaygroundApp } from './playground/PlaygroundApp'
 import { ensureMockElectronAPI } from './playground/mock-utils'
+import { EscapeInterruptProvider } from './context/EscapeInterruptContext'
 import './index.css'
 
 // Inject mock electronAPI before rendering
@@ -14,8 +15,10 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <JotaiProvider>
       <ThemeProvider>
-        <PlaygroundApp />
-        <Toaster />
+        <EscapeInterruptProvider>
+          <PlaygroundApp />
+          <Toaster />
+        </EscapeInterruptProvider>
       </ThemeProvider>
     </JotaiProvider>
   </React.StrictMode>

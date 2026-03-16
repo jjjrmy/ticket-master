@@ -8,8 +8,9 @@
  * Claude's full feature set.
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from 'fs';
 import { join, basename } from 'path';
+import { CONFIG_DIR } from '../config/paths.ts';
 import type {
   SessionToolContext,
   SessionToolCallbacks,
@@ -23,6 +24,7 @@ import type {
   McpValidationResult,
   ApiTestResult,
   SourceConfig,
+  DeveloperFeedback,
 } from '@craft-agent/session-tools-core';
 import {
   validateConfig,
@@ -37,7 +39,7 @@ import {
   validateAllPermissions,
   validateToolIcons,
 } from '../config/validators.ts';
-import { validateHooks } from '../hooks-simple/index.ts';
+import { validateAutomations } from '../automations/index.ts';
 import {
   validateMcpConnection as validateMcpConnectionImpl,
   validateStdioMcpConnection as validateStdioMcpConnectionImpl,
@@ -64,7 +66,8 @@ import {
 } from '../sources/types.ts';
 import { isGoogleOAuthConfigured as isGoogleOAuthConfiguredImpl } from '../auth/google-oauth.ts';
 import { debug } from '../utils/debug.ts';
-import { getSessionPlansPath } from '../sessions/storage.ts';
+import { getSessionPlansPath, getSessionPath, getSessionDataPath } from '../sessions/storage.ts';
+import { updatePreferences as updatePreferencesImpl } from '../config/preferences.ts';
 
 // Re-export types that may be needed by consumers
 export type { SessionToolContext, SessionToolCallbacks } from '@craft-agent/session-tools-core';
@@ -129,7 +132,7 @@ export function createClaudeContext(options: ClaudeContextOptions): SessionToolC
       }
       return validateAllPermissions(wsPath);
     },
-    validateHooks: (wsPath: string) => validateHooks(wsPath),
+    validateAutomations: (wsPath: string) => validateAutomations(wsPath),
     validateToolIcons: () => validateToolIcons(),
     validateAll: (wsPath: string) => validateAll(wsPath),
     validateSkill: (wsPath: string, slug: string) => validateSkill(wsPath, slug),
@@ -216,6 +219,7 @@ export function createClaudeContext(options: ClaudeContextOptions): SessionToolC
 
       const result = await validateMcpConnectionImpl({
         mcpUrl: config.url,
+        mcpHeaders: config.headers,
         claudeApiKey: apiKey || undefined,
         claudeOAuthToken: oauthToken || undefined,
       });
@@ -240,10 +244,22 @@ export function createClaudeContext(options: ClaudeContextOptions): SessionToolC
     get sourcesPath() { return join(workspacePath, 'sources'); },
     get skillsPath() { return join(workspacePath, 'skills'); },
     plansFolderPath: getSessionPlansPath(workspacePath, sessionId),
+    sessionPath: getSessionPath(workspacePath, sessionId),
+    dataPath: getSessionDataPath(workspacePath, sessionId),
     callbacks,
     fs,
     validators,
     credentialManager,
+    updatePreferences: (updates: Record<string, unknown>) => {
+      updatePreferencesImpl(updates as any);
+    },
+    submitFeedback: (feedback: DeveloperFeedback) => {
+      const feedbackDir = join(CONFIG_DIR, 'feedback');
+      mkdirSync(feedbackDir, { recursive: true });
+      const filePath = join(feedbackDir, `${feedback.id}.json`);
+      writeFileSync(filePath, JSON.stringify(feedback, null, 2), 'utf-8');
+      debug('claude-context', `Developer feedback written to ${filePath}`);
+    },
     // Source management
     loadSourceConfig: (sourceSlug: string): SourceConfig | null => {
       const config = loadSourceConfigImpl(workspacePath, sourceSlug);

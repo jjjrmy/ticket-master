@@ -1,7 +1,7 @@
 /**
- * Shared infrastructure for network interceptors (Anthropic + Copilot).
+ * Shared infrastructure for the unified network interceptor.
  *
- * Both interceptors run as preload scripts in separate subprocesses.
+ * The interceptor runs as a preload script in SDK subprocesses (Claude, Copilot, Pi).
  * This module provides the common pieces:
  * - toolMetadataStore (file-based cross-process sharing)
  * - LastApiError (error capture for error handler)
@@ -28,6 +28,9 @@ export const DEBUG = INTERCEPTOR_LOGGING_ENABLED &&
 
 /** Config file path for reading settings in the SDK subprocess */
 export const CONFIG_FILE = join(homedir(), '.craft-agent', 'config.json');
+
+/** Session directory — set by env var (subprocess) or setSessionDir() (main process) */
+let _sessionDir: string | null = process.env.CRAFT_SESSION_DIR || null;
 
 // ============================================================================
 // LOGGING
@@ -117,16 +120,23 @@ export interface LastApiError {
   timestamp: number;
 }
 
-const ERROR_FILE = join(homedir(), '.craft-agent', 'api-error.json');
 const MAX_ERROR_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
-function getStoredError(): LastApiError | null {
+function getErrorFilePath(): string {
+  // Prefer session-scoped file to avoid cross-session error consumption.
+  if (_sessionDir) return join(_sessionDir, 'api-error.json');
+  // Fallback for legacy/non-session contexts.
+  return join(homedir(), '.craft-agent', 'api-error.json');
+}
+
+function getStoredError(sessionDir?: string): LastApiError | null {
+  const errorFile = sessionDir ? join(sessionDir, 'api-error.json') : getErrorFilePath();
   try {
-    if (!existsSync(ERROR_FILE)) return null;
-    const content = readFileSync(ERROR_FILE, 'utf-8');
+    if (!existsSync(errorFile)) return null;
+    const content = readFileSync(errorFile, 'utf-8');
     const error = JSON.parse(content) as LastApiError;
     try {
-      unlinkSync(ERROR_FILE);
+      unlinkSync(errorFile);
       debugLog(`[getStoredError] Popped error file`);
     } catch {
       // Ignore delete errors
@@ -138,13 +148,14 @@ function getStoredError(): LastApiError | null {
 }
 
 export function setStoredError(error: LastApiError | null): void {
+  const errorFile = getErrorFilePath();
   try {
     if (error) {
-      writeFileSync(ERROR_FILE, JSON.stringify(error));
+      writeFileSync(errorFile, JSON.stringify(error));
       debugLog(`[setStoredError] Wrote error to file: ${error.status} ${error.message}`);
     } else {
       try {
-        unlinkSync(ERROR_FILE);
+        unlinkSync(errorFile);
       } catch {
         // File might not exist
       }
@@ -154,8 +165,8 @@ export function setStoredError(error: LastApiError | null): void {
   }
 }
 
-export function getLastApiError(): LastApiError | null {
-  const error = getStoredError();
+export function getLastApiError(sessionDir?: string): LastApiError | null {
+  const error = getStoredError(sessionDir);
   if (error) {
     const age = Date.now() - error.timestamp;
     if (age < MAX_ERROR_AGE_MS) {
@@ -209,9 +220,6 @@ export interface ToolMetadata {
  * from all sessions coexist safely (tool_use_ids are globally unique UUIDs).
  */
 
-// Session directory — set by env var (subprocess) or setSessionDir() (main process)
-let _sessionDir: string | null = process.env.CRAFT_SESSION_DIR || null;
-
 function getMetadataFilePath(): string | null {
   return _sessionDir ? join(_sessionDir, 'tool-metadata.json') : null;
 }
@@ -222,16 +230,14 @@ function readMetadataFileFromDir(dir: string): Record<string, ToolMetadata> {
     const filePath = join(dir, 'tool-metadata.json');
     const data = readFileSync(filePath, 'utf-8');
     return JSON.parse(data) as Record<string, ToolMetadata>;
-  } catch {
+  } catch (error) {
+    debugLog(`[toolMetadataStore.read] Failed for dir=${dir}: ${error instanceof Error ? error.message : String(error)}`);
     return {};
   }
 }
 
 // In-memory Map for same-process lookups (accumulates entries across all sessions)
 const _metadataMap = new Map<string, ToolMetadata>();
-
-// File cache — shadows what's been written to disk by this process.
-let _fileCache: Record<string, ToolMetadata> | null = null;
 
 /** Read the entire metadata file from disk (uses current _sessionDir) */
 function readMetadataFile(): Record<string, ToolMetadata> {
@@ -247,8 +253,30 @@ function writeMetadataFile(allMetadata: Record<string, ToolMetadata>): void {
     const tmpPath = filePath + '.tmp';
     writeFileSync(tmpPath, JSON.stringify(allMetadata));
     renameSync(tmpPath, filePath);
-  } catch {
-    // Ignore write errors — in-memory still works for same-process
+  } catch (error) {
+    // Keep non-throwing behavior, but log for diagnostics.
+    debugLog(`[toolMetadataStore.write] Failed for file=${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Merge an updater into the latest on-disk metadata and write atomically.
+ * Retries once to reduce lost updates under concurrent writers.
+ */
+function mergeAndWriteMetadata(
+  updater: (all: Record<string, ToolMetadata>) => void,
+  retries: number = 1,
+): void {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const all = readMetadataFile();
+      updater(all);
+      writeMetadataFile(all);
+      return;
+    } catch (error) {
+      debugLog(`[toolMetadataStore.merge] Attempt ${attempt + 1}/${retries + 1} failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (attempt === retries) return;
+    }
   }
 }
 
@@ -261,7 +289,6 @@ export const toolMetadataStore = {
    */
   setSessionDir(dir: string): void {
     _sessionDir = dir;
-    _fileCache = null;
     // Merge, don't clear — concurrent sessions share this singleton and
     // clearing would discard metadata from other active sessions.
     const all = readMetadataFile();
@@ -273,9 +300,9 @@ export const toolMetadataStore = {
   /** Store metadata — writes to in-memory Map + cached file */
   set(toolUseId: string, metadata: ToolMetadata): void {
     _metadataMap.set(toolUseId, metadata);
-    if (!_fileCache) _fileCache = readMetadataFile();
-    _fileCache[toolUseId] = metadata;
-    writeMetadataFile(_fileCache);
+    mergeAndWriteMetadata((all) => {
+      all[toolUseId] = metadata;
+    });
   },
 
   /**
@@ -302,13 +329,18 @@ export const toolMetadataStore = {
 
   delete(toolUseId: string): void {
     _metadataMap.delete(toolUseId);
-    if (!_fileCache) _fileCache = readMetadataFile();
-    delete _fileCache[toolUseId];
-    writeMetadataFile(_fileCache);
+    mergeAndWriteMetadata((all) => {
+      delete all[toolUseId];
+    });
   },
 
   get size(): number {
     return _metadataMap.size;
+  },
+
+  /** Clear all in-memory entries. Used by tests to prevent cross-file state leaks. */
+  _clearForTesting(): void {
+    _metadataMap.clear();
   },
 };
 

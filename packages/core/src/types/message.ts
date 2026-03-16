@@ -108,6 +108,125 @@ export interface ContentBadge {
 }
 
 /**
+ * Author metadata for annotations
+ */
+export interface AnnotationAuthor {
+  id: string;
+  name?: string;
+  type?: 'user' | 'agent' | 'system';
+}
+
+/**
+ * Annotation body payloads (extensible)
+ */
+export type AnnotationBody =
+  | { type: 'highlight' }
+  | { type: 'note'; text: string; format?: 'plain' | 'markdown' }
+  | { type: 'tag'; value: string };
+
+/**
+ * Annotation intent (tight v1 semantics).
+ */
+export type AnnotationIntent = 'highlight' | 'comment' | 'question';
+
+/**
+ * Optional lifecycle status for annotation workflows.
+ */
+export type AnnotationStatus = 'pending' | 'acknowledged' | 'resolved' | 'dismissed';
+
+/**
+ * Block types for block selectors.
+ */
+export type AnnotationBlockType =
+  | 'paragraph'
+  | 'code'
+  | 'latex'
+  | 'mermaid'
+  | 'datatable'
+  | 'spreadsheet'
+  | 'image-preview'
+  | 'pdf-preview'
+  | 'html-preview';
+
+/**
+ * Selector union used to anchor an annotation target.
+ * Multiple selectors can be stored for robust fallback resolution.
+ */
+export type AnnotationSelector =
+  | {
+      type: 'text-quote';
+      exact: string;
+      prefix?: string;
+      suffix?: string;
+    }
+  | {
+      type: 'text-position';
+      start: number;
+      end: number;
+      textVersion?: string;
+    }
+  | {
+      type: 'block';
+      blockType: AnnotationBlockType;
+      path: string;
+      blockId?: string;
+    }
+  | {
+      type: 'xywh';
+      unit: 'pixel' | 'percent';
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      page?: number;
+      rotation?: number;
+    }
+  | {
+      type: 'table-cell';
+      rowKey: string | number;
+      columnKey: string;
+    };
+
+/**
+ * Annotation target definition.
+ */
+export interface AnnotationTarget {
+  source: {
+    sessionId: string;
+    messageId: string;
+  };
+  selectors: AnnotationSelector[];
+}
+
+/**
+ * Persisted annotation payload (schema-versioned for migration safety).
+ */
+export interface AnnotationV1 {
+  id: string;
+  schemaVersion: 1;
+  createdAt: number;
+  updatedAt?: number;
+  createdBy?: AnnotationAuthor;
+  deletedAt?: number;
+  body: AnnotationBody[];
+  target: AnnotationTarget;
+  /** Optional workflow intent (tight v1 semantics). */
+  intent?: AnnotationIntent;
+  /** Optional lifecycle status. */
+  status?: AnnotationStatus;
+  /** Optional reference to the conversation/thread around this annotation. */
+  threadRef?: {
+    threadId?: string;
+    sessionId?: string;
+  };
+  style?: {
+    color?: 'yellow' | 'green' | 'blue' | 'pink' | string;
+    opacity?: number;
+  };
+  meta?: Record<string, unknown>;
+}
+
+/**
  * Stored attachment metadata (persisted to disk, no base64)
  * Created when user sends a message with attachments
  */
@@ -156,6 +275,8 @@ export interface Message {
   attachments?: StoredAttachment[];
   // Content badges for inline display (sources, skills)
   badges?: ContentBadge[];
+  /** Annotation payloads for this message */
+  annotations?: AnnotationV1[];
   isError?: boolean;
   isStreaming?: boolean;
   // Pending: streaming text where we don't yet know if it's intermediate
@@ -178,8 +299,6 @@ export interface Message {
   errorDetails?: string[];
   errorOriginal?: string;
   errorCanRetry?: boolean;
-  // Ultrathink mode - indicates this user message was sent with extended thinking
-  ultrathink?: boolean;
   // Plan-specific fields (for role='plan')
   planPath?: string;  // Path to the plan markdown file
   // Auth-request-specific fields (for role='auth-request')
@@ -207,7 +326,7 @@ export interface Message {
 
 /**
  * Stored message format (persistence)
- * Excludes only transient fields (isStreaming)
+ * Excludes transient runtime-only fields (isStreaming, isPending)
  */
 export interface StoredMessage {
   id: string;
@@ -237,19 +356,21 @@ export interface StoredMessage {
   attachments?: StoredAttachment[];
   /** Content badges for inline display (sources, skills) */
   badges?: ContentBadge[];
+  /** Annotations persisted at message level */
+  annotations?: AnnotationV1[];
   // Turn grouping - critical for TurnCard rendering after reload
   isIntermediate?: boolean;
   turnId?: string;
   // Status type for compaction messages (persisted for reload)
   statusType?: 'compacting' | 'compaction_complete';
+  // Info level for info messages (persisted for reload)
+  infoLevel?: 'info' | 'warning' | 'error' | 'success';
   // Error display fields
   errorCode?: string;
   errorTitle?: string;
   errorDetails?: string[];
   errorOriginal?: string;
   errorCanRetry?: boolean;
-  // Ultrathink mode - indicates this user message was sent with extended thinking
-  ultrathink?: boolean;
   // Plan-specific fields (for role='plan')
   planPath?: string;
   // Auth-request-specific fields (for role='auth-request')
@@ -353,7 +474,7 @@ export interface TypedError {
 /**
  * Permission request type categories
  */
-export type PermissionRequestType = 'bash' | 'file_write' | 'mcp_mutation' | 'api_mutation';
+export type PermissionRequestType = 'bash' | 'file_write' | 'mcp_mutation' | 'api_mutation' | 'admin_approval';
 
 /**
  * Permission request from agent (e.g., bash command approval)
@@ -364,6 +485,20 @@ export interface PermissionRequest {
   command?: string;  // Optional: bash commands have it, MCP tools may not
   description: string;
   type?: PermissionRequestType;  // Type of permission request
+  /** Friendly app/package label for admin approval prompts */
+  appName?: string;
+  /** Plain-language reason shown in admin approval prompt */
+  reason?: string;
+  /** Plain-language impact shown in admin approval prompt */
+  impact?: string;
+  /** Whether native OS auth prompt is expected */
+  requiresSystemPrompt?: boolean;
+  /** Optional remember window for this exact command */
+  rememberForMinutes?: number;
+  /** Hash binding for approval integrity checks */
+  commandHash?: string;
+  /** Approval validity window */
+  approvalTtlSeconds?: number;
 }
 
 /**
@@ -388,10 +523,24 @@ export type AgentEvent =
   | { type: 'status'; message: string }
   | { type: 'info'; message: string }
   | { type: 'text_delta'; text: string; turnId?: string; parentToolUseId?: string }
-  | { type: 'text_complete'; text: string; isIntermediate?: boolean; turnId?: string; parentToolUseId?: string }
+  | { type: 'text_complete'; text: string; isIntermediate?: boolean; turnId?: string; parentToolUseId?: string; sdkTurnAnchor?: string }
   | { type: 'tool_start'; toolName: string; toolUseId: string; input: Record<string, unknown>; intent?: string; displayName?: string; turnId?: string; parentToolUseId?: string; toolDisplayMeta?: ToolDisplayMeta }
   | { type: 'tool_result'; toolUseId: string; toolName?: string; result: string; isError: boolean; input?: Record<string, unknown>; turnId?: string; parentToolUseId?: string }
-  | { type: 'permission_request'; requestId: string; toolName: string; command: string; description: string }
+  | {
+      type: 'permission_request';
+      requestId: string;
+      toolName: string;
+      command?: string;
+      description: string;
+      permissionType?: PermissionRequestType;
+      appName?: string;
+      reason?: string;
+      impact?: string;
+      requiresSystemPrompt?: boolean;
+      rememberForMinutes?: number;
+      commandHash?: string;
+      approvalTtlSeconds?: number;
+    }
   | { type: 'error'; message: string }
   | { type: 'typed_error'; error: TypedError }
   | { type: 'complete'; usage?: AgentEventUsage }
@@ -399,10 +548,11 @@ export type AgentEvent =
   | { type: 'task_backgrounded'; toolUseId: string; taskId: string; intent?: string; turnId?: string }
   | { type: 'shell_backgrounded'; toolUseId: string; shellId: string; intent?: string; command?: string; turnId?: string }
   | { type: 'task_progress'; toolUseId: string; elapsedSeconds: number; turnId?: string }
+  | { type: 'task_completed'; taskId: string; status: 'completed' | 'failed' | 'stopped'; outputFile?: string; summary?: string; turnId?: string }
   | { type: 'shell_killed'; shellId: string; turnId?: string }
   | { type: 'source_activated'; sourceSlug: string; originalMessage: string }
   | { type: 'usage_update'; usage: Pick<AgentEventUsage, 'inputTokens' | 'contextWindow'> }
-  | { type: 'todos_updated'; todos: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed'; activeForm?: string }>; turnId?: string; explanation?: string | null };
+  | { type: 'steer_undelivered'; message: string };
 
 /**
  * Generate a unique message ID

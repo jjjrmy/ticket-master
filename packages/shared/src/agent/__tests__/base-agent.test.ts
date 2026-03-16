@@ -41,17 +41,6 @@ describe('BaseAgent', () => {
       expect(agent.getThinkingLevel()).toBe('max');
     });
 
-    it('should track ultrathink override', () => {
-      // Set up debug callback to verify the override is set
-      let debugMessage = '';
-      agent.onDebug = (msg) => { debugMessage = msg; };
-
-      agent.setUltrathinkOverride(true);
-      expect(debugMessage).toContain('Ultrathink override: ENABLED');
-
-      agent.setUltrathinkOverride(false);
-      expect(debugMessage).toContain('Ultrathink override: disabled');
-    });
   });
 
   describe('Permission Mode', () => {
@@ -119,8 +108,8 @@ describe('BaseAgent', () => {
       expect(agent.getActiveSourceSlugs()).toEqual([]);
     });
 
-    it('should track source servers', () => {
-      agent.setSourceServers(
+    it('should track source servers', async () => {
+      await agent.setSourceServers(
         { 'source-1': { type: 'http', url: 'http://test' } },
         { 'source-2': {} },
         ['source-1', 'source-2']
@@ -130,8 +119,8 @@ describe('BaseAgent', () => {
       expect(agent.getActiveSourceSlugs()).toContain('source-2');
     });
 
-    it('should check if source is active', () => {
-      agent.setSourceServers(
+    it('should check if source is active', async () => {
+      await agent.setSourceServers(
         { 'active-source': { type: 'http', url: 'http://test' } },
         {},
         ['active-source']

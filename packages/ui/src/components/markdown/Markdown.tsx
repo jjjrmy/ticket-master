@@ -1,7 +1,10 @@
 import * as React from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
+import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import 'katex/dist/katex.min.css'
 import { cn } from '../../lib/utils'
 import { CodeBlock, InlineCode } from './CodeBlock'
 import { MarkdownDiffBlock } from './MarkdownDiffBlock'
@@ -9,11 +12,17 @@ import { MarkdownJsonBlock } from './MarkdownJsonBlock'
 import { MarkdownMermaidBlock } from './MarkdownMermaidBlock'
 import { MarkdownDatatableBlock } from './MarkdownDatatableBlock'
 import { MarkdownSpreadsheetBlock } from './MarkdownSpreadsheetBlock'
+import { MarkdownHtmlBlock } from './MarkdownHtmlBlock'
+import { MarkdownImageBlock } from './MarkdownImageBlock'
+import { MarkdownLatexBlock } from './MarkdownLatexBlock'
+import { MarkdownPdfBlock } from './MarkdownPdfBlock'
 import { preprocessLinks } from './linkify'
+import { classifyMarkdownLinkTarget } from './link-target'
 import remarkCollapsibleSections from './remarkCollapsibleSections'
 import { CollapsibleSection } from './CollapsibleSection'
 import { useCollapsibleMarkdown } from './CollapsibleMarkdownContext'
 import { wrapWithSafeProxy } from './safe-components'
+import { MARKDOWN_MATH_OPTIONS } from './math-options'
 
 /**
  * Render modes for markdown content:
@@ -70,9 +79,6 @@ interface CollapsibleContext {
   toggleSection: (id: string) => void
 }
 
-// File path detection regex - matches paths starting with /, ~/, or ./
-const FILE_PATH_REGEX = /^(?:\/|~\/|\.\/)[\w\-./@]+\.(?:ts|tsx|js|jsx|mjs|cjs|md|json|yaml|yml|py|go|rs|css|scss|less|html|htm|txt|log|sh|bash|zsh|swift|kt|java|c|cpp|h|hpp|rb|php|xml|toml|ini|cfg|conf|env|sql|graphql|vue|svelte|astro|prisma)$/i
-
 /**
  * Create custom components based on render mode.
  *
@@ -85,6 +91,15 @@ const FILE_PATH_REGEX = /^(?:\/|~\/|\.\/)[\w\-./@]+\.(?:ts|tsx|js|jsx|mjs|cjs|md
  * @param hideFirstMermaidExpand - Whether to hide the expand button on the first
  *   mermaid block when the message starts with a mermaid fence. Defaults to true.
  */
+function stableHash(input: string): string {
+  let hash = 2166136261
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
 function createComponents(
   mode: RenderMode,
   onUrlClick?: (url: string) => void,
@@ -93,6 +108,32 @@ function createComponents(
   firstMermaidCodeRef?: React.RefObject<string | null>,
   hideFirstMermaidExpand: boolean = true
 ): Partial<Components> {
+  let blockIndex = 0
+  const wrapBlock = (
+    blockType: string,
+    content: string,
+    child: React.ReactNode,
+    nodePosition?: { start?: { line?: number }; end?: { line?: number } },
+  ) => {
+    blockIndex += 1
+    const startLine = nodePosition?.start?.line
+    const endLine = nodePosition?.end?.line
+    const path = startLine && endLine
+      ? `line:${startLine}-${endLine}`
+      : `idx:${blockIndex}`
+    const blockId = `blk-${stableHash(`${blockType}|${path}|${content.slice(0, 240)}`)}`
+
+    return (
+      <div
+        data-ca-block-type={blockType}
+        data-ca-block-path={path}
+        data-ca-block-id={blockId}
+      >
+        {child}
+      </div>
+    )
+  }
+
   const baseComponents: Partial<Components> = {
     // Section wrapper for collapsible headings
     div: ({ node, children, ...props }) => {
@@ -120,13 +161,22 @@ function createComponents(
     a: ({ href, children }) => {
       const handleClick = (e: React.MouseEvent) => {
         e.preventDefault()
-        if (href) {
-          // Check if it's a file path
-          if (FILE_PATH_REGEX.test(href) && onFileClick) {
-            onFileClick(href)
-          } else if (onUrlClick) {
-            onUrlClick(href)
-          }
+
+        // Some AI outputs include raw HTML anchors with empty href but path text content.
+        // Fallback to the anchor text when href is missing/empty.
+        const fallbackText = React.Children.toArray(children)
+          .map((child) => (typeof child === 'string' ? child : ''))
+          .join('')
+          .trim()
+
+        const target = (href?.trim() || fallbackText)
+        if (!target) return
+
+        const targetType = classifyMarkdownLinkTarget(target)
+        if (targetType === 'file' && onFileClick) {
+          onFileClick(target)
+        } else if (onUrlClick) {
+          onUrlClick(target)
         }
       }
 
@@ -134,7 +184,7 @@ function createComponents(
         <a
           href={href}
           onClick={handleClick}
-          className="text-foreground hover:underline cursor-pointer"
+          className="text-accent hover:underline cursor-pointer"
         >
           {children}
         </a>
@@ -174,7 +224,7 @@ function createComponents(
       ...baseComponents,
       // Inline code
       code: ({ className, children, ...props }) => {
-        const match = /language-(\w+)/.exec(className || '')
+        const match = /language-([\w-]+)/.exec(className || '')
         const isBlock = 'node' in props && props.node?.position?.start.line !== props.node?.position?.end.line
 
         // Block code
@@ -182,19 +232,35 @@ function createComponents(
           const code = String(children).replace(/\n$/, '')
           // Diff code blocks → pierre/diffs for a proper diff viewer
           if (match?.[1] === 'diff') {
-            return <MarkdownDiffBlock code={code} className="my-1" />
+            return wrapBlock('code', code, <MarkdownDiffBlock code={code} className="my-2" />, props.node?.position)
           }
           // JSON code blocks → interactive tree viewer
           if (match?.[1] === 'json') {
-            return <MarkdownJsonBlock code={code} className="my-1" />
+            return wrapBlock('code', code, <MarkdownJsonBlock code={code} className="my-2" />, props.node?.position)
           }
           // Datatable code blocks → sortable/filterable data table
           if (match?.[1] === 'datatable') {
-            return <MarkdownDatatableBlock code={code} className="my-1" />
+            return wrapBlock('datatable', code, <MarkdownDatatableBlock code={code} className="my-2" />, props.node?.position)
           }
           // Spreadsheet code blocks → Excel-style grid
           if (match?.[1] === 'spreadsheet') {
-            return <MarkdownSpreadsheetBlock code={code} className="my-1" />
+            return wrapBlock('spreadsheet', code, <MarkdownSpreadsheetBlock code={code} className="my-2" />, props.node?.position)
+          }
+          // HTML preview blocks → sandboxed iframe
+          if (match?.[1] === 'html-preview') {
+            return wrapBlock('html-preview', code, <MarkdownHtmlBlock code={code} className="my-2" />, props.node?.position)
+          }
+          // PDF preview blocks → inline first page with expand to full viewer
+          if (match?.[1] === 'pdf-preview') {
+            return wrapBlock('pdf-preview', code, <MarkdownPdfBlock code={code} className="my-2" />, props.node?.position)
+          }
+          // Image preview blocks → inline image with expand to full viewer
+          if (match?.[1] === 'image-preview') {
+            return wrapBlock('image-preview', code, <MarkdownImageBlock code={code} className="my-2" />, props.node?.position)
+          }
+          // LaTeX/math code blocks → KaTeX rendered display math
+          if (match?.[1] === 'latex' || match?.[1] === 'math') {
+            return wrapBlock('latex', code, <MarkdownLatexBlock code={code} className="my-2" />, props.node?.position)
           }
           // Mermaid code blocks → zinc-styled SVG diagram.
           // Hide the inline expand button when the mermaid block is the first
@@ -206,9 +272,14 @@ function createComponents(
             const isFirstBlock = hideFirstMermaidExpand &&
                                 firstMermaidCodeRef?.current != null &&
                                 code === firstMermaidCodeRef.current
-            return <MarkdownMermaidBlock code={code} className="my-1" showExpandButton={!isFirstBlock} />
+            return wrapBlock(
+              'mermaid',
+              code,
+              <MarkdownMermaidBlock code={code} className="my-2" showExpandButton={!isFirstBlock} />,
+              props.node?.position,
+            )
           }
-          return <CodeBlock code={code} language={match?.[1]} mode="full" className="my-1" />
+          return wrapBlock('code', code, <CodeBlock code={code} language={match?.[1]} mode="full" className="my-2" />, props.node?.position)
         }
 
         // Inline code
@@ -218,15 +289,35 @@ function createComponents(
       // Comfortable paragraph spacing
       p: ({ children }) => <p className="my-2 leading-relaxed">{children}</p>,
       // Styled lists - ul uses tighter spacing, ol uses standard for number alignment
-      ul: ({ children }) => (
-        <ul className="my-2 space-y-1 ps-[16px] pe-2 list-disc marker:text-[var(--md-bullets)]">
+      ul: ({ children, className }) => (
+        <ul
+          className={cn(
+            'my-2 space-y-1 ps-[16px] pe-2 list-disc marker:text-[var(--md-bullets)]',
+            className?.includes('contains-task-list') && 'list-none ps-0 marker:content-none',
+          )}
+        >
           {children}
         </ul>
       ),
-      ol: ({ children }) => (
-        <ol className="my-2 space-y-1 pl-6 list-decimal">{children}</ol>
+      ol: ({ children, className }) => (
+        <ol className={cn('my-2 space-y-1 pl-6 list-decimal', className)}>{children}</ol>
       ),
-      li: ({ children }) => <li>{children}</li>,
+      li: ({ children, className }) => (
+        <li className={cn(className?.includes('task-list-item') && 'list-none')}>{children}</li>
+      ),
+      input: ({ type, checked }) => {
+        if (type === 'checkbox') {
+          return (
+            <input
+              type="checkbox"
+              checked={checked}
+              readOnly
+              className="mr-2 rounded border-muted-foreground align-middle"
+            />
+          )
+        }
+        return <input type={type} />
+      },
       // Clean tables
       table: ({ children }) => (
         <div className="my-3 overflow-x-auto">
@@ -263,26 +354,42 @@ function createComponents(
     ...baseComponents,
     // Full code blocks with copy button
     code: ({ className, children, ...props }) => {
-      const match = /language-(\w+)/.exec(className || '')
+      const match = /language-([\w-]+)/.exec(className || '')
       const isBlock = 'node' in props && props.node?.position?.start.line !== props.node?.position?.end.line
 
       if (match || isBlock) {
         const code = String(children).replace(/\n$/, '')
         // Diff code blocks → pierre/diffs for a proper diff viewer
         if (match?.[1] === 'diff') {
-          return <MarkdownDiffBlock code={code} className="my-1" />
+          return wrapBlock('code', code, <MarkdownDiffBlock code={code} className="my-2" />, props.node?.position)
         }
         // JSON code blocks → interactive tree viewer
         if (match?.[1] === 'json') {
-          return <MarkdownJsonBlock code={code} className="my-1" />
+          return wrapBlock('code', code, <MarkdownJsonBlock code={code} className="my-2" />, props.node?.position)
         }
         // Datatable code blocks → sortable/filterable data table
         if (match?.[1] === 'datatable') {
-          return <MarkdownDatatableBlock code={code} className="my-1" />
+          return wrapBlock('datatable', code, <MarkdownDatatableBlock code={code} className="my-2" />, props.node?.position)
         }
         // Spreadsheet code blocks → Excel-style grid
         if (match?.[1] === 'spreadsheet') {
-          return <MarkdownSpreadsheetBlock code={code} className="my-1" />
+          return wrapBlock('spreadsheet', code, <MarkdownSpreadsheetBlock code={code} className="my-2" />, props.node?.position)
+        }
+        // HTML preview blocks → sandboxed iframe
+        if (match?.[1] === 'html-preview') {
+          return wrapBlock('html-preview', code, <MarkdownHtmlBlock code={code} className="my-2" />, props.node?.position)
+        }
+        // PDF preview blocks → inline first page with expand to full viewer
+        if (match?.[1] === 'pdf-preview') {
+          return wrapBlock('pdf-preview', code, <MarkdownPdfBlock code={code} className="my-2" />, props.node?.position)
+        }
+        // Image preview blocks → inline image with expand to full viewer
+        if (match?.[1] === 'image-preview') {
+          return wrapBlock('image-preview', code, <MarkdownImageBlock code={code} className="my-2" />, props.node?.position)
+        }
+        // LaTeX/math code blocks → KaTeX rendered display math
+        if (match?.[1] === 'latex' || match?.[1] === 'math') {
+          return wrapBlock('latex', code, <MarkdownLatexBlock code={code} className="my-2" />, props.node?.position)
         }
         // Mermaid code blocks → zinc-styled SVG diagram.
         // (Same first-block detection as minimal mode — see comment above.)
@@ -290,9 +397,14 @@ function createComponents(
           const isFirstBlock = hideFirstMermaidExpand &&
                               firstMermaidCodeRef?.current != null &&
                               code === firstMermaidCodeRef.current
-          return <MarkdownMermaidBlock code={code} className="my-1" showExpandButton={!isFirstBlock} />
+          return wrapBlock(
+            'mermaid',
+            code,
+            <MarkdownMermaidBlock code={code} className="my-2" showExpandButton={!isFirstBlock} />,
+            props.node?.position,
+          )
         }
-        return <CodeBlock code={code} language={match?.[1]} mode="full" className="my-1" />
+        return wrapBlock('code', code, <CodeBlock code={code} language={match?.[1]} mode="full" className="my-2" />, props.node?.position)
       }
 
       return <InlineCode>{children}</InlineCode>
@@ -301,15 +413,22 @@ function createComponents(
     // Rich paragraph spacing
     p: ({ children }) => <p className="my-3 leading-relaxed">{children}</p>,
     // Styled lists - ul uses tighter spacing, ol uses standard for number alignment
-    ul: ({ children }) => (
-      <ul className="my-3 space-y-1.5 ps-[16px] pe-2 list-disc marker:text-[var(--md-bullets)]">
+    ul: ({ children, className }) => (
+      <ul
+        className={cn(
+          'my-3 space-y-1.5 ps-[16px] pe-2 list-disc marker:text-[var(--md-bullets)]',
+          className?.includes('contains-task-list') && 'list-none ps-0 marker:content-none',
+        )}
+      >
         {children}
       </ul>
     ),
-    ol: ({ children }) => (
-      <ol className="my-3 space-y-1.5 pl-6 list-decimal">{children}</ol>
+    ol: ({ children, className }) => (
+      <ol className={cn('my-3 space-y-1.5 pl-6 list-decimal', className)}>{children}</ol>
     ),
-    li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+    li: ({ children, className }) => (
+      <li className={cn('leading-relaxed', className?.includes('task-list-item') && 'list-none')}>{children}</li>
+    ),
     // Beautiful tables
     table: ({ children }) => (
       <div className="my-4 overflow-x-auto rounded-md border">
@@ -419,9 +538,19 @@ export function Markdown({
     [children]
   )
 
-  // Conditionally include the collapsible sections plugin
+  // Conditionally include the collapsible sections plugin.
+  // IMPORTANT: Disable single-dollar inline math so currency like $2M–$4M
+  // stays plain text. Math should use $$...$$ delimiters.
   const remarkPlugins = React.useMemo(
-    () => collapsible ? [remarkGfm, remarkCollapsibleSections] : [remarkGfm],
+    () => {
+      const mathPlugin: [typeof remarkMath, typeof MARKDOWN_MATH_OPTIONS] = [
+        remarkMath,
+        MARKDOWN_MATH_OPTIONS
+      ]
+      return collapsible
+        ? [remarkGfm, mathPlugin, remarkCollapsibleSections]
+        : [remarkGfm, mathPlugin]
+    },
     [collapsible]
   )
 
@@ -429,7 +558,7 @@ export function Markdown({
     <div className={cn('markdown-content', className)}>
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
-        rehypePlugins={[rehypeRaw]}
+        rehypePlugins={[rehypeKatex, rehypeRaw]}
         components={components}
       >
         {processedContent}

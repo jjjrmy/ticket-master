@@ -13,8 +13,12 @@
 /// <reference path="../types/incr-regex-package.d.ts" />
 
 import { homedir } from 'os';
+import { existsSync, realpathSync } from 'fs';
 import { debug } from '../utils/debug.ts';
-import { resolve } from 'path';
+import { dirname, isAbsolute, relative, resolve } from 'path';
+import { getSessionSafeAllowedToolNames } from '@craft-agent/session-tools-core';
+import { FEATURE_FLAGS } from '../feature-flags.ts';
+import { isBrowserToolNameOrAlias } from './browser-tool-names.ts';
 import type { PermissionsContext, MergedPermissionsConfig } from './permissions-config.ts';
 import {
   validateBashCommand,
@@ -35,10 +39,14 @@ import {
   type ModeConfig,
   type CompiledApiEndpointRule,
   type CompiledBashPattern,
+  type CompiledBlockedCommandHint,
   type MismatchAnalysis,
   PERMISSION_MODE_ORDER,
   PERMISSION_MODE_CONFIG,
   SAFE_MODE_CONFIG,
+  type PermissionModeCanonical,
+  toCanonicalPermissionMode,
+  parsePermissionMode,
 } from './mode-types.ts';
 
 // Import incr-regex-package for smart pattern mismatch diagnostics
@@ -48,13 +56,17 @@ import { IREGEX, DONE, MORE, FAILED } from 'incr-regex-package';
 // Re-export types and config from mode-types (single source of truth)
 export {
   type PermissionMode,
+  type PermissionModeCanonical,
   type ModeConfig,
   type CompiledApiEndpointRule,
   type CompiledBashPattern,
+  type CompiledBlockedCommandHint,
   type MismatchAnalysis,
   PERMISSION_MODE_ORDER,
   PERMISSION_MODE_CONFIG,
   SAFE_MODE_CONFIG,
+  toCanonicalPermissionMode,
+  parsePermissionMode,
 };
 
 // Re-export PowerShell validator types
@@ -68,11 +80,23 @@ export {
 /**
  * State for a single session's permission mode
  */
+export type PermissionModeChangedBy = 'user' | 'system' | 'restore' | 'automation' | 'unknown';
+
 export interface ModeState {
   /** Session ID */
   sessionId: string;
   /** Current permission mode */
   permissionMode: PermissionMode;
+  /** Previous permission mode (if any mode transition has occurred) */
+  previousPermissionMode?: PermissionMode;
+  /** Monotonic version incremented each time the mode changes */
+  modeVersion: number;
+  /** ISO timestamp for the last mode change */
+  lastChangedAt: string;
+  /** Actor that initiated the last mode change */
+  lastChangedBy: PermissionModeChangedBy;
+  /** Last user-mode modeVersion for which one-turn signal has been consumed */
+  lastUserSignalConsumedModeVersion?: number;
   /** Callback when mode state changes */
   onStateChange?: (state: ModeState) => void;
 }
@@ -149,6 +173,52 @@ function normalizeForComparison(path: string): string {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
+function isWithin(base: string, target: string): boolean {
+  const normalizedBase = normalizeForComparison(base);
+  const normalizedTarget = normalizeForComparison(target);
+  const rel = relative(normalizedBase, normalizedTarget);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Check whether targetPath is inside baseDir (or exactly equal to it).
+ *
+ * Uses path.relative semantics to avoid sibling-prefix bypasses and then
+ * re-validates using real paths to prevent symlink escapes.
+ */
+function isPathWithinDirectory(targetPath: string, baseDir: string): boolean {
+  const expandedTarget = expandHome(targetPath);
+  const expandedBase = expandHome(baseDir);
+
+  const resolvedTarget = resolve(expandedTarget);
+  const resolvedBase = resolve(expandedBase);
+  if (!isWithin(resolvedBase, resolvedTarget)) {
+    return false;
+  }
+
+  const realBase = existsSync(resolvedBase) ? realpathSync.native(resolvedBase) : resolvedBase;
+
+  if (existsSync(resolvedTarget)) {
+    const realTarget = realpathSync.native(resolvedTarget);
+    return isWithin(realBase, realTarget);
+  }
+
+  // Target may be a new file path. Validate using nearest existing ancestor
+  // to prevent symlink escapes while still allowing legitimate new files.
+  let current = dirname(resolvedTarget);
+  while (true) {
+    if (existsSync(current)) {
+      const realCurrent = realpathSync.native(current);
+      return isWithin(realBase, realCurrent);
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
 // ============================================================
 // Mode Manager Class
 // ============================================================
@@ -163,6 +233,23 @@ class ModeManager {
   private subscribers: Map<string, Set<() => void>> = new Map();
 
   /**
+   * Hydrate persisted transition context (previous mode) without mutating current mode/version.
+   * Used on session restore so transition metadata can survive app restarts.
+   */
+  setPreviousPermissionMode(sessionId: string, previousPermissionMode?: PermissionMode): void {
+    const existing = this.getState(sessionId);
+    if (existing.previousPermissionMode === previousPermissionMode) {
+      return;
+    }
+
+    const newState: ModeState = {
+      ...existing,
+      previousPermissionMode,
+    };
+    this.states.set(sessionId, newState);
+  }
+
+  /**
    * Get or create state for a session
    */
   getState(sessionId: string): ModeState {
@@ -171,6 +258,9 @@ class ModeManager {
       state = {
         sessionId,
         permissionMode: 'ask', // Default to 'ask' until initialized
+        modeVersion: 0,
+        lastChangedAt: new Date().toISOString(),
+        lastChangedBy: 'system',
       };
       this.states.set(sessionId, state);
     }
@@ -178,14 +268,37 @@ class ModeManager {
   }
 
   /**
-   * Set permission mode for a session
+   * Set permission mode for a session.
+   * @returns true when state changed, false when mode was unchanged
    */
-  setPermissionMode(sessionId: string, mode: PermissionMode): void {
+  setPermissionMode(
+    sessionId: string,
+    mode: PermissionMode,
+    metadata?: { changedBy?: PermissionModeChangedBy; changedAt?: string }
+  ): boolean {
     const existing = this.getState(sessionId);
-    const newState = { ...existing, permissionMode: mode };
+
+    // No-op when mode is unchanged (prevents duplicate logs/events)
+    if (existing.permissionMode === mode) {
+      return false;
+    }
+
+    const changedAt = metadata?.changedAt ?? new Date().toISOString();
+    const changedBy = metadata?.changedBy ?? 'unknown';
+
+    const shouldTrackTransition = !(existing.modeVersion === 0 && changedBy === 'restore');
+
+    const newState: ModeState = {
+      ...existing,
+      previousPermissionMode: shouldTrackTransition ? existing.permissionMode : undefined,
+      permissionMode: mode,
+      modeVersion: existing.modeVersion + 1,
+      lastChangedAt: changedAt,
+      lastChangedBy: changedBy,
+    };
     this.states.set(sessionId, newState);
 
-    debug(`[Mode] Set permission mode to ${mode} for session ${sessionId}`);
+    debug(`[Mode] Set permission mode to ${mode} for session ${sessionId} (changedBy=${changedBy}, modeVersion=${newState.modeVersion})`);
 
     // Notify callbacks (for CraftAgent internal sync)
     const callbacks = this.callbacks.get(sessionId);
@@ -195,6 +308,28 @@ class ModeManager {
 
     // Notify React subscribers (for useSyncExternalStore)
     this.subscribers.get(sessionId)?.forEach(cb => cb());
+    return true;
+  }
+
+  /**
+   * Mark the current user-origin mode change signal as consumed.
+   * No-op unless the latest mode change was user-initiated.
+   */
+  consumeUserModeSignal(sessionId: string): void {
+    const existing = this.getState(sessionId);
+    if (existing.lastChangedBy !== 'user') {
+      return;
+    }
+
+    if (existing.lastUserSignalConsumedModeVersion === existing.modeVersion) {
+      return;
+    }
+
+    const newState: ModeState = {
+      ...existing,
+      lastUserSignalConsumedModeVersion: existing.modeVersion,
+    };
+    this.states.set(sessionId, newState);
   }
 
   /**
@@ -252,10 +387,22 @@ export function getPermissionMode(sessionId: string): PermissionMode {
 }
 
 /**
- * Set the permission mode for a session
+ * Set the permission mode for a session.
+ * @returns true when state changed, false when mode was unchanged
  */
-export function setPermissionMode(sessionId: string, mode: PermissionMode): void {
-  modeManager.setPermissionMode(sessionId, mode);
+export function setPermissionMode(
+  sessionId: string,
+  mode: PermissionMode,
+  metadata?: { changedBy?: PermissionModeChangedBy; changedAt?: string }
+): boolean {
+  return modeManager.setPermissionMode(sessionId, mode, metadata);
+}
+
+/**
+ * Consume one-turn user mode-change signal for the current modeVersion.
+ */
+export function consumeUserModeSignal(sessionId: string): void {
+  modeManager.consumeUserModeSignal(sessionId);
 }
 
 /**
@@ -276,14 +423,14 @@ export function cyclePermissionMode(
   // If current mode not in enabled list, jump to first enabled mode
   if (currentIndex === -1) {
     const nextMode = modes[0] ?? 'ask';
-    setPermissionMode(sessionId, nextMode);
+    setPermissionMode(sessionId, nextMode, { changedBy: 'user' });
     return nextMode;
   }
 
   const nextIndex = (currentIndex + 1) % modes.length;
   // Safe assertion: nextIndex is always valid due to modulo operation
   const nextMode = modes[nextIndex] as PermissionMode;
-  setPermissionMode(sessionId, nextMode);
+  setPermissionMode(sessionId, nextMode, { changedBy: 'user' });
   return nextMode;
 }
 
@@ -300,6 +447,45 @@ export function subscribeModeChanges(sessionId: string, callback: () => void): (
  */
 export function getModeState(sessionId: string): ModeState {
   return modeManager.getState(sessionId);
+}
+
+/**
+ * Hydrate persisted transition context for a session without changing current mode.
+ */
+export function hydratePreviousPermissionMode(sessionId: string, previousPermissionMode?: PermissionMode): void {
+  modeManager.setPreviousPermissionMode(sessionId, previousPermissionMode);
+}
+
+/**
+ * Lightweight diagnostics for permission denials and debugging.
+ */
+export function getPermissionModeDiagnostics(sessionId: string): {
+  permissionMode: PermissionMode;
+  previousPermissionMode?: PermissionMode;
+  transitionDisplay?: string;
+  modeVersion: number;
+  lastChangedAt: string;
+  lastChangedBy: PermissionModeChangedBy;
+  userModeSignalPending: boolean;
+} {
+  const state = modeManager.getState(sessionId);
+  const transitionDisplay = state.previousPermissionMode
+    ? `${PERMISSION_MODE_CONFIG[state.previousPermissionMode].displayName} -> ${PERMISSION_MODE_CONFIG[state.permissionMode].displayName}`
+    : undefined;
+  const userModeSignalPending =
+    state.lastChangedBy === 'user' &&
+    state.modeVersion > 0 &&
+    state.lastUserSignalConsumedModeVersion !== state.modeVersion;
+
+  return {
+    permissionMode: state.permissionMode,
+    previousPermissionMode: state.previousPermissionMode,
+    transitionDisplay,
+    modeVersion: state.modeVersion,
+    lastChangedAt: state.lastChangedAt,
+    lastChangedBy: state.lastChangedBy,
+    userModeSignalPending,
+  };
 }
 
 /**
@@ -326,7 +512,7 @@ export function initializeModeState(
   if (callbacks) {
     modeManager.registerCallbacks(sessionId, callbacks);
   }
-  modeManager.setPermissionMode(sessionId, mode);
+  modeManager.setPermissionMode(sessionId, mode, { changedBy: 'restore' });
 }
 
 /**
@@ -458,7 +644,7 @@ export interface RelevantPatternInfo {
  */
 export type BashRejectionReason =
   | { type: 'control_char'; char: string; charCode: number; explanation: string }
-  | { type: 'no_safe_pattern'; command: string; relevantPatterns: RelevantPatternInfo[]; mismatchAnalysis?: MismatchAnalysis }
+  | { type: 'no_safe_pattern'; command: string; relevantPatterns: RelevantPatternInfo[]; mismatchAnalysis?: MismatchAnalysis; commandHint?: CompiledBlockedCommandHint }
   | { type: 'dangerous_operator'; operator: string; operatorType: 'chain' | 'redirect'; explanation: string }
   | { type: 'dangerous_substitution'; pattern: string; explanation: string }
   | { type: 'parse_error'; error: string }
@@ -467,6 +653,8 @@ export type BashRejectionReason =
   | { type: 'redirect'; op: string; explanation: string }
   | { type: 'command_expansion'; explanation: string }
   | { type: 'process_substitution'; explanation: string }
+  | { type: 'parameter_expansion'; explanation: string }
+  | { type: 'env_assignment'; explanation: string }
   | { type: 'unsafe_command'; command: string; explanation: string }
   | { type: 'compound_partial_fail'; failedCommands: string[]; passedCommands: string[] };
 
@@ -590,6 +778,32 @@ function findRelevantPatterns(command: string, patterns: CompiledBashPattern[]):
 
   // Limit to top 3 most relevant patterns to avoid overwhelming the agent
   return relevant.slice(0, 3);
+}
+
+/**
+ * Resolve command-specific hint for blocked bash commands.
+ * Uses exact base-command match and optional whenNotMatching condition.
+ */
+function findBlockedCommandHint(command: string, config: ToolCheckConfig): CompiledBlockedCommandHint | undefined {
+  const hints = config.blockedCommandHints ?? [];
+  if (hints.length === 0) return undefined;
+
+  const firstToken = command.trim().split(/\s+/)[0]?.toLowerCase();
+  if (!firstToken) return undefined;
+  const baseCommand = firstToken.split('/').pop() ?? firstToken;
+
+  for (const hint of hints) {
+    if (hint.command !== baseCommand) continue;
+
+    // If a condition is provided, hint applies only when command does NOT match it
+    if (hint.whenNotMatchingRegex && hint.whenNotMatchingRegex.test(command)) {
+      continue;
+    }
+
+    return hint;
+  }
+
+  return undefined;
 }
 
 /**
@@ -959,16 +1173,32 @@ export function getBashRejectionReason(command: string, config: ToolCheckConfig)
           explanation: reason.explanation,
         };
 
+      case 'parameter_expansion':
+        return {
+          type: 'dangerous_substitution',
+          pattern: '${} / $VAR',
+          explanation: reason.explanation,
+        };
+
+      case 'env_assignment':
+        return {
+          type: 'dangerous_substitution',
+          pattern: 'VAR=value',
+          explanation: reason.explanation,
+        };
+
       case 'unsafe_command': {
         // Find relevant patterns to help the agent understand what format is expected
         const relevantPatterns = findRelevantPatterns(reason.command, config.readOnlyBashPatterns);
         const mismatchAnalysis = analyzePatternMismatch(reason.command, config.readOnlyBashPatterns);
+        const commandHint = findBlockedCommandHint(reason.command, config);
 
         return {
           type: 'no_safe_pattern',
           command: reason.command,
           relevantPatterns,
           mismatchAnalysis: mismatchAnalysis ?? undefined,
+          commandHint,
         };
       }
 
@@ -998,6 +1228,7 @@ export function getBashRejectionReason(command: string, config: ToolCheckConfig)
     command: trimmedCommand,
     relevantPatterns: [],
     mismatchAnalysis: undefined,
+    commandHint: findBlockedCommandHint(trimmedCommand, config),
   };
 }
 
@@ -1090,12 +1321,14 @@ function getPowerShellRejectionReason(command: string, config: ToolCheckConfig):
       case 'unsafe_command': {
         const relevantPatterns = findRelevantPatterns(reason.command, config.readOnlyBashPatterns);
         const mismatchAnalysis = analyzePatternMismatch(reason.command, config.readOnlyBashPatterns);
+        const commandHint = findBlockedCommandHint(reason.command, config);
 
         return {
           type: 'no_safe_pattern',
           command: reason.command,
           relevantPatterns,
           mismatchAnalysis: mismatchAnalysis ?? undefined,
+          commandHint,
         };
       }
     }
@@ -1108,6 +1341,7 @@ function getPowerShellRejectionReason(command: string, config: ToolCheckConfig):
     command: command,
     relevantPatterns: [],
     mismatchAnalysis: undefined,
+    commandHint: findBlockedCommandHint(command, config),
   };
 }
 
@@ -1133,6 +1367,17 @@ function formatPermissionGuidance(config: ToolCheckConfig): string {
 }
 
 /**
+ * Detect known upstream bash-parser tokenizer bugs.
+ *
+ * bash-parser has longstanding edge cases around quoted `$` / `)` handling
+ * that can throw internal errors like `reducers.doubleQuoting`.
+ */
+function isKnownBashParserTokenizerBug(error: string): boolean {
+  const lower = error.toLowerCase();
+  return lower.includes('doublequoting') || lower.includes('reducers.doublequoting');
+}
+
+/**
  * Format a bash rejection reason into a user-friendly error message.
  * The message explains what was blocked and why, helping the agent understand the issue.
  * Includes actionable guidance on how to customize permissions.
@@ -1150,7 +1395,25 @@ export function formatBashRejectionMessage(reason: BashRejectionReason, config: 
       const lines: string[] = [];
       lines.push(`Bash command \`${reason.command}\` is not in the read-only allowlist.`);
 
-      // If we have mismatch analysis, show detailed diagnostics first (most helpful)
+      // Prefer deterministic per-command guidance over fuzzy regex diagnostics.
+      if (reason.commandHint) {
+        lines.push('');
+        lines.push(`Why: ${reason.commandHint.reason}`);
+        if (reason.commandHint.context) {
+          lines.push(`Context: ${reason.commandHint.context}`);
+        }
+        if (reason.commandHint.tryInstead && reason.commandHint.tryInstead.length > 0) {
+          lines.push('Try instead:');
+          for (const item of reason.commandHint.tryInstead) {
+            lines.push(`  • ${item}`);
+          }
+        }
+        if (reason.commandHint.example) {
+          lines.push(`Example: \`${reason.commandHint.example}\``);
+        }
+      }
+
+      // If we have mismatch analysis, show detailed diagnostics as heuristic guidance.
       if (reason.mismatchAnalysis) {
         const analysis = reason.mismatchAnalysis;
         lines.push('');
@@ -1169,15 +1432,15 @@ export function formatBashRejectionMessage(reason: BashRejectionReason, config: 
           lines.push(analysis.suggestion);
         }
 
-        // Show which pattern was closest to matching
+        // Show which pattern was closest to matching (heuristic only)
         if (analysis.bestMatchPattern?.comment) {
           lines.push('');
-          lines.push(`Pattern: ${analysis.bestMatchPattern.comment}`);
+          lines.push(`Closest allowlist hint (heuristic): ${analysis.bestMatchPattern.comment}`);
         }
       } else if (reason.relevantPatterns.length > 0) {
         // Fall back to showing relevant patterns if no mismatch analysis
         lines.push('');
-        lines.push('Relevant pattern(s) that might match:');
+        lines.push('Heuristic relevant pattern(s):');
         for (const pattern of reason.relevantPatterns) {
           // Show the pattern regex (simplified for readability)
           const patternDisplay = pattern.source.length > 80
@@ -1189,7 +1452,7 @@ export function formatBashRejectionMessage(reason: BashRejectionReason, config: 
           }
         }
         lines.push('');
-        lines.push('The command must match the pattern exactly from the start.');
+        lines.push('The command must match an allowlist pattern exactly from the start.');
       }
 
       // Add permission guidance for pattern-based rejections
@@ -1205,8 +1468,22 @@ export function formatBashRejectionMessage(reason: BashRejectionReason, config: 
     case 'dangerous_substitution':
       return `Bash command blocked: contains ${reason.pattern} syntax. ${reason.explanation}. ${modeSwitchHint}`;
 
-    case 'parse_error':
-      return `Bash command blocked: could not parse command safely (${reason.error}). ${modeSwitchHint}`;
+    case 'parse_error': {
+      const lines: string[] = [];
+      lines.push(`Bash command blocked: could not parse command safely (${reason.error}).`);
+
+      if (isKnownBashParserTokenizerBug(reason.error)) {
+        lines.push('');
+        lines.push('This looks like a known bash-parser tokenizer bug (not necessarily unsafe intent).');
+        lines.push('Try using single quotes for regex/text arguments instead of double quotes.');
+        lines.push('Problematic patterns often involve `$` (and sometimes `)`) inside double-quoted strings.');
+        lines.push('Example: `rg -n "a|b|$|c" ...` → `rg -n \'a|b|$|c\' ...`');
+      }
+
+      lines.push('');
+      lines.push(modeSwitchHint);
+      return lines.join('\n');
+    }
 
     case 'compound_partial_fail': {
       // Some commands in a compound expression failed
@@ -1244,6 +1521,12 @@ export function formatBashRejectionMessage(reason: BashRejectionReason, config: 
 
     case 'process_substitution':
       return `Bash command blocked: contains process substitution. ${reason.explanation}. ${modeSwitchHint}`;
+
+    case 'parameter_expansion':
+      return `Bash command blocked: contains variable expansion (\${} / $VAR). ${reason.explanation}. ${modeSwitchHint}`;
+
+    case 'env_assignment':
+      return `Bash command blocked: contains environment variable assignment. ${reason.explanation}. ${modeSwitchHint}`;
 
     case 'unsafe_command': {
       const lines: string[] = [];
@@ -1335,7 +1618,8 @@ export function extractBashWriteTarget(command: string): string | null {
   }
 
   // Pattern 3: Direct redirect - extract path after > or >>
-  const directRedirectMatch = command.match(/>{1,2}\s*([^\s;|&"'>]+)/);
+  // Guard against non-shell uses like JavaScript arrow functions (=>).
+  const directRedirectMatch = command.match(/(?:^|[^=<>])>{1,2}\s*([^\s;|&"'>=][^\s;|&"'>]*)/);
   if (directRedirectMatch?.[1] && directRedirectMatch[1] !== '/dev/null') {
     return directRedirectMatch[1];
   }
@@ -1387,7 +1671,11 @@ export function extractBashWriteTarget(command: string): string | null {
  * Used to provide better error messages when write detection fails.
  */
 export function looksLikePotentialWrite(command: string): boolean {
-  return /Out-File|Set-Content|Add-Content|>\s*[^&]|>>/i.test(command);
+  // Shell redirects at token boundaries (avoid matching JS arrows like =>)
+  const hasRedirectToken = /(?:^|[\s;|&()])\d*>>?(?![=>])/.test(command);
+  // Common PowerShell write cmdlets
+  const hasPowerShellWriteCmdlet = /(?:Out-File|Set-Content|Add-Content)\b/i.test(command);
+  return hasRedirectToken || hasPowerShellWriteCmdlet;
 }
 
 /**
@@ -1488,9 +1776,11 @@ const ALWAYS_ALLOWED_TOOLS = new Set([
   'Read', 'Glob', 'Grep',           // File reading
   'Task', 'TaskOutput',             // Agent orchestration
   'WebFetch', 'WebSearch',          // Web research
-  'TodoWrite',                       // Task tracking
+  'TodoWrite',                      // Task tracking
   'SubmitPlan',                     // Plan submission
   'LSP',                            // Language server (read-only)
+  // Browser automation tool (canonical wrapper)
+  'browser_tool',
 ]);
 
 /**
@@ -1555,6 +1845,12 @@ export function shouldAllowToolInMode(
     }
   }
 
+  // Browser tool aliases (legacy browser_open/browser_snapshot/...)
+  // are normalized centrally to avoid drift across permission checks.
+  if (isBrowserToolNameOrAlias(toolName)) {
+    return { allowed: true };
+  }
+
   // Handle Bash - check if command is read-only
   // Uses detailed rejection reasons to provide helpful error messages
   if (toolName === 'Bash') {
@@ -1570,32 +1866,24 @@ export function shouldAllowToolInMode(
       // Plans/data folder exception for bash/PowerShell writes.
       // Bash uses redirects: /bin/zsh -lc "cat <<'EOF' > /path/to/plans/file.md..."
       // PowerShell uses: @(...) | Out-File -FilePath 'C:\path\to\plans\file.md'
-      // Allow these if the write target is within the plans or data folder.
-      if (options?.plansFolderPath || options?.dataFolderPath) {
+      // Only run this branch for likely write attempts to avoid false positives.
+      const likelyWriteAttempt =
+        (rejection.type === 'dangerous_operator' && rejection.operatorType === 'redirect') ||
+        looksLikePotentialWrite(command);
+
+      if (likelyWriteAttempt && (options?.plansFolderPath || options?.dataFolderPath)) {
         const targetPath = extractBashWriteTarget(command) ?? extractPowerShellWriteTarget(command);
         if (targetPath) {
-          // Normalize path separators: replace backslashes with forward slashes, then collapse
-          // consecutive slashes. Codex JSON-RPC may send paths with \\\\ (double backslash)
-          // which becomes \\ in the actual string — each \\ → // → collapsed to /.
-          const normalizedTarget = targetPath.replace(/[\\/]+/g, '/');
-
-          // Check plans folder
-          if (options?.plansFolderPath) {
-            const normalizedPlansDir = options.plansFolderPath.replace(/[\\/]+/g, '/');
-            // Use case-insensitive comparison for Windows path compatibility
-            if (normalizedTarget.toLowerCase().startsWith(normalizedPlansDir.toLowerCase())) {
-              debug(`[Mode] Allowing write to plans folder: ${targetPath}`);
-              return { allowed: true };
-            }
+          // Check plans folder with robust path containment (prevents sibling-prefix bypasses)
+          if (options?.plansFolderPath && isPathWithinDirectory(targetPath, options.plansFolderPath)) {
+            debug(`[Mode] Allowing write to plans folder: ${targetPath}`);
+            return { allowed: true };
           }
 
-          // Check data folder
-          if (options?.dataFolderPath) {
-            const normalizedDataDir = options.dataFolderPath.replace(/[\\/]+/g, '/');
-            if (normalizedTarget.toLowerCase().startsWith(normalizedDataDir.toLowerCase())) {
-              debug(`[Mode] Allowing write to data folder: ${targetPath}`);
-              return { allowed: true };
-            }
+          // Check data folder with robust path containment
+          if (options?.dataFolderPath && isPathWithinDirectory(targetPath, options.dataFolderPath)) {
+            debug(`[Mode] Allowing write to data folder: ${targetPath}`);
+            return { allowed: true };
           }
 
           // Target path extracted but not in any allowed folder - give specific error with helpful hint
@@ -1628,21 +1916,6 @@ export function shouldAllowToolInMode(
             reason: lines.join('\n'),
           };
         }
-        // Check if this looks like a write attempt but we couldn't extract the path
-        if (looksLikePotentialWrite(command)) {
-          debug(`[Mode] Bash command looks like a write but path extraction failed`);
-          const plansExample = options?.plansFolderPath
-            ? `  Plans: printf '...' > "${options.plansFolderPath}/plan_<descriptive-name>.md"\n` : '';
-          const dataExample = options?.dataFolderPath
-            ? `  Data:  printf '...' > "${options.dataFolderPath}/output.json"\n` : '';
-          return {
-            allowed: false,
-            reason: `Bash command appears to write files but the target path couldn't be detected.\n\n` +
-                    `If writing to an allowed folder, use one of these patterns:\n` +
-                    plansExample + dataExample + `\n` +
-                    `Or ask the user to switch to Ask or Auto mode (${config.shortcutHint}).`,
-          };
-        }
       }
 
       // Return detailed error message explaining exactly why the command was blocked
@@ -1664,28 +1937,19 @@ export function shouldAllowToolInMode(
     const filePath = (input?.file_path ?? input?.notebook_path) as string | undefined;
 
     if (filePath) {
-      const normalizedPath = filePath.replace(/\\/g, '/');
-
       // Check plans folder exception
       if (options?.plansFolderPath) {
-        const normalizedPlansDir = options.plansFolderPath.replace(/\\/g, '/');
-        debug(`[Mode] Checking plans folder exception: path="${normalizedPath}", plansDir="${normalizedPlansDir}"`);
-
-        // Use case-insensitive comparison for Windows path compatibility
-        // (paths from Codex may have inconsistent casing)
-        if (normalizedPath.toLowerCase().startsWith(normalizedPlansDir.toLowerCase())) {
+        debug(`[Mode] Checking plans folder exception: path="${filePath}", plansDir="${options.plansFolderPath}"`);
+        if (isPathWithinDirectory(filePath, options.plansFolderPath)) {
           debug(`[Mode] Allowing ${toolName} to plans folder`);
           return { allowed: true };
         }
       }
 
       // Check data folder exception
-      if (options?.dataFolderPath) {
-        const normalizedDataDir = options.dataFolderPath.replace(/\\/g, '/');
-        if (normalizedPath.toLowerCase().startsWith(normalizedDataDir.toLowerCase())) {
-          debug(`[Mode] Allowing ${toolName} to data folder`);
-          return { allowed: true };
-        }
+      if (options?.dataFolderPath && isPathWithinDirectory(filePath, options.dataFolderPath)) {
+        debug(`[Mode] Allowing ${toolName} to data folder`);
+        return { allowed: true };
       }
 
       // Check allowedWritePaths from permissions config
@@ -1740,28 +2004,23 @@ export function shouldAllowToolInMode(
 
   // Handle MCP tools - allow read-only, block write operations
   if (toolName.startsWith('mcp__')) {
-    // Always allow preferences and documentation tools (read-only, always available)
-    if (toolName.startsWith('mcp__preferences__') || toolName.startsWith('mcp__craft-agents-docs__')) {
+    // Always allow documentation tools (read-only, always available)
+    if (toolName.startsWith('mcp__craft-agents-docs__')) {
       return { allowed: true };
     }
 
-    // Handle session-scoped tools - allow read-only, block mutations
+    // Handle session-scoped tools - derive safe-mode behavior from canonical session-tools-core metadata
     if (toolName.startsWith('mcp__session__')) {
-      // Read-only session tools - always allowed in Explore mode
-      // These tools don't modify state, they only read/validate/invoke secondary models
-      const readOnlySessionTools = [
-        'mcp__session__SubmitPlan',
-        'mcp__session__config_validate',
-        'mcp__session__skill_validate',
-        'mcp__session__mermaid_validate',
-        'mcp__session__source_test',
-        'mcp__session__transform_data',
-      ];
-      if (readOnlySessionTools.includes(toolName)) {
+      const safeAllowedSessionTools = getSessionSafeAllowedToolNames({
+        prefix: 'mcp__session__',
+        includeDeveloperFeedback: FEATURE_FLAGS.developerFeedback,
+      });
+
+      if (safeAllowedSessionTools.has(toolName)) {
         return { allowed: true };
       }
 
-      // Write/auth session tools - blocked in Explore mode (source_oauth_trigger, source_credential_prompt, etc.)
+      // Write/auth/admin session tools - blocked in Explore mode
       return {
         allowed: false,
         reason: `Session configuration changes are blocked in ${config.displayName}. Switch to Ask or Allow All mode (${config.shortcutHint}) to create, update, or delete sources and agents.`
@@ -1870,13 +2129,31 @@ export function getSessionState(sessionId: string): { permissionMode: Permission
  */
 export function formatSessionState(
   sessionId: string,
-  options?: { plansFolderPath?: string; dataFolderPath?: string }
+  options?: { plansFolderPath?: string; dataFolderPath?: string; consumeModeChangeUserSignal?: boolean }
 ): string {
-  const mode = getPermissionMode(sessionId);
+  const diagnostics = getPermissionModeDiagnostics(sessionId);
 
-  // Use the display name (lowercased) so the agent sees "explore" instead of internal key "safe"
-  const modeName = PERMISSION_MODE_CONFIG[mode].displayName.toLowerCase();
+  // Use canonical user-facing mode tokens to avoid terminology drift.
+  const modeName = toCanonicalPermissionMode(diagnostics.permissionMode);
   let result = `<session_state>\nsessionId: ${sessionId}\npermissionMode: ${modeName}`;
+
+  if (diagnostics.transitionDisplay) {
+    result += `\nmodeTransition: ${diagnostics.transitionDisplay}`;
+  }
+  result += `\nmodeChangedBy: ${diagnostics.lastChangedBy}`;
+  result += `\nmodeChangedAt: ${diagnostics.lastChangedAt}`;
+  result += `\nmodeVersion: ${diagnostics.modeVersion}`;
+
+  const transitionLabel = diagnostics.transitionDisplay ?? `Unknown -> ${PERMISSION_MODE_CONFIG[diagnostics.permissionMode].displayName}`;
+  result += `\nmodeChangeSummary: Last mode change by ${diagnostics.lastChangedBy} at ${diagnostics.lastChangedAt} (${transitionLabel}, modeVersion=${diagnostics.modeVersion})`;
+
+  if (diagnostics.userModeSignalPending) {
+    result += '\nmodeChangeUserSignal: The user changed mode manually. Apply this mode immediately for this turn.';
+
+    if (options?.consumeModeChangeUserSignal) {
+      consumeUserModeSignal(sessionId);
+    }
+  }
 
   // Always include plans folder path so agent knows where plans are stored
   if (options?.plansFolderPath) {

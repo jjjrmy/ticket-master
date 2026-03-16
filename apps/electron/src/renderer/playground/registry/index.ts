@@ -10,20 +10,26 @@ import { markdownComponents } from './markdown'
 import { iconComponents } from './icons'
 import { oauthComponents } from './oauth'
 import { toastsComponents } from './toasts'
-import { labelBadgeComponents } from './label-badges'
 import { sessionListComponents } from './session-list'
 import { editPopoverComponents } from './edit-popover'
-import { actionCardsComponents } from './action-cards'
+import { automationComponents } from './automations'
+import { entityListComponents } from './entity-lists'
+import { browserUiComponents } from './browser-ui'
+import { plannerComponents } from './planner'
+import { customShadowsComponents } from './custom-shadows'
+import { transportBannerComponents } from './transport-banner'
+import { containerTransitionsComponents } from './container-transitions'
+import { apiKeyInputComponents } from './api-key-input'
 
 export * from './types'
 
 export const componentRegistry: ComponentEntry[] = [
+  ...apiKeyInputComponents,
   ...onboardingComponents,
   ...chatComponents,
   ...turnCardComponents,
   ...turnCardModesComponents,
   ...fullscreenOverlayComponents,
-  ...actionCardsComponents,
   ...messagesComponents,
   ...inputComponents,
   ...toastsComponents,
@@ -31,13 +37,19 @@ export const componentRegistry: ComponentEntry[] = [
   ...markdownComponents,
   ...iconComponents,
   ...oauthComponents,
-  ...labelBadgeComponents,
   ...sessionListComponents,
   ...editPopoverComponents,
+  ...automationComponents,
+  ...entityListComponents,
+  ...browserUiComponents,
+  ...plannerComponents,
+  ...customShadowsComponents,
+  ...transportBannerComponents,
+  ...containerTransitionsComponents,
 ]
 
 export function getCategories(): CategoryGroup[] {
-  const categoryOrder: Category[] = ['Onboarding', 'Agent Setup', 'Chat', 'Session List', 'Edit Popover', 'Turn Cards', 'TurnCard Modes', 'Fullscreen', 'Action Cards', 'Chat Messages', 'Chat Inputs', 'Toast Messages', 'Markdown', 'Icons', 'OAuth']
+  const categoryOrder: Category[] = ['Automations', 'Onboarding', 'Agent Setup', 'Chat', 'Island', 'Browser', 'Planner', 'Custom Shadows', 'Session List', 'Entity Lists', 'Edit Popover', 'Turn Cards', 'TurnCard Modes', 'Fullscreen', 'Chat Messages', 'Chat Inputs', 'Toast Messages', 'Markdown', 'Icons', 'OAuth']
   const categoryMap = new Map<Category, ComponentEntry[]>()
 
   for (const entry of componentRegistry) {

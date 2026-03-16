@@ -17,16 +17,16 @@
 /**
  * Provider identifier for AI backends.
  */
-export type ModelProvider = 'anthropic' | 'openai' | 'copilot';
+export type ModelProvider = 'anthropic' | 'pi';
 
 /**
  * Full model definition with capabilities and costs.
  * Used throughout the application for model selection and display.
  */
 export interface ModelDefinition {
-  /** Model identifier (e.g., 'claude-sonnet-4-5-20250929', 'gpt-5.3-codex') */
+  /** Model identifier (e.g., 'claude-sonnet-4-6', 'gpt-5.3-codex') */
   id: string;
-  /** Human-readable name (e.g., 'Sonnet 4.5', 'Codex') */
+  /** Human-readable name (e.g., 'Sonnet 4.6', 'Codex') */
   name: string;
   /** Short display name for compact UI (e.g., 'Sonnet', 'Codex') */
   shortName: string;
@@ -69,8 +69,8 @@ export const MODEL_REGISTRY: ModelDefinition[] = [
     contextWindow: 200_000,
   },
   {
-    id: 'claude-sonnet-4-5-20250929',
-    name: 'Sonnet 4.5',
+    id: 'claude-sonnet-4-6',
+    name: 'Sonnet 4.6',
     shortName: 'Sonnet',
     description: 'Best for everyday tasks',
     provider: 'anthropic',
@@ -86,30 +86,10 @@ export const MODEL_REGISTRY: ModelDefinition[] = [
   },
 
   // ----------------------------------------
-  // OpenAI Codex Models (via ChatGPT Plus)
-  // Model IDs match actual OpenAI model slugs
-  // ----------------------------------------
-  {
-    id: 'gpt-5.3-codex',
-    name: 'GPT-5.3 Codex',
-    shortName: 'Codex',
-    description: 'OpenAI reasoning model',
-    provider: 'openai',
-    contextWindow: 256_000,
-  },
-  {
-    id: 'gpt-5.1-codex-mini',
-    name: 'GPT-5.1 Codex Mini',
-    shortName: 'Codex Mini',
-    description: 'Fast OpenAI model',
-    provider: 'openai',
-    contextWindow: 128_000,
-  },
-
-  // ----------------------------------------
-  // GitHub Copilot Models (via Copilot SDK)
-  // No hardcoded entries — models are discovered at runtime via client.listModels()
-  // and stored on the connection. See fetchAndStoreCopilotModels() in ipc.ts.
+  // Pi Models
+  // No hardcoded entries — models are discovered dynamically:
+  //   - Pi: getModels(provider) from @mariozechner/pi-ai SDK
+  // See ModelRefreshService in apps/electron/src/main/model-fetchers/
   // ----------------------------------------
 ];
 
@@ -127,11 +107,6 @@ export function getModelsByProvider(provider: ModelProvider): ModelDefinition[] 
 /** All Anthropic Claude models */
 export const ANTHROPIC_MODELS = getModelsByProvider('anthropic');
 
-/** All OpenAI/Codex models */
-export const OPENAI_MODELS = getModelsByProvider('openai');
-
-/** All GitHub Copilot models */
-export const COPILOT_MODELS = getModelsByProvider('copilot');
 
 /**
  * Legacy compatibility export.
@@ -164,11 +139,6 @@ export function getModelIdByShortName(shortName: string): string {
 /** Default model for Anthropic connections (used when creating/backfilling connections) */
 export const DEFAULT_MODEL = getModelIdByShortName('Opus');
 
-/** Default model for Codex/OpenAI connections (used when creating/backfilling connections) */
-export const DEFAULT_CODEX_MODEL = getModelIdByShortName('Codex');
-
-/** Default model for Copilot connections — no hardcoded default; models come from listModels() */
-export const DEFAULT_COPILOT_MODEL: string | undefined = undefined;
 
 // ============================================
 // UTILITY MODELS
@@ -248,7 +218,7 @@ export function isOpusModel(modelId: string): boolean {
 
 /**
  * Check if a model ID refers to a Claude model.
- * Handles both direct Anthropic IDs (e.g. "claude-sonnet-4-5-20250929")
+ * Handles both direct Anthropic IDs (e.g. "claude-sonnet-4-6")
  * and provider-prefixed IDs (e.g. "anthropic/claude-sonnet-4" via OpenRouter).
  */
 export function isClaudeModel(modelId: string): boolean {
@@ -256,22 +226,6 @@ export function isClaudeModel(modelId: string): boolean {
   return lower.startsWith('claude-') || lower.includes('/claude');
 }
 
-/**
- * Check if a model ID refers to a Codex/OpenAI model.
- * Matches patterns like 'gpt-5.3-codex', 'gpt-5.1-codex-mini', etc.
- */
-export function isCodexModel(modelId: string): boolean {
-  const lower = modelId.toLowerCase();
-  return lower.includes('codex');
-}
-
-/**
- * Check if a model ID refers to a Copilot model.
- */
-export function isCopilotModel(modelId: string): boolean {
-  const model = getModelById(modelId);
-  return model?.provider === 'copilot';
-}
 
 /**
  * Get the provider for a model ID.
@@ -279,4 +233,3 @@ export function isCopilotModel(modelId: string): boolean {
 export function getModelProvider(modelId: string): ModelProvider | undefined {
   return getModelById(modelId)?.provider;
 }
-

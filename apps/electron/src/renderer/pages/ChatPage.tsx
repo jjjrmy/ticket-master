@@ -13,7 +13,7 @@ import { PanelHeader } from '@/components/app-shell/PanelHeader'
 import { SessionMenu } from '@/components/app-shell/SessionMenu'
 import { RenameDialog } from '@/components/ui/rename-dialog'
 import { toast } from 'sonner'
-import { HeaderIconButton } from '@/components/ui/HeaderIconButton'
+import { PanelHeaderCenterButton } from '@/components/ui/PanelHeaderCenterButton'
 import { DropdownMenu, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { StyledDropdownMenuContent, StyledDropdownMenuItem, StyledDropdownMenuSeparator } from '@/components/ui/styled-dropdown'
 import { useAppShellContext, usePendingPermission, usePendingCredential, useSessionOptionsFor, useSession as useSessionData } from '@/context/AppShellContext'
@@ -41,12 +41,12 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onSendMessage,
     onOpenFile,
     onOpenUrl,
+    workspaces,
     onRespondToPermission,
     onRespondToCredential,
     onMarkSessionRead,
     onMarkSessionUnread,
     onSetActiveViewingSession,
-    textareaRef,
     getDraft,
     onInputChange,
     enabledSources,
@@ -54,20 +54,21 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     labels,
     onSessionLabelsChange,
     enabledModes,
-    todoStates,
+    sessionStatuses,
     onSessionSourcesChange,
     onRenameSession,
     onFlagSession,
     onUnflagSession,
     onArchiveSession,
     onUnarchiveSession,
-    onTodoStateChange,
+    onSessionStatusChange,
     onDeleteSession,
     rightSidebarButton,
     sessionListSearchQuery,
     isSearchModeActive,
     chatDisplayRef,
     onChatMatchInfoChange,
+    isFocusedPanel,
   } = useAppShellContext()
 
   // Use the unified session options hook for clean access
@@ -117,11 +118,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   // 2. If processing → when it completes, main process will clear hasUnread
   // The main process handles all the logic; we just report viewing state.
   React.useEffect(() => {
-    if (session && isWindowFocused) {
+    if (session && isWindowFocused && isFocusedPanel !== false) {
       onSetActiveViewingSession(session.id)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.id, isWindowFocused, onSetActiveViewingSession])
+  }, [session?.id, isWindowFocused, isFocusedPanel, onSetActiveViewingSession])
 
   // Get pending permission and credential for this session
   const pendingPermission = usePendingPermission(sessionId)
@@ -159,6 +160,19 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 
     return () => clearInterval(interval)
   }, [sessionId, getDraft])
+
+  // Listen for restore-input events (queued messages restored to input on abort)
+  React.useEffect(() => {
+    const handler = (e: Event) => {
+      const { sessionId: targetId, text } = (e as CustomEvent).detail
+      if (targetId === sessionId) {
+        setInputValue(text)
+        inputValueRef.current = text
+      }
+    }
+    window.addEventListener('craft:restore-input', handler)
+    return () => window.removeEventListener('craft:restore-input', handler)
+  }, [sessionId])
 
   const handleInputChange = React.useCallback((value: string) => {
     setInputValue(value)
@@ -206,16 +220,61 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 
   // Working directory for this session
   const workingDirectory = session?.workingDirectory
+  const activeWorkspace = React.useMemo(
+    () => workspaces.find((w) => w.id === activeWorkspaceId) || null,
+    [workspaces, activeWorkspaceId]
+  )
   const handleWorkingDirectoryChange = React.useCallback(async (path: string) => {
     if (!session) return
     await window.electronAPI.sessionCommand(session.id, { type: 'updateWorkingDirectory', dir: path })
   }, [session])
 
   const handleOpenFile = React.useCallback(
-    (path: string) => {
-      onOpenFile(path)
+    async (path: string) => {
+      // Resolve bare relative paths against session working directory,
+      // or workspace root as a fallback when workingDirectory is not set.
+      const resolved = (() => {
+        if (path.startsWith('/') || path.startsWith('~/')) return path
+
+        const baseDir = workingDirectory || activeWorkspace?.rootPath
+        if (!baseDir) return path
+
+        const cleanedBase = baseDir.replace(/\/+$/, '')
+        const cleanedPath = path.replace(/^\.\//, '')
+        return `${cleanedBase}/${cleanedPath}`
+      })()
+
+      // Smart fallback for missing files in AI output:
+      // if the exact path doesn't exist, search nearby for same basename
+      // (e.g. markdown/linkify.test.ts -> markdown/__tests__/linkify.test.ts).
+      if (resolved.startsWith('/')) {
+        const lastSlash = resolved.lastIndexOf('/')
+        if (lastSlash > 0 && lastSlash < resolved.length - 1) {
+          const parentDir = resolved.slice(0, lastSlash)
+          const fileName = resolved.slice(lastSlash + 1)
+          try {
+            const matches = await window.electronAPI.searchFiles(parentDir, fileName)
+            const files = matches.filter((m) => m.type === 'file' && m.name === fileName)
+            const exact = files.find((m) => m.path === resolved)
+            if (exact) {
+              onOpenFile(exact.path)
+              return
+            }
+
+            if (files.length === 1) {
+              onOpenFile(files[0].path)
+              toast.info(`Opened closest match: ${files[0].relativePath}`)
+              return
+            }
+          } catch {
+            // Search fallback is best-effort; proceed with original resolved path.
+          }
+        }
+      }
+
+      onOpenFile(resolved)
     },
-    [onOpenFile]
+    [onOpenFile, workingDirectory, activeWorkspace?.rootPath]
   )
 
   const handleOpenUrl = React.useCallback(
@@ -250,7 +309,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const isFlagged = session?.isFlagged || sessionMeta?.isFlagged || false
   const isArchived = session?.isArchived || sessionMeta?.isArchived || false
   const sharedUrl = session?.sharedUrl || sessionMeta?.sharedUrl || null
-  const currentTodoState = session?.todoState || sessionMeta?.todoState || 'todo'
+  const currentSessionStatus = session?.sessionStatus || sessionMeta?.sessionStatus || 'todo'
   const hasMessages = !!(session?.messages?.length || sessionMeta?.lastFinalMessageId)
   const hasUnreadMessages = sessionMeta
     ? !!(sessionMeta.lastFinalMessageId && sessionMeta.lastFinalMessageId !== sessionMeta.lastReadMessageId)
@@ -295,9 +354,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onMarkSessionUnread(sessionId)
   }, [sessionId, onMarkSessionUnread])
 
-  const handleTodoStateChange = React.useCallback((state: string) => {
-    onTodoStateChange(sessionId, state)
-  }, [sessionId, onTodoStateChange])
+  const handleSessionStatusChange = React.useCallback((state: string) => {
+    onSessionStatusChange(sessionId, state)
+  }, [sessionId, onSessionStatusChange])
 
   const handleLabelsChange = React.useCallback((newLabels: string[]) => {
     onSessionLabelsChange?.(sessionId, newLabels)
@@ -365,16 +424,16 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const shareButton = React.useMemo(() => (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <HeaderIconButton
+        <PanelHeaderCenterButton
           icon={sharedUrl
-            ? <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            ? <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M11.2383 10.2871C11.6481 10.0391 12.1486 10.0082 12.5811 10.1943L12.7617 10.2871L13.0088 10.4414C14.2231 11.227 15.1393 12.2124 15.8701 13.502C16.1424 13.9824 15.9736 14.5929 15.4932 14.8652C15.0127 15.1375 14.4022 14.9688 14.1299 14.4883C13.8006 13.9073 13.4303 13.417 13 12.9883V21C13 21.5523 12.5523 22 12 22C11.4477 22 11 21.5523 11 21V12.9883C10.5697 13.417 10.1994 13.9073 9.87012 14.4883C9.59781 14.9688 8.98732 15.1375 8.50684 14.8652C8.02643 14.5929 7.8576 13.9824 8.12988 13.502C8.90947 12.1264 9.90002 11.0972 11.2383 10.2871ZM11.5 3C14.2848 3 16.6594 4.75164 17.585 7.21289C20.1294 7.90815 22 10.235 22 13C22 16.3137 19.3137 19 16 19H15V16.9961C15.5021 16.9966 16.0115 16.8707 16.4795 16.6055C17.9209 15.7885 18.4272 13.9571 17.6104 12.5156C16.6661 10.8495 15.4355 9.56805 13.7969 8.57617C12.692 7.90745 11.308 7.90743 10.2031 8.57617C8.56453 9.56806 7.3339 10.8495 6.38965 12.5156C5.57277 13.957 6.07915 15.7885 7.52051 16.6055C7.98851 16.8707 8.49794 16.9966 9 16.9961V19H7C4.23858 19 2 16.7614 2 14C2 11.9489 3.23498 10.1861 5.00195 9.41504C5.04745 5.86435 7.93852 3 11.5 3Z" />
               </svg>
-            : <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                 <path d="M8 8.53809C6.74209 8.60866 5.94798 8.80911 5.37868 9.37841C4.5 10.2571 4.5 11.6713 4.5 14.4997V15.4997C4.5 18.3282 4.5 19.7424 5.37868 20.6211C6.25736 21.4997 7.67157 21.4997 10.5 21.4997H13.5C16.3284 21.4997 17.7426 21.4997 18.6213 20.6211C19.5 19.7424 19.5 18.3282 19.5 15.4997V14.4997C19.5 11.6713 19.5 10.2571 18.6213 9.37841C18.052 8.80911 17.2579 8.60866 16 8.53809M12 14V3.5M9.5 5.5C9.99903 4.50411 10.6483 3.78875 11.5606 3.24093C11.7612 3.12053 11.8614 3.06033 12 3.06033C12.1386 3.06033 12.2388 3.12053 12.4394 3.24093C13.3517 3.78875 14.001 4.50411 14.5 5.5" />
               </svg>
           }
-          className={sharedUrl ? 'text-accent' : 'text-foreground'}
+          className={sharedUrl ? 'text-accent' : undefined}
         />
       </DropdownMenuTrigger>
       <StyledDropdownMenuContent align="end" sideOffset={8}>
@@ -423,19 +482,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   ), [sharedUrl, handleShare, handleOpenInBrowser, handleCopyLink, handleUpdateShare, handleRevokeShare])
 
   // Build title menu content for chat sessions using shared SessionMenu
-  const sessionLabels = session?.labels ?? []
-  const titleMenu = React.useMemo(() => (
+  const titleMenu = React.useMemo(() => sessionMeta ? (
     <SessionMenu
-      sessionId={sessionId}
-      sessionName={displayTitle}
-      isFlagged={isFlagged}
-      isArchived={isArchived}
-      sharedUrl={sharedUrl}
-      hasMessages={hasMessages}
-      hasUnreadMessages={hasUnreadMessages}
-      currentTodoState={currentTodoState}
-      todoStates={todoStates ?? []}
-      sessionLabels={sessionLabels}
+      item={sessionMeta}
+      sessionStatuses={sessionStatuses ?? []}
       labels={labels ?? []}
       onLabelsChange={handleLabelsChange}
       onRename={handleRename}
@@ -444,21 +494,13 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       onArchive={handleArchive}
       onUnarchive={handleUnarchive}
       onMarkUnread={handleMarkUnread}
-      onTodoStateChange={handleTodoStateChange}
+      onSessionStatusChange={handleSessionStatusChange}
       onOpenInNewWindow={handleOpenInNewWindow}
       onDelete={handleDelete}
     />
-  ), [
-    sessionId,
-    displayTitle,
-    isFlagged,
-    isArchived,
-    sharedUrl,
-    hasMessages,
-    hasUnreadMessages,
-    currentTodoState,
-    todoStates,
-    sessionLabels,
+  ) : null, [
+    sessionMeta,
+    sessionStatuses,
     labels,
     handleLabelsChange,
     handleRename,
@@ -467,7 +509,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     handleArchive,
     handleUnarchive,
     handleMarkUnread,
-    handleTodoStateChange,
+    handleSessionStatusChange,
     handleOpenInNewWindow,
     handleDelete,
   ])
@@ -504,15 +546,12 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 currentModel={effectiveModel}
                 onModelChange={handleModelChange}
                 onConnectionChange={handleConnectionChange}
-                textareaRef={textareaRef}
                 pendingPermission={undefined}
                 onRespondToPermission={onRespondToPermission}
                 pendingCredential={undefined}
                 onRespondToCredential={onRespondToCredential}
                 thinkingLevel={sessionOpts.thinkingLevel}
                 onThinkingLevelChange={(level) => setOption('thinkingLevel', level)}
-                ultrathinkEnabled={sessionOpts.ultrathinkEnabled}
-                onUltrathinkChange={(enabled) => setOption('ultrathinkEnabled', enabled)}
                 permissionMode={sessionOpts.permissionMode}
                 onPermissionModeChange={setPermissionMode}
                 enabledModes={enabledModes}
@@ -520,8 +559,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 onInputChange={handleInputChange}
                 sources={enabledSources}
                 skills={skills}
-                todoStates={todoStates}
-                onTodoStateChange={handleTodoStateChange}
+                sessionStatuses={sessionStatuses}
+                onSessionStatusChange={handleSessionStatusChange}
                 workspaceId={activeWorkspaceId || undefined}
                 onSourcesChange={(slugs) => onSessionSourcesChange?.(sessionId, slugs)}
                 workingDirectory={sessionMeta.workingDirectory}
@@ -577,15 +616,12 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             currentModel={effectiveModel}
             onModelChange={handleModelChange}
             onConnectionChange={handleConnectionChange}
-            textareaRef={textareaRef}
             pendingPermission={pendingPermission}
             onRespondToPermission={onRespondToPermission}
             pendingCredential={pendingCredential}
             onRespondToCredential={onRespondToCredential}
             thinkingLevel={sessionOpts.thinkingLevel}
             onThinkingLevelChange={(level) => setOption('thinkingLevel', level)}
-            ultrathinkEnabled={sessionOpts.ultrathinkEnabled}
-            onUltrathinkChange={(enabled) => setOption('ultrathinkEnabled', enabled)}
             permissionMode={sessionOpts.permissionMode}
             onPermissionModeChange={setPermissionMode}
             enabledModes={enabledModes}
@@ -595,8 +631,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             skills={skills}
             labels={labels}
             onLabelsChange={(newLabels) => onSessionLabelsChange?.(sessionId, newLabels)}
-            todoStates={todoStates}
-            onTodoStateChange={handleTodoStateChange}
+            sessionStatuses={sessionStatuses}
+            onSessionStatusChange={handleSessionStatusChange}
             workspaceId={activeWorkspaceId || undefined}
             onSourcesChange={(slugs) => onSessionSourcesChange?.(sessionId, slugs)}
             workingDirectory={workingDirectory}

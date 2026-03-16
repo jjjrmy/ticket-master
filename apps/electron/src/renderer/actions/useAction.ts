@@ -10,7 +10,7 @@ import type { ActionId } from './definitions'
  *
  * @example
  * // With enabled condition
- * useAction('sessionList.selectAll', selectAll, {
+ * useAction('navigator.selectAll', selectAll, {
  *   enabled: () => zoneRef.current?.contains(document.activeElement) ?? false
  * })
  */

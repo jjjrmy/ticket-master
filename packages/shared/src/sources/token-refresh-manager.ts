@@ -13,6 +13,7 @@
 
 import { isOAuthSource, type LoadedSource } from './types.ts';
 import type { SourceCredentialManager } from './credential-manager.ts';
+import { markSourceAuthenticated } from './storage.ts';
 
 /** Default cooldown after failed refresh (5 minutes) */
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
@@ -74,6 +75,13 @@ export class TokenRefreshManager {
   }
 
   /**
+   * Clear cooldown for a source (e.g. after successful re-authentication).
+   */
+  clearCooldown(sourceSlug: string): void {
+    this.failedAttempts.delete(sourceSlug);
+  }
+
+  /**
    * Reset all rate limiting state (useful for testing).
    */
   reset(): void {
@@ -87,6 +95,11 @@ export class TokenRefreshManager {
   async needsRefresh(source: LoadedSource): Promise<boolean> {
     const cred = await this.credManager.load(source);
     if (!cred) return false;
+    if (!cred.refreshToken) return false;
+    // If no expiresAt, we can't determine token lifetime — proactively refresh.
+    // This handles credentials stored before expiresAt defaulting was added.
+    // After refresh, the new credential will have expiresAt set, preventing refresh every turn.
+    if (!cred.expiresAt) return true;
     return this.credManager.isExpired(cred) || this.credManager.needsRefresh(cred);
   }
 
@@ -113,8 +126,16 @@ export class TokenRefreshManager {
     // Load credential and check if refresh needed
     const cred = await this.credManager.load(source);
 
-    // If no credential or doesn't need refresh, return current token
-    if (cred && !this.credManager.isExpired(cred) && !this.credManager.needsRefresh(cred)) {
+    // Non-refreshable tokens (e.g. Slack) — return as-is.
+    // Consistent with needsRefresh() which returns false when !refreshToken.
+    if (cred && !cred.refreshToken) {
+      return { success: true, token: cred.value };
+    }
+
+    // If credential exists, has a known expiry, and isn't near expiry, return it as-is.
+    // Missing expiresAt means we can't determine lifetime — fall through to refresh
+    // so the new credential gets a proper expiresAt (matching needsRefresh() logic).
+    if (cred && cred.expiresAt && !this.credManager.isExpired(cred) && !this.credManager.needsRefresh(cred)) {
       return {
         success: true,
         token: cred.value,
@@ -130,6 +151,13 @@ export class TokenRefreshManager {
       if (token) {
         this.log(`[TokenRefresh] Successfully refreshed token for ${slug}`);
         this.clearFailure(slug);
+
+        // Restore auth state — undoes markSourceNeedsReauth() from startup
+        markSourceAuthenticated(source.workspaceRootPath, source.config.slug);
+        source.config['isAuthenticated'] = true;
+        source.config.connectionStatus = 'connected';
+        source.config.connectionError = undefined;
+
         return { success: true, token };
       } else {
         const reason = 'Refresh returned null';

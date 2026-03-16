@@ -10,7 +10,7 @@
 
 // Types
 export type {
-  TodoState,
+  SessionStatus,
   SessionTokenUsage,
   StoredMessage,
   SessionConfig,
@@ -50,7 +50,7 @@ export {
   canUpdateSdkCwd,
   flagSession,
   unflagSession,
-  setSessionTodoState,
+  setSessionStatus,
   // Pending plan execution (Accept & Compact flow)
   setPendingPlanExecution,
   markCompactionComplete,
@@ -66,18 +66,6 @@ export {
   listArchivedSessions,
   listActiveSessions,
   deleteOldArchivedSessions,
-  // Sub-session hierarchy
-  sortSiblings,
-  createSubSession,
-  getChildSessions,
-  getParentSession,
-  getSiblingsSessions,
-  getSessionFamily,
-  hasChildren,
-  updateSiblingOrder,
-  archiveSessionCascade,
-  unarchiveSessionCascade,
-  deleteSessionCascade,
   // Plan storage
   formatPlanAsMarkdown,
   parsePlanFromMarkdown,
@@ -89,6 +77,8 @@ export {
   getMostRecentPlanFile,
   // Async persistence queue
   sessionPersistenceQueue,
+  // Header metadata signature (for self-triggered event suppression)
+  getHeaderMetadataSignature,
 } from './storage.ts';
 
 // JSONL helpers (for direct access if needed)

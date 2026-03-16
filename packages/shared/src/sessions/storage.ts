@@ -34,7 +34,7 @@ import type {
   SessionMetadata,
   SessionTokenUsage,
   SessionHeader,
-  TodoState,
+  SessionStatus,
 } from './types.ts';
 import type { Plan } from '../agent/plan-types.ts';
 import { validateSessionStatus } from '../statuses/validation.ts';
@@ -182,8 +182,9 @@ export async function createSession(
     permissionMode?: SessionConfig['permissionMode'];
     enabledSourceSlugs?: string[];
     model?: string;
+    llmConnection?: string;
     hidden?: boolean;
-    todoState?: SessionConfig['todoState'];
+    sessionStatus?: SessionConfig['sessionStatus'];
     labels?: string[];
     isFlagged?: boolean;
   }
@@ -212,8 +213,9 @@ export async function createSession(
     permissionMode: options?.permissionMode,
     enabledSourceSlugs: options?.enabledSourceSlugs,
     model: options?.model,
+    llmConnection: options?.llmConnection,
     hidden: options?.hidden,
-    todoState: options?.todoState,
+    sessionStatus: options?.sessionStatus,
     labels: options?.labels,
     isFlagged: options?.isFlagged,
   };
@@ -310,7 +312,7 @@ export async function saveSession(session: StoredSession): Promise<void> {
  * Multiple rapid calls are coalesced into a single write.
  * Use this during active sessions to avoid blocking the main thread.
  */
-export { sessionPersistenceQueue } from './persistence-queue.js'
+export { sessionPersistenceQueue, getHeaderMetadataSignature } from './persistence-queue.js'
 
 /**
  * Load session by ID
@@ -387,8 +389,10 @@ export function listSessions(workspaceRootPath: string): SessionMetadata[] {
  */
 function headerToMetadata(header: SessionHeader, workspaceRootPath: string): SessionMetadata | null {
   try {
-    // Validate todoState against workspace status config
-    const validatedTodoState = validateSessionStatus(workspaceRootPath, header.todoState);
+    // Migration: accept old 'todoState' field from pre-rename session files
+    const rawStatus = header.sessionStatus ?? (header as unknown as { todoState?: string }).todoState;
+    // Validate sessionStatus against workspace status config
+    const validatedStatus = validateSessionStatus(workspaceRootPath, rawStatus);
 
     // Count plan files for this session
     const planCount = listPlanFiles(workspaceRootPath, header.id).length;
@@ -397,47 +401,21 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
     const workingDir = header.workingDirectory ? expandPath(header.workingDirectory) : undefined;
     const sdkCwd = header.sdkCwd ? expandPath(header.sdkCwd) : workingDir;
 
+    // Destructure fields that don't exist on SessionMetadata or need overrides
+    const {
+      enabledSourceSlugs: _es, pendingPlanExecution: _pp,
+      sessionStatus: _ss, workingDirectory: _wd, sdkCwd: _sc,
+      workspaceRootPath: _wrp, ...headerFields
+    } = header;
+
     return {
-      id: header.id,
+      ...headerFields,
       workspaceRootPath,
-      name: header.name,
-      createdAt: header.createdAt,
-      lastUsedAt: header.lastUsedAt,
-      lastMessageAt: header.lastMessageAt,
-      messageCount: header.messageCount,
-      preview: header.preview,
-      sdkSessionId: header.sdkSessionId,
-      isFlagged: header.isFlagged,
-      todoState: validatedTodoState,
-      labels: header.labels,
-      permissionMode: header.permissionMode,
+      sessionStatus: validatedStatus,
       planCount: planCount > 0 ? planCount : undefined,
-      lastMessageRole: header.lastMessageRole,
       workingDirectory: workingDir,
       sdkCwd,
-      model: header.model,
-      llmConnection: header.llmConnection,
-      connectionLocked: header.connectionLocked,
-      thinkingLevel: header.thinkingLevel,
-      // Shared viewer state - must be included for persistence across app restarts
-      sharedUrl: header.sharedUrl,
-      sharedId: header.sharedId,
-      // Token usage from JSONL header (available without loading messages)
-      tokenUsage: header.tokenUsage,
-      // Unread detection fields - pre-computed for session list display without loading messages
-      lastReadMessageId: header.lastReadMessageId,
-      lastFinalMessageId: header.lastFinalMessageId,
-      // Explicit unread flag - single source of truth for NEW badge (state machine approach)
-      hasUnread: header.hasUnread,
-      // Hidden flag for mini-agent sessions (not shown in session list)
-      hidden: header.hidden,
-      // Archive state
-      isArchived: header.isArchived,
-      archivedAt: header.archivedAt,
-      // Sub-session hierarchy
-      parentSessionId: header.parentSessionId,
-      siblingOrder: header.siblingOrder,
-    };
+    } as SessionMetadata;
   } catch (error) {
     debug(`[sessions] Failed to convert header to metadata for session "${header?.id}" in ${workspaceRootPath}:`, error);
     return null;
@@ -549,7 +527,7 @@ export async function updateSessionMetadata(
   updates: Partial<Pick<SessionConfig,
     | 'isFlagged'
     | 'name'
-    | 'todoState'
+    | 'sessionStatus'
     | 'labels'
     | 'lastReadMessageId'
     | 'hasUnread'
@@ -570,7 +548,7 @@ export async function updateSessionMetadata(
 
   if (updates.isFlagged !== undefined) session.isFlagged = updates.isFlagged;
   if (updates.name !== undefined) session.name = updates.name;
-  if (updates.todoState !== undefined) session.todoState = updates.todoState;
+  if (updates.sessionStatus !== undefined) session.sessionStatus = updates.sessionStatus;
   if (updates.labels !== undefined) session.labels = updates.labels;
   if (updates.enabledSourceSlugs !== undefined) session.enabledSourceSlugs = updates.enabledSourceSlugs;
   if (updates.workingDirectory !== undefined) session.workingDirectory = updates.workingDirectory;
@@ -603,14 +581,14 @@ export async function unflagSession(workspaceRootPath: string, sessionId: string
 }
 
 /**
- * Set todo state for a session
+ * Set session status
  */
-export async function setSessionTodoState(
+export async function setSessionStatus(
   workspaceRootPath: string,
   sessionId: string,
-  todoState: TodoState
+  sessionStatus: SessionStatus
 ): Promise<void> {
-  await updateSessionMetadata(workspaceRootPath, sessionId, { todoState });
+  await updateSessionMetadata(workspaceRootPath, sessionId, { sessionStatus });
 }
 
 /**
@@ -656,13 +634,15 @@ export async function unarchiveSession(workspaceRootPath: string, sessionId: str
 export async function setPendingPlanExecution(
   workspaceRootPath: string,
   sessionId: string,
-  planPath: string
+  planPath: string,
+  draftInputSnapshot?: string,
 ): Promise<void> {
   const session = loadSession(workspaceRootPath, sessionId);
   if (!session) return;
 
   session.pendingPlanExecution = {
     planPath,
+    draftInputSnapshot,
     awaitingCompaction: true,
   };
   await saveSession(session);
@@ -707,7 +687,7 @@ export async function clearPendingPlanExecution(
 export function getPendingPlanExecution(
   workspaceRootPath: string,
   sessionId: string
-): { planPath: string; awaitingCompaction: boolean } | null {
+): { planPath: string; draftInputSnapshot?: string; awaitingCompaction: boolean } | null {
   const session = loadSession(workspaceRootPath, sessionId);
   return session?.pendingPlanExecution ?? null;
 }
@@ -730,7 +710,7 @@ export function listFlaggedSessions(workspaceRootPath: string): SessionMetadata[
  */
 export function listCompletedSessions(workspaceRootPath: string): SessionMetadata[] {
   return listActiveSessions(workspaceRootPath).filter(s => {
-    const category = getStatusCategory(workspaceRootPath, s.todoState || 'todo');
+    const category = getStatusCategory(workspaceRootPath, s.sessionStatus || 'todo');
     return category === 'closed';
   });
 }
@@ -742,7 +722,7 @@ export function listCompletedSessions(workspaceRootPath: string): SessionMetadat
  */
 export function listInboxSessions(workspaceRootPath: string): SessionMetadata[] {
   return listActiveSessions(workspaceRootPath).filter(s => {
-    const category = getStatusCategory(workspaceRootPath, s.todoState || 'todo');
+    const category = getStatusCategory(workspaceRootPath, s.sessionStatus || 'todo');
     return category === 'open';
   });
 }
@@ -781,243 +761,6 @@ export function deleteOldArchivedSessions(workspaceRootPath: string, retentionDa
   }
 
   return deletedCount;
-}
-
-// ============================================================
-// Sub-Session Hierarchy (1 level max)
-// ============================================================
-
-/**
- * Sort siblings by explicit order or creation time.
- * Uses siblingOrder if any sibling has it set, otherwise falls back to createdAt.
- */
-export function sortSiblings(sessions: SessionMetadata[]): SessionMetadata[] {
-  const hasExplicitOrder = sessions.some(s => s.siblingOrder !== undefined);
-
-  return [...sessions].sort((a, b) => {
-    if (hasExplicitOrder) {
-      // Explicit order takes precedence (undefined = end)
-      return (a.siblingOrder ?? Infinity) - (b.siblingOrder ?? Infinity);
-    }
-    // Default: creation order
-    return a.createdAt - b.createdAt;
-  });
-}
-
-/**
- * Create a sub-session under a parent session.
- * Sub-sessions share the same workspace but have a parentSessionId reference.
- */
-export async function createSubSession(
-  workspaceRootPath: string,
-  parentSessionId: string,
-  options?: {
-    name?: string;
-    workingDirectory?: string;
-    permissionMode?: SessionConfig['permissionMode'];
-    enabledSourceSlugs?: string[];
-    model?: string;
-    todoState?: SessionConfig['todoState'];
-    labels?: string[];
-  }
-): Promise<SessionConfig> {
-  // Verify parent exists
-  const parent = loadSession(workspaceRootPath, parentSessionId);
-  if (!parent) {
-    throw new Error(`Parent session not found: ${parentSessionId}`);
-  }
-
-  // Prevent nested sub-sessions (max 1 level)
-  if (parent.parentSessionId) {
-    throw new Error('Cannot create sub-session of a sub-session (max 1 level)');
-  }
-
-  // Create child session with parentSessionId set
-  const session = await createSession(workspaceRootPath, {
-    name: options?.name,
-    workingDirectory: options?.workingDirectory ?? parent.workingDirectory,
-    permissionMode: options?.permissionMode ?? parent.permissionMode,
-    enabledSourceSlugs: options?.enabledSourceSlugs ?? parent.enabledSourceSlugs,
-    model: options?.model ?? parent.model,
-    todoState: options?.todoState,
-    labels: options?.labels,
-  });
-
-  // Set parentSessionId
-  const storedSession = loadSession(workspaceRootPath, session.id);
-  if (storedSession) {
-    storedSession.parentSessionId = parentSessionId;
-    await saveSession(storedSession);
-  }
-
-  return { ...session, parentSessionId };
-}
-
-/**
- * Get all direct children of a session.
- * Returns sessions where parentSessionId matches the given sessionId.
- */
-export function getChildSessions(workspaceRootPath: string, parentSessionId: string): SessionMetadata[] {
-  const allSessions = listSessions(workspaceRootPath);
-  const children = allSessions.filter(s => s.parentSessionId === parentSessionId);
-  return sortSiblings(children);
-}
-
-/**
- * Get parent session metadata (if this is a sub-session).
- */
-export function getParentSession(workspaceRootPath: string, sessionId: string): SessionMetadata | null {
-  const session = loadSession(workspaceRootPath, sessionId);
-  if (!session?.parentSessionId) {
-    return null;
-  }
-
-  const allSessions = listSessions(workspaceRootPath);
-  return allSessions.find(s => s.id === session.parentSessionId) ?? null;
-}
-
-/**
- * Get sibling sessions (same parent, excluding self).
- * Returns empty array if session has no parent.
- */
-export function getSiblingsSessions(workspaceRootPath: string, sessionId: string): SessionMetadata[] {
-  const session = loadSession(workspaceRootPath, sessionId);
-  if (!session?.parentSessionId) {
-    return [];
-  }
-
-  const children = getChildSessions(workspaceRootPath, session.parentSessionId);
-  return children.filter(s => s.id !== sessionId);
-}
-
-/**
- * Get full session family (parent + siblings) for a sub-session.
- * Returns null if session is a root session (no parent).
- */
-export function getSessionFamily(workspaceRootPath: string, sessionId: string): {
-  parent: SessionMetadata;
-  siblings: SessionMetadata[];
-  self: SessionMetadata;
-} | null {
-  const session = loadSession(workspaceRootPath, sessionId);
-  if (!session?.parentSessionId) {
-    return null;
-  }
-
-  const parent = getParentSession(workspaceRootPath, sessionId);
-  if (!parent) {
-    return null;
-  }
-
-  const allChildren = getChildSessions(workspaceRootPath, session.parentSessionId);
-  const self = allChildren.find(s => s.id === sessionId);
-  const siblings = allChildren.filter(s => s.id !== sessionId);
-
-  if (!self) {
-    return null;
-  }
-
-  return { parent, siblings, self };
-}
-
-/**
- * Check if a session has any children.
- */
-export function hasChildren(workspaceRootPath: string, sessionId: string): boolean {
-  return getChildSessions(workspaceRootPath, sessionId).length > 0;
-}
-
-/**
- * Update sibling order for multiple sessions at once.
- * Used when user reorders siblings via drag-drop.
- */
-export async function updateSiblingOrder(
-  workspaceRootPath: string,
-  orderedSessionIds: string[]
-): Promise<void> {
-  for (let i = 0; i < orderedSessionIds.length; i++) {
-    const sessionId = orderedSessionIds[i];
-    if (!sessionId) continue;
-
-    const session = loadSession(workspaceRootPath, sessionId);
-    if (session) {
-      session.siblingOrder = i;
-      await saveSession(session);
-    }
-  }
-}
-
-/**
- * Archive a session and all its children.
- * Returns the count of sessions archived.
- */
-export async function archiveSessionCascade(workspaceRootPath: string, sessionId: string): Promise<number> {
-  const children = getChildSessions(workspaceRootPath, sessionId);
-  let count = 0;
-
-  // Archive children first
-  for (const child of children) {
-    await archiveSession(workspaceRootPath, child.id);
-    count++;
-  }
-
-  // Archive parent
-  await archiveSession(workspaceRootPath, sessionId);
-  count++;
-
-  return count;
-}
-
-/**
- * Unarchive a session and optionally its children.
- * Returns the count of sessions unarchived.
- */
-export async function unarchiveSessionCascade(
-  workspaceRootPath: string,
-  sessionId: string,
-  includeChildren: boolean = true
-): Promise<number> {
-  let count = 0;
-
-  // Unarchive parent first
-  await unarchiveSession(workspaceRootPath, sessionId);
-  count++;
-
-  // Optionally unarchive children
-  if (includeChildren) {
-    const children = getChildSessions(workspaceRootPath, sessionId);
-    for (const child of children) {
-      if (child.isArchived) {
-        await unarchiveSession(workspaceRootPath, child.id);
-        count++;
-      }
-    }
-  }
-
-  return count;
-}
-
-/**
- * Delete a session and all its children.
- * Returns the count of sessions deleted.
- */
-export function deleteSessionCascade(workspaceRootPath: string, sessionId: string): number {
-  const children = getChildSessions(workspaceRootPath, sessionId);
-  let count = 0;
-
-  // Delete children first
-  for (const child of children) {
-    if (deleteSession(workspaceRootPath, child.id)) {
-      count++;
-    }
-  }
-
-  // Delete parent
-  if (deleteSession(workspaceRootPath, sessionId)) {
-    count++;
-  }
-
-  return count;
 }
 
 // ============================================================

@@ -20,14 +20,13 @@ export const KEYS = {
   viewFilters: 'view-filters', // Per-view filter map: { [viewKey]: { statuses, labels } }
   expandedFolders: 'expanded-folders',
   collapsedSidebarItems: 'collapsed-sidebar-items',
+  chatGroupingMode: 'chat-grouping-mode', // How to group chats: 'date' | 'status'
+  collapsedSessionGroups: 'collapsed-session-groups', // Collapsed group keys in session list
 
   // Focus mode
   focusModeEnabled: 'focus-mode-enabled',
 
-  // Right sidebar (chat page)
-  rightSidebarVisible: 'right-sidebar-visible',
-  rightSidebarWidth: 'right-sidebar-width',
-  sessionInfoMetadataHeight: 'session-info-metadata-height', // Height of metadata section in session info panel
+  // Session files panel state
   sessionFilesExpandedFolders: 'session-files-expanded', // Expanded folders in session files tree (keyed by sessionId)
 
   // Theme
@@ -56,6 +55,10 @@ export const KEYS = {
 
   // What's New
   whatsNewLastSeenVersion: 'whats-new-last-seen-version',
+
+  // Workspace navigation state (workspace-scoped via suffix = workspaceSlug)
+  // Stores the full URL search string so switching back restores panels/focus/sidebar
+  workspaceUrl: 'workspace-url',
 } as const
 
 export type StorageKey = typeof KEYS[keyof typeof KEYS]

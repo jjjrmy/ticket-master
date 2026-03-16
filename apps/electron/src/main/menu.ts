@@ -1,12 +1,17 @@
 import { Menu, app, shell, BrowserWindow } from 'electron'
-import { IPC_CHANNELS } from '../shared/types'
+import { RPC_CHANNELS, type BroadcastEventMap } from '../shared/types'
 import { EDIT_MENU, VIEW_MENU, WINDOW_MENU } from '../shared/menu-schema'
 import type { MenuItem } from '../shared/menu-schema'
 import type { WindowManager } from './window-manager'
+import type { EventSink } from '@craft-agent/server-core/transport'
 import { mainLog } from './logger'
 
-// Store reference for rebuilding menu
+type ClientResolver = (webContentsId: number) => string | undefined
+
+// Store references for rebuilding menu
 let cachedWindowManager: WindowManager | null = null
+let cachedEventSink: EventSink | null = null
+let cachedClientResolver: ClientResolver | null = null
 
 /**
  * Creates and sets the application menu for macOS.
@@ -14,9 +19,20 @@ let cachedWindowManager: WindowManager | null = null
  *
  * Call rebuildMenu() when update state changes to refresh the menu.
  */
-export function createApplicationMenu(windowManager: WindowManager): void {
+export function createApplicationMenu(windowManager: WindowManager, sink?: EventSink, resolver?: ClientResolver): void {
   cachedWindowManager = windowManager
+  cachedEventSink = sink ?? null
+  cachedClientResolver = resolver ?? null
   rebuildMenu()
+}
+
+/**
+ * Set the event sink and client resolver after server creation.
+ * Called separately from createApplicationMenu since the server may not exist at menu init time.
+ */
+export function setMenuEventSink(sink: EventSink, resolver: ClientResolver): void {
+  cachedEventSink = sink
+  cachedClientResolver = resolver
 }
 
 /**
@@ -70,7 +86,8 @@ export async function rebuildMenu(): Promise<void> {
         {
           label: 'Settings...',
           accelerator: 'CmdOrCtrl+,',
-          click: () => sendToRenderer(IPC_CHANNELS.MENU_OPEN_SETTINGS)
+          registerAccelerator: false,  // Action registry handles the keyboard shortcut
+          click: () => sendToRenderer(RPC_CHANNELS.menu.OPEN_SETTINGS)
         },
         { type: 'separator' as const },
         { role: 'hide' as const, label: 'Hide Craft Agents' },
@@ -88,11 +105,13 @@ export async function rebuildMenu(): Promise<void> {
         {
           label: 'New Chat',
           accelerator: 'CmdOrCtrl+N',
-          click: () => sendToRenderer(IPC_CHANNELS.MENU_NEW_CHAT)
+          registerAccelerator: false,  // Action registry handles the keyboard shortcut
+          click: () => sendToRenderer(RPC_CHANNELS.menu.NEW_CHAT)
         },
         {
           label: 'New Window',
           accelerator: 'CmdOrCtrl+Shift+N',
+          registerAccelerator: false,  // Action registry handles the keyboard shortcut
           click: () => {
             const focused = BrowserWindow.getFocusedWindow()
             if (focused) {
@@ -122,8 +141,34 @@ export async function rebuildMenu(): Promise<void> {
         // Dev tools only in development
         ...(!app.isPackaged ? [
           { type: 'separator' as const },
-          { role: 'reload' as const },
-          { role: 'forceReload' as const },
+          {
+            label: 'Reload',
+            accelerator: 'CmdOrCtrl+R',
+            click: (_menuItem: Electron.MenuItem, window: Electron.BaseWindow | undefined) => {
+              const browserWindow = window instanceof BrowserWindow ? window : BrowserWindow.getFocusedWindow()
+              if (!browserWindow) return
+              const views = browserWindow.getBrowserViews()
+              if (views.length > 0) {
+                views[0].webContents.reload()
+              } else {
+                browserWindow.webContents.reload()
+              }
+            }
+          },
+          {
+            label: 'Force Reload',
+            accelerator: 'CmdOrCtrl+Shift+R',
+            click: (_menuItem: Electron.MenuItem, window: Electron.BaseWindow | undefined) => {
+              const browserWindow = window instanceof BrowserWindow ? window : BrowserWindow.getFocusedWindow()
+              if (!browserWindow) return
+              const views = browserWindow.getBrowserViews()
+              if (views.length > 0) {
+                views[0].webContents.reloadIgnoringCache()
+              } else {
+                browserWindow.webContents.reloadIgnoringCache()
+              }
+            }
+          },
           { type: 'separator' as const },
           { role: 'toggleDevTools' as const }
         ] : [])
@@ -192,7 +237,8 @@ export async function rebuildMenu(): Promise<void> {
         {
           label: 'Keyboard Shortcuts',
           accelerator: 'CmdOrCtrl+/',
-          click: () => sendToRenderer(IPC_CHANNELS.MENU_KEYBOARD_SHORTCUTS)
+          registerAccelerator: false,  // Action registry handles the keyboard shortcut
+          click: () => sendToRenderer(RPC_CHANNELS.menu.KEYBOARD_SHORTCUTS)
         }
       ]
     }
@@ -202,13 +248,20 @@ export async function rebuildMenu(): Promise<void> {
   Menu.setApplicationMenu(menu)
 }
 
+/** Menu channels that are main→renderer push events in BroadcastEventMap */
+type MenuBroadcastChannel = Extract<keyof BroadcastEventMap, `menu:${string}`>
+
 /**
- * Sends an IPC message to the focused renderer window.
+ * Sends an event to the focused renderer window via the RPC event sink.
  */
-function sendToRenderer(channel: string): void {
+function sendToRenderer(channel: MenuBroadcastChannel): void {
+  if (!cachedEventSink || !cachedClientResolver) return
   const win = BrowserWindow.getFocusedWindow()
   if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
-    win.webContents.send(channel)
+    const clientId = cachedClientResolver(win.webContents.id)
+    if (clientId) {
+      cachedEventSink(channel, { to: 'client', clientId })
+    }
   }
 }
 
@@ -229,7 +282,8 @@ function toElectronMenuItem(item: MenuItem): Electron.MenuItemConstructorOptions
     return {
       label: item.label,
       accelerator: item.shortcut,
-      click: () => sendToRenderer(item.ipcChannel),
+      registerAccelerator: false,  // Action registry handles the keyboard shortcut
+      click: () => sendToRenderer(item.ipcChannel as MenuBroadcastChannel),
     }
   }
 

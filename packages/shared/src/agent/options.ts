@@ -6,7 +6,6 @@ import { debug } from "../utils/debug";
 
 declare const CRAFT_AGENT_CLI_VERSION: string | undefined;
 
-let optionsEnv: Record<string, string> = {};
 let customPathToClaudeCodeExecutable: string | null = null;
 let customInterceptorPath: string | null = null;
 let customExecutable: string | null = null;
@@ -152,10 +151,6 @@ export function resetClaudeConfigCheck(): void {
     claudeConfigChecked = false;
 }
 
-export function setAnthropicOptionsEnv(env: Record<string, string>) {
-    optionsEnv = env;
-}
-
 /**
  * Override the path to the Claude Code executable (cli.js from the SDK).
  * This is needed when the SDK is bundled (e.g., in Electron) and can't auto-detect the path.
@@ -180,7 +175,15 @@ export function setExecutable(path: string) {
     customExecutable = path;
 }
 
-export function getDefaultOptions(): Partial<Options> {
+/**
+ * Get default SDK options for spawning the Claude Code subprocess.
+ *
+ * @param envOverrides - Per-session environment variable overrides.
+ *   These are spread AFTER process.env so they take precedence.
+ *   Used to pass per-session config like ANTHROPIC_BASE_URL that would
+ *   otherwise be clobbered by concurrent sessions mutating process.env.
+ */
+export function getDefaultOptions(envOverrides?: Record<string, string>): Partial<Options> {
     // Repair corrupted ~/.claude.json before the SDK subprocess reads it
     ensureClaudeConfig();
 
@@ -207,7 +210,7 @@ export function getDefaultOptions(): Partial<Options> {
             executableArgs,
             env: {
                 ...process.env,
-                ... optionsEnv,
+                ...envOverrides,
                 // Propagate debug mode from argv flag OR existing env var
                 CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
             }
@@ -223,11 +226,11 @@ export function getDefaultOptions(): Partial<Options> {
             // eliminating the need for external Node or Bun installation
             executable: process.execPath as 'bun',
             // Inject network interceptor into SDK subprocess for API error capture and MCP schema injection
-            executableArgs: [envFileFlag, '--preload', join(baseDir, 'network-interceptor.ts')],
+            executableArgs: [envFileFlag, '--preload', join(baseDir, 'unified-network-interceptor.ts')],
             env: {
                 ...process.env,
                 BUN_BE_BUN: '1',
-                ... optionsEnv,
+                ...envOverrides,
                 // Propagate debug mode from argv flag OR existing env var
                 CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
             }
@@ -236,8 +239,8 @@ export function getDefaultOptions(): Partial<Options> {
     return {
         executableArgs: [envFileFlag],
         env: {
-            ... process.env,
-            ... optionsEnv,
+            ...process.env,
+            ...envOverrides,
             // Propagate debug mode from argv flag OR existing env var
             CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
         }

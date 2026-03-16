@@ -15,7 +15,7 @@
  * - Mark as Unread
  * - Rename
  * - Open in New Window
- * - View in Finder
+ * - Show in file manager
  * - Delete
  */
 
@@ -30,42 +30,29 @@ import {
   MailOpen,
   FolderOpen,
   Copy,
-  Link2Off,
   AppWindow,
+  Columns2,
   CloudUpload,
-  Globe,
   RefreshCw,
   Tag,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { navigate, routes } from '@/lib/navigate'
 import { useMenuComponents } from '@/components/ui/menu-context'
-import { getStateColor, getStateIcon, type TodoStateId } from '@/config/todo-states'
-import type { TodoState } from '@/config/todo-states'
+import { getStateColor, getStateIcon, type SessionStatusId } from '@/config/session-status-config'
+import type { SessionStatus } from '@/config/session-status-config'
 import type { LabelConfig } from '@craft-agent/shared/labels'
 import { extractLabelId } from '@craft-agent/shared/labels'
-import { LabelMenuItems, StatusMenuItems } from './SessionMenuParts'
+import { LabelMenuItems, StatusMenuItems, ShareMenuItems } from './SessionMenuParts'
+import { getFileManagerName } from '@/lib/platform'
+import type { SessionMeta } from '@/atoms/sessions'
+import { getSessionStatus, hasUnreadMeta, hasMessagesMeta } from '@/utils/session'
 
 export interface SessionMenuProps {
-  /** Session ID */
-  sessionId: string
-  /** Session name for rename dialog */
-  sessionName: string
-  /** Whether session is flagged */
-  isFlagged: boolean
-  /** Whether session is archived */
-  isArchived?: boolean
-  /** Shared URL if session is shared */
-  sharedUrl?: string | null
-  /** Whether session has messages */
-  hasMessages: boolean
-  /** Whether session has unread messages */
-  hasUnreadMessages: boolean
-  /** Current todo state */
-  currentTodoState: TodoStateId
+  /** Session data — display state is derived from this */
+  item: SessionMeta
   /** Available todo states */
-  todoStates: TodoState[]
-  /** Current labels applied to this session (e.g. ["bug", "priority::3"]) */
-  sessionLabels?: string[]
+  sessionStatuses: SessionStatus[]
   /** All available label configs (tree structure) for the labels submenu */
   labels?: LabelConfig[]
   /** Callback when labels are toggled (receives full updated labels array) */
@@ -77,7 +64,7 @@ export interface SessionMenuProps {
   onArchive: () => void
   onUnarchive: () => void
   onMarkUnread: () => void
-  onTodoStateChange: (state: TodoStateId) => void
+  onSessionStatusChange: (state: SessionStatusId) => void
   onOpenInNewWindow: () => void
   onDelete: () => void
 }
@@ -87,16 +74,8 @@ export interface SessionMenuProps {
  * This is the content only, not wrapped in a DropdownMenu
  */
 export function SessionMenu({
-  sessionId,
-  sessionName,
-  isFlagged,
-  isArchived = false,
-  sharedUrl,
-  hasMessages,
-  hasUnreadMessages,
-  currentTodoState,
-  todoStates,
-  sessionLabels = [],
+  item,
+  sessionStatuses,
   labels = [],
   onLabelsChange,
   onRename,
@@ -105,10 +84,19 @@ export function SessionMenu({
   onArchive,
   onUnarchive,
   onMarkUnread,
-  onTodoStateChange,
+  onSessionStatusChange,
   onOpenInNewWindow,
   onDelete,
 }: SessionMenuProps) {
+  // Derive display state from item
+  const sessionId = item.id
+  const isFlagged = item.isFlagged ?? false
+  const isArchived = item.isArchived ?? false
+  const sharedUrl = item.sharedUrl
+  const currentSessionStatus = getSessionStatus(item)
+  const sessionLabels = item.labels ?? []
+  const _hasMessages = hasMessagesMeta(item)
+  const _hasUnread = hasUnreadMeta(item)
   // Share handlers
   const handleShare = async () => {
     const result = await window.electronAPI.sessionCommand(sessionId, { type: 'shareToViewer' }) as { success: boolean; url?: string; error?: string } | undefined
@@ -123,37 +111,6 @@ export function SessionMenu({
       })
     } else {
       toast.error('Failed to share', { description: result?.error || 'Unknown error' })
-    }
-  }
-
-  const handleOpenInBrowser = () => {
-    if (sharedUrl) window.electronAPI.openUrl(sharedUrl)
-  }
-
-  const handleCopyLink = async () => {
-    if (sharedUrl) {
-      await navigator.clipboard.writeText(sharedUrl)
-      toast.success('Link copied to clipboard')
-    }
-  }
-
-  const handleUpdateShare = async () => {
-    const result = await window.electronAPI.sessionCommand(sessionId, { type: 'updateShare' })
-    if (result && 'success' in result && result.success) {
-      toast.success('Share updated')
-    } else {
-      const errorMsg = result && 'error' in result ? result.error : undefined
-      toast.error('Failed to update share', { description: errorMsg })
-    }
-  }
-
-  const handleRevokeShare = async () => {
-    const result = await window.electronAPI.sessionCommand(sessionId, { type: 'revokeShare' })
-    if (result && 'success' in result && result.success) {
-      toast.success('Sharing stopped')
-    } else {
-      const errorMsg = result && 'error' in result ? result.error : undefined
-      toast.error('Failed to stop sharing', { description: errorMsg })
     }
   }
 
@@ -198,6 +155,10 @@ export function SessionMenu({
     }
   }, [sessionLabels, appliedLabelIds, onLabelsChange])
 
+  const handleOpenInNewPanel = () => {
+    navigate(routes.view.allSessions(sessionId), { newPanel: true })
+  }
+
   // Get menu components from context (works with both DropdownMenu and ContextMenu)
   const { MenuItem, Separator, Sub, SubTrigger, SubContent } = useMenuComponents()
 
@@ -216,22 +177,7 @@ export function SessionMenu({
             <span className="flex-1">Shared</span>
           </SubTrigger>
           <SubContent>
-            <MenuItem onClick={handleOpenInBrowser}>
-              <Globe className="h-3.5 w-3.5" />
-              <span className="flex-1">Open in Browser</span>
-            </MenuItem>
-            <MenuItem onClick={handleCopyLink}>
-              <Copy className="h-3.5 w-3.5" />
-              <span className="flex-1">Copy Link</span>
-            </MenuItem>
-            <MenuItem onClick={handleUpdateShare}>
-              <RefreshCw className="h-3.5 w-3.5" />
-              <span className="flex-1">Update Share</span>
-            </MenuItem>
-            <MenuItem onClick={handleRevokeShare} variant="destructive">
-              <Link2Off className="h-3.5 w-3.5" />
-              <span className="flex-1">Stop Sharing</span>
-            </MenuItem>
+            <ShareMenuItems sessionId={sessionId} sharedUrl={sharedUrl} menu={{ MenuItem, Separator }} />
           </SubContent>
         </Sub>
       )}
@@ -240,9 +186,9 @@ export function SessionMenu({
       {/* Status submenu - includes all statuses plus Flag/Unflag at the bottom */}
       <Sub>
         <SubTrigger className="pr-2">
-          <span style={{ color: getStateColor(currentTodoState, todoStates) ?? 'var(--foreground)' }}>
+          <span style={{ color: getStateColor(currentSessionStatus, sessionStatuses) ?? 'var(--foreground)' }}>
             {(() => {
-              const icon = getStateIcon(currentTodoState, todoStates)
+              const icon = getStateIcon(currentSessionStatus, sessionStatuses)
               return React.isValidElement(icon)
                 ? React.cloneElement(icon as React.ReactElement<{ bare?: boolean }>, { bare: true })
                 : icon
@@ -252,9 +198,9 @@ export function SessionMenu({
         </SubTrigger>
         <SubContent>
           <StatusMenuItems
-            todoStates={todoStates}
-            activeStateId={currentTodoState}
-            onSelect={onTodoStateChange}
+            sessionStatuses={sessionStatuses}
+            activeStateId={currentSessionStatus}
+            onSelect={onSessionStatusChange}
             menu={{ MenuItem }}
           />
         </SubContent>
@@ -310,7 +256,7 @@ export function SessionMenu({
       )}
 
       {/* Mark as Unread - only show if session has been read */}
-      {!hasUnreadMessages && hasMessages && (
+      {!_hasUnread && _hasMessages && (
         <MenuItem onClick={onMarkUnread}>
           <MailOpen className="h-3.5 w-3.5" />
           <span className="flex-1">Mark as Unread</span>
@@ -333,16 +279,22 @@ export function SessionMenu({
 
       <Separator />
 
+      {/* Open in New Panel */}
+      <MenuItem onClick={handleOpenInNewPanel}>
+        <Columns2 className="h-3.5 w-3.5" />
+        <span className="flex-1">Open in New Panel</span>
+      </MenuItem>
+
       {/* Open in New Window */}
       <MenuItem onClick={onOpenInNewWindow}>
         <AppWindow className="h-3.5 w-3.5" />
         <span className="flex-1">Open in New Window</span>
       </MenuItem>
 
-      {/* View in Finder */}
+      {/* Show in file manager */}
       <MenuItem onClick={handleShowInFinder}>
         <FolderOpen className="h-3.5 w-3.5" />
-        <span className="flex-1">View in Finder</span>
+        <span className="flex-1">{`Show in ${getFileManagerName()}`}</span>
       </MenuItem>
 
       {/* Copy Path */}

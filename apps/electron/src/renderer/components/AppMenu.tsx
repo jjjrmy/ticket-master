@@ -26,6 +26,7 @@ import {
 } from "../../shared/menu-schema"
 import type { MenuItem, MenuSection, SettingsMenuItem } from "../../shared/menu-schema"
 import { SETTINGS_ICONS } from "./icons/SettingsIcons"
+import { getDocUrl } from '@craft-agent/shared/docs/doc-links'
 
 // Map of action handlers for menu items that need custom behavior
 type MenuActionHandlers = {
@@ -195,7 +196,8 @@ export function AppMenu({
 
   return (
     <div className="flex items-center gap-[5px] w-full">
-      {/* Craft Logo Menu */}
+      {/* Craft Logo Menu - interactive island */}
+      <div className="pointer-events-auto titlebar-no-drag">
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <TopBarButton aria-label="Craft menu">
@@ -268,6 +270,12 @@ export function AppMenu({
                 Help & Documentation
                 <Icons.ExternalLink className="h-3 w-3 ml-auto text-muted-foreground" />
               </StyledDropdownMenuItem>
+              <StyledDropdownMenuItem onClick={() => window.electronAPI.openUrl(getDocUrl('automations'))}>
+                <Icons.Webhook className="h-3.5 w-3.5" />
+                Automations
+                <Icons.ExternalLink className="h-3 w-3 ml-auto text-muted-foreground" />
+              </StyledDropdownMenuItem>
+              <StyledDropdownMenuSeparator />
               <StyledDropdownMenuItem onClick={onOpenKeyboardShortcuts}>
                 <Icons.Keyboard className="h-3.5 w-3.5" />
                 Keyboard Shortcuts
@@ -314,37 +322,41 @@ export function AppMenu({
           </StyledDropdownMenuItem>
         </StyledDropdownMenuContent>
       </DropdownMenu>
+      </div>
 
-      {/* Spacer to push nav buttons right */}
+      {/* Spacer - pointer-events-none inherited from parent, drag passes through */}
       <div className="flex-1" />
 
-      {/* Back Navigation */}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <TopBarButton
-            onClick={onBack}
-            disabled={!canGoBack}
-            aria-label="Go back"
-          >
-            <Icons.ChevronLeft className="h-[22px] w-[22px] text-foreground/70" strokeWidth={1.5} />
-          </TopBarButton>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Back {goBackHotkey}</TooltipContent>
-      </Tooltip>
+      {/* Nav Buttons - interactive island */}
+      <div className="pointer-events-auto titlebar-no-drag flex items-center gap-[5px]">
+        {/* Back Navigation */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <TopBarButton
+              onClick={onBack}
+              disabled={!canGoBack}
+              aria-label="Go back"
+            >
+              <Icons.ChevronLeft className="h-[22px] w-[22px] text-foreground/70" strokeWidth={1.5} />
+            </TopBarButton>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Back {goBackHotkey}</TooltipContent>
+        </Tooltip>
 
-      {/* Forward Navigation */}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <TopBarButton
-            onClick={onForward}
-            disabled={!canGoForward}
-            aria-label="Go forward"
-          >
-            <Icons.ChevronRight className="h-[22px] w-[22px] text-foreground/70" strokeWidth={1.5} />
-          </TopBarButton>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Forward {goForwardHotkey}</TooltipContent>
-      </Tooltip>
+        {/* Forward Navigation */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <TopBarButton
+              onClick={onForward}
+              disabled={!canGoForward}
+              aria-label="Go forward"
+            >
+              <Icons.ChevronRight className="h-[22px] w-[22px] text-foreground/70" strokeWidth={1.5} />
+            </TopBarButton>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Forward {goForwardHotkey}</TooltipContent>
+        </Tooltip>
+      </div>
     </div>
   )
 }

@@ -1,5 +1,6 @@
+import * as React from 'react'
 import type { ComponentEntry } from './types'
-import { Markdown, CollapsibleMarkdownProvider, CodeBlock, InlineCode, MarkdownDatatableBlock, MarkdownSpreadsheetBlock } from '@craft-agent/ui'
+import { Markdown, CollapsibleMarkdownProvider, CodeBlock, InlineCode, MarkdownDatatableBlock, MarkdownSpreadsheetBlock, MarkdownImageBlock, ImageCardStack, PlatformProvider } from '@craft-agent/ui'
 
 const sampleMarkdown = `# Welcome to Markdown
 
@@ -137,9 +138,114 @@ const jsonCode = `{
   }
 }`
 
+const richBlockParityMarkdown = `# Rich Block Interaction Parity
+
+Use this fixture to compare **inline** and **fullscreen** interactions for Mermaid and image blocks.
+
+- Tap/click inline content to open fullscreen
+- In fullscreen: wheel/pinch zoom, drag pan, double-click reset
+- Keyboard: Cmd/Ctrl +, -, 0
+
+## Mermaid block
+
+\`\`\`mermaid
+graph LR
+    A[Input] --> B{Validate}
+    B -->|Valid| C[Persist]
+    B -->|Invalid| D[Show Error]
+    C --> E[Notify]
+\`\`\`
+
+## Image block
+
+\`\`\`image-preview
+{
+  "title": "Parity Check",
+  "items": [
+    { "src": "/mock/images/gallery-1.png", "label": "Lake" },
+    { "src": "/mock/images/gallery-2.png", "label": "Forest" }
+  ]
+}
+\`\`\`
+`
+
 // Wrapper for collapsible markdown
 function CollapsibleWrapper({ children }: { children: React.ReactNode }) {
   return <CollapsibleMarkdownProvider>{children}</CollapsibleMarkdownProvider>
+}
+
+const MOCK_IMAGE_DATA: Record<string, string> = {
+  '/mock/images/gallery-1.png': 'https://picsum.photos/id/1015/1200/900',
+  '/mock/images/gallery-2.png': 'https://picsum.photos/id/1025/900/1200',
+  '/mock/images/gallery-3.png': 'https://picsum.photos/id/1035/1400/900',
+  '/mock/images/gallery-4.png': 'https://picsum.photos/id/1043/1200/900',
+  '/mock/images/gallery-5.png': 'https://picsum.photos/id/1067/1200/900',
+}
+
+function MarkdownImageBlockWrapper({ children }: { children: React.ReactNode }) {
+  return (
+    <PlatformProvider
+      actions={{
+        onReadFileDataUrl: async (path: string) => {
+          await new Promise((resolve) => setTimeout(resolve, 120))
+          const dataUrl = MOCK_IMAGE_DATA[path]
+          if (!dataUrl) {
+            throw new Error(`Mock image not found for: ${path}`)
+          }
+          return dataUrl
+        },
+      }}
+    >
+      {children}
+    </PlatformProvider>
+  )
+}
+
+function ImageCardStackPlayground({
+  items,
+  maxRotate,
+}: {
+  items: Array<{ src: string; label?: string; ratio?: number }> | string
+  maxRotate: number
+}) {
+  const parsedItems = React.useMemo(() => {
+    if (Array.isArray(items)) return items
+    if (typeof items === 'string') {
+      try {
+        const parsed = JSON.parse(items)
+        return Array.isArray(parsed) ? parsed : []
+      } catch {
+        return []
+      }
+    }
+    return []
+  }, [items])
+
+  const [currentIndex, setCurrentIndex] = React.useState(0)
+
+  React.useEffect(() => {
+    setCurrentIndex(0)
+  }, [parsedItems])
+
+  return (
+    <div className="h-full w-full p-4 flex flex-col gap-3">
+      <div className="text-xs text-muted-foreground flex items-center justify-between">
+        <span>Active card: {Math.min(currentIndex + 1, Math.max(parsedItems.length, 1))} / {parsedItems.length}</span>
+        <span>Swipe left/right on top card</span>
+      </div>
+      <div className="flex-1 min-h-0 rounded-md border border-border/60 bg-muted/20 p-4 flex items-center justify-center">
+        {parsedItems.length > 0 ? (
+          <div className="h-[320px] w-full">
+            <ImageCardStack items={parsedItems} currentIndex={currentIndex} onIndexChange={setCurrentIndex} maxRotate={maxRotate} maxHeight={320} />
+          </div>
+        ) : (
+          <div className="h-full w-full flex items-center justify-center text-sm text-muted-foreground">
+            Invalid or empty items JSON
+          </div>
+        )}
+      </div>
+    </div>
+  )
 }
 
 export const markdownComponents: ComponentEntry[] = [
@@ -409,5 +515,170 @@ export const markdownComponents: ComponentEntry[] = [
         props: { code: '{ invalid json here' },
       },
     ],
+  },
+  {
+    id: 'image-card-stack',
+    name: 'ImageCardStack',
+    category: 'Markdown',
+    description: 'Swipeable card stack used for image gallery previews.',
+    component: ImageCardStackPlayground,
+    layout: 'full',
+    props: [
+      {
+        name: 'items',
+        description: 'Gallery items with optional aspect ratio values (width/height).',
+        control: { type: 'textarea', rows: 10 },
+        defaultValue: JSON.stringify([
+          { src: MOCK_IMAGE_DATA['/mock/images/gallery-1.png'], label: 'Lake', ratio: 4 / 3 },
+          { src: MOCK_IMAGE_DATA['/mock/images/gallery-2.png'], label: 'Forest', ratio: 3 / 4 },
+          { src: MOCK_IMAGE_DATA['/mock/images/gallery-3.png'], label: 'Sunset', ratio: 16 / 9 },
+        ], null, 2),
+      },
+      {
+        name: 'maxRotate',
+        description: 'Maximum baseline random card rotation in degrees.',
+        control: { type: 'number', min: 0, max: 16, step: 1 },
+        defaultValue: 5,
+      },
+    ],
+    variants: [
+      {
+        name: 'Mixed Ratios',
+        props: {
+          items: JSON.stringify([
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-1.png'], label: 'Lake', ratio: 4 / 3 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-2.png'], label: 'Forest', ratio: 3 / 4 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-3.png'], label: 'Sunset', ratio: 16 / 9 },
+          ], null, 2),
+          maxRotate: 5,
+        },
+      },
+      {
+        name: 'Large Gallery',
+        props: {
+          items: JSON.stringify([
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-1.png'], label: 'Shot 1', ratio: 4 / 3 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-2.png'], label: 'Shot 2', ratio: 4 / 3 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-3.png'], label: 'Shot 3', ratio: 16 / 9 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-4.png'], label: 'Shot 4', ratio: 3 / 4 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-5.png'], label: 'Shot 5', ratio: 4 / 3 },
+          ], null, 2),
+          maxRotate: 7,
+        },
+      },
+      {
+        name: 'Subtle Rotation',
+        props: {
+          items: JSON.stringify([
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-1.png'], label: 'One', ratio: 4 / 3 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-2.png'], label: 'Two', ratio: 4 / 3 },
+            { src: MOCK_IMAGE_DATA['/mock/images/gallery-3.png'], label: 'Three', ratio: 4 / 3 },
+          ], null, 2),
+          maxRotate: 2,
+        },
+      },
+    ],
+  },
+  {
+    id: 'markdown-image-block',
+    name: 'MarkdownImageBlock',
+    category: 'Markdown',
+    description: 'Renders ```image-preview blocks with card-stack galleries and fullscreen overlay support.',
+    component: MarkdownImageBlock,
+    wrapper: MarkdownImageBlockWrapper,
+    layout: 'top',
+    props: [
+      {
+        name: 'code',
+        description: 'JSON spec for image-preview block.',
+        control: { type: 'textarea', rows: 12 },
+        defaultValue: JSON.stringify({
+          title: 'Image Gallery',
+          items: [
+            { src: '/mock/images/gallery-1.png', label: 'Lake', ratio: 4 / 3 },
+            { src: '/mock/images/gallery-2.png', label: 'Forest', ratio: 3 / 4 },
+            { src: '/mock/images/gallery-3.png', label: 'Sunset', ratio: 16 / 9 },
+          ],
+        }, null, 2),
+      },
+    ],
+    variants: [
+      {
+        name: 'Single Image',
+        props: {
+          code: JSON.stringify({
+            title: 'Single Image',
+            src: '/mock/images/gallery-1.png',
+          }, null, 2),
+        },
+      },
+      {
+        name: 'Gallery Stack',
+        props: {
+          code: JSON.stringify({
+            title: 'Gallery Stack',
+            items: [
+              { src: '/mock/images/gallery-1.png', label: 'Lake', ratio: 4 / 3 },
+              { src: '/mock/images/gallery-2.png', label: 'Forest', ratio: 3 / 4 },
+              { src: '/mock/images/gallery-3.png', label: 'Sunset', ratio: 16 / 9 },
+              { src: '/mock/images/gallery-4.png', label: 'City', ratio: 4 / 3 },
+            ],
+          }, null, 2),
+        },
+      },
+      {
+        name: 'Unknown Path Error',
+        props: {
+          code: JSON.stringify({
+            title: 'Missing Image',
+            items: [
+              { src: '/mock/images/gallery-1.png', label: 'Found' },
+              { src: '/mock/images/does-not-exist.png', label: 'Missing' },
+            ],
+          }, null, 2),
+        },
+      },
+      {
+        name: 'Invalid JSON (Fallback)',
+        props: { code: '{ invalid json here' },
+      },
+    ],
+  },
+  {
+    id: 'rich-block-interaction-parity',
+    name: 'RichBlockInteractionParity',
+    category: 'Markdown',
+    description: 'Single playground fixture to verify inline + fullscreen interaction parity across Mermaid and image-preview blocks.',
+    component: Markdown,
+    wrapper: MarkdownImageBlockWrapper,
+    layout: 'top',
+    props: [
+      {
+        name: 'children',
+        description: 'Markdown fixture for parity checks',
+        control: { type: 'textarea', rows: 20 },
+        defaultValue: richBlockParityMarkdown,
+      },
+      {
+        name: 'mode',
+        description: 'Render mode controlling formatting level',
+        control: {
+          type: 'select',
+          options: [
+            { label: 'Terminal', value: 'terminal' },
+            { label: 'Minimal', value: 'minimal' },
+            { label: 'Full', value: 'full' },
+          ],
+        },
+        defaultValue: 'full',
+      },
+    ],
+    variants: [
+      { name: 'Parity Fixture', props: { children: richBlockParityMarkdown, mode: 'full' } },
+    ],
+    mockData: () => ({
+      onUrlClick: (url: string) => console.log('[Playground] URL clicked:', url),
+      onFileClick: (path: string) => console.log('[Playground] File clicked:', path),
+    }),
   },
 ]

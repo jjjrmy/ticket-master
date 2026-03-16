@@ -62,7 +62,8 @@ export default function SkillInfoPage({ skillSlug, workspaceId }: SkillInfoPageP
     loadSkill()
 
     // Subscribe to skill changes
-    const unsubscribe = window.electronAPI.onSkillsChanged?.((skills) => {
+    const unsubscribe = window.electronAPI.onSkillsChanged?.((changedWorkspaceId, skills) => {
+      if (changedWorkspaceId !== workspaceId) return
       const updated = skills.find((s) => s.slug === skillSlug)
       if (updated) {
         setSkill(updated)
@@ -182,6 +183,11 @@ export default function SkillInfoPage({ skillSlug, workspaceId }: SkillInfoPageP
                   {formatPath(skill.path)}
                 </button>
               </Info_Table.Row>
+              {skill.metadata.requiredSources && skill.metadata.requiredSources.length > 0 && (
+                <Info_Table.Row label="Required Sources">
+                  {skill.metadata.requiredSources.join(', ')}
+                </Info_Table.Row>
+              )}
             </Info_Table>
           </Info_Section>
 

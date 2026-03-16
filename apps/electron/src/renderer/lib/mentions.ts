@@ -11,6 +11,7 @@
 import type { ContentBadge } from '@craft-agent/core'
 import type { MentionItemType } from '@/components/ui/mention-menu'
 import type { LoadedSkill, LoadedSource } from '../../shared/types'
+import { AGENTS_PLUGIN_NAME } from '@craft-agent/shared/skills/types'
 import { getSourceIconSync, getSkillIconSync } from './icon-cache'
 
 // Import and re-export parsing functions from shared (pure string operations, no renderer deps)
@@ -209,19 +210,23 @@ export function extractBadges(
   const sourceSlugs = sources.map(s => s.config.slug)
   const matches = findMentionMatches(text, skillSlugs, sourceSlugs)
 
+  // Build lookup maps to avoid linear scans per match
+  const skillsBySlug = new Map(skills.map(s => [s.slug, s]))
+  const sourcesBySlug = new Map(sources.map(s => [s.config.slug, s]))
+
   return matches.map(match => {
     let label = match.id
     let iconDataUrl: string | undefined
     let filePath: string | undefined
 
     if (match.type === 'skill') {
-      const skill = skills.find(s => s.slug === match.id)
+      const skill = skillsBySlug.get(match.id)
       label = skill?.metadata.name || match.id
 
       // Get cached icon as data URL (preserves mime type for SVG, PNG, etc.)
       iconDataUrl = getSkillIconSync(workspaceId, match.id) ?? undefined
     } else if (match.type === 'source') {
-      const source = sources.find(s => s.config.slug === match.id)
+      const source = sourcesBySlug.get(match.id)
       label = source?.config.name || match.id
 
       // Get cached icon as data URL (preserves mime type for SVG, PNG, etc.)
@@ -236,12 +241,14 @@ export function extractBadges(
       filePath = match.id
     }
 
-    // For skills, create fully-qualified rawText (workspaceId:slug) so the agent
-    // receives the correct format for the SDK's Skill tool. The SDK requires
-    // fully-qualified names to resolve skills. Display label stays as the friendly name.
+    // For skills, create fully-qualified rawText (pluginName:slug) so the agent
+    // receives the correct format for the SDK's Skill tool. Plugin name depends
+    // on which tier the skill came from: workspace → workspaceId, project/global → AGENTS_PLUGIN_NAME
     let rawText = match.fullMatch
     if (match.type === 'skill') {
-      rawText = `[skill:${workspaceId}:${match.id}]`
+      const skill = skillsBySlug.get(match.id)
+      const pluginName = skill?.source === 'workspace' ? workspaceId : AGENTS_PLUGIN_NAME
+      rawText = `[skill:${pluginName}:${match.id}]`
     }
 
     return {

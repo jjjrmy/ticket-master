@@ -42,6 +42,7 @@ const componentSpecificSections: ShortcutSection[] = [
     shortcuts: [
       { keys: ['Enter'], description: 'Focus chat input' },
       { keys: ['Right-click'], description: 'Open context menu' },
+      { keys: [isMac ? '⌥' : 'Alt', 'Click'], description: 'Add filter as excluded' },
     ],
   },
   {
@@ -56,7 +57,7 @@ const componentSpecificSections: ShortcutSection[] = [
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-[11px] font-medium font-sans bg-muted border border-border rounded shadow-sm">
+    <kbd className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-[11px] font-medium font-sans bg-muted border border-border rounded">
       {children}
     </kbd>
   )

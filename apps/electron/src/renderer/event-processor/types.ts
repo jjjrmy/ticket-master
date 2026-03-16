@@ -5,7 +5,7 @@
  * All agent events flow through a single pure function for consistent state transitions.
  */
 
-import type { Session, Message, PermissionRequest, CredentialRequest, TypedError, PermissionMode, TodoState, AuthRequest, ToolDisplayMeta } from '../../shared/types'
+import type { Session, Message, PermissionRequest, CredentialRequest, TypedError, PermissionMode, SessionStatus, AuthRequest, ToolDisplayMeta } from '../../shared/types'
 
 /**
  * Streaming state for a session - replaces streamingTextRef
@@ -44,6 +44,10 @@ export interface TextCompleteEvent {
   turnId?: string
   isIntermediate?: boolean
   parentToolUseId?: string
+  /** Timestamp from main process for consistent ordering with session.jsonl */
+  timestamp?: number
+  /** Authoritative message ID from main process for persistence/branching parity */
+  messageId?: string
 }
 
 /**
@@ -78,6 +82,8 @@ export interface ToolResultEvent {
   isError?: boolean
   turnId?: string
   parentToolUseId?: string
+  /** Timestamp from main process for consistent ordering */
+  timestamp?: number
 }
 
 /**
@@ -102,6 +108,8 @@ export interface ErrorEvent {
   title?: string
   details?: string
   original?: string
+  /** Timestamp from main process for consistent ordering */
+  timestamp?: number
 }
 
 /**
@@ -135,10 +143,10 @@ export interface LabelsChangedEvent {
 /**
  * Todo state changed event (external metadata change or agent tool)
  */
-export interface TodoStateChangedEvent {
-  type: 'todo_state_changed'
+export interface SessionStatusChangedEvent {
+  type: 'session_status_changed'
   sessionId: string
-  todoState?: string
+  sessionStatus?: string
 }
 
 /**
@@ -192,6 +200,8 @@ export interface TypedErrorEvent {
   type: 'typed_error'
   sessionId: string
   error: TypedError
+  /** Timestamp from main process for consistent ordering */
+  timestamp?: number
 }
 
 /**
@@ -202,6 +212,8 @@ export interface StatusEvent {
   sessionId: string
   message: string
   statusType?: 'compacting'
+  /** Timestamp from main process for consistent ordering */
+  timestamp?: number
 }
 
 /**
@@ -213,6 +225,8 @@ export interface InfoEvent {
   message: string
   statusType?: 'compaction_complete'
   level?: 'info' | 'warning' | 'error' | 'success'
+  /** Timestamp from main process for consistent ordering */
+  timestamp?: number
 }
 
 /**
@@ -221,7 +235,9 @@ export interface InfoEvent {
 export interface InterruptedEvent {
   type: 'interrupted'
   sessionId: string
-  message: Message
+  message?: Message
+  /** Messages that were queued but not processed — should be restored to input field */
+  queuedMessages?: string[]
 }
 
 /**
@@ -271,6 +287,11 @@ export interface PermissionModeChangedEvent {
   type: 'permission_mode_changed'
   sessionId: string
   permissionMode: PermissionMode
+  previousPermissionMode?: PermissionMode
+  transitionDisplay?: string
+  modeVersion?: number
+  changedAt?: string
+  changedBy?: 'user' | 'system' | 'restore' | 'automation' | 'unknown'
 }
 
 /**
@@ -289,6 +310,7 @@ export interface LLMConnectionChangedEvent {
   type: 'connection_changed'
   sessionId: string
   connectionSlug: string
+  supportsBranching?: boolean
 }
 
 /**
@@ -336,6 +358,20 @@ export interface TaskProgressEvent {
 }
 
 /**
+ * Task completed event - background task finished execution
+ * Updates the tool message status and result when a background task completes.
+ */
+export interface TaskCompletedEvent {
+  type: 'task_completed'
+  sessionId: string
+  taskId: string
+  status: 'completed' | 'failed' | 'stopped'
+  outputFile?: string
+  summary?: string
+  turnId?: string
+}
+
+/**
  * User message event - backend confirmation of optimistic user message
  * Used for optimistic UI: frontend shows message immediately,
  * backend confirms/updates status via this event
@@ -347,6 +383,16 @@ export interface UserMessageEvent {
   status: 'accepted' | 'queued' | 'processing'
   /** Frontend's optimistic message ID for reliable matching */
   optimisticMessageId?: string
+}
+
+/**
+ * Message annotation update event
+ */
+export interface MessageAnnotationsUpdatedEvent {
+  type: 'message_annotations_updated'
+  sessionId: string
+  messageId: string
+  annotations: NonNullable<Message['annotations']>
 }
 
 /**
@@ -415,22 +461,6 @@ export interface UsageUpdateEvent {
 }
 
 /**
- * Codex turn/plan/updated notification - task list updates
- * Synthesized into TodoWrite tool messages for TurnCard display
- */
-export interface TodosUpdatedEvent {
-  type: 'todos_updated'
-  sessionId: string
-  todos: Array<{
-    content: string
-    status: 'pending' | 'in_progress' | 'completed'
-    activeForm?: string
-  }>
-  turnId?: string
-  explanation?: string | null
-}
-
-/**
  * Union of all agent events
  */
 export type AgentEvent =
@@ -445,7 +475,7 @@ export type AgentEvent =
   | CredentialRequestEvent
   | SourcesChangedEvent
   | LabelsChangedEvent
-  | TodoStateChangedEvent
+  | SessionStatusChangedEvent
   | SessionFlaggedEvent
   | SessionUnflaggedEvent
   | SessionArchivedEvent
@@ -465,14 +495,15 @@ export type AgentEvent =
   | TaskBackgroundedEvent
   | ShellBackgroundedEvent
   | TaskProgressEvent
+  | TaskCompletedEvent
   | UserMessageEvent
+  | MessageAnnotationsUpdatedEvent
   | SessionSharedEvent
   | SessionUnsharedEvent
   | AuthRequestEvent
   | AuthCompletedEvent
   | SourceActivatedEvent
   | UsageUpdateEvent
-  | TodosUpdatedEvent
 
 /**
  * Side effects that need to be handled outside the pure processor
@@ -481,8 +512,9 @@ export type Effect =
   | { type: 'permission_request'; request: PermissionRequest }
   | { type: 'credential_request'; request: CredentialRequest }
   | { type: 'generate_title'; sessionId: string; userMessage: string }
-  | { type: 'permission_mode_changed'; sessionId: string; permissionMode: PermissionMode }
+  | { type: 'permission_mode_changed'; sessionId: string; permissionMode: PermissionMode; previousPermissionMode?: PermissionMode; transitionDisplay?: string; modeVersion?: number; changedAt?: string; changedBy?: 'user' | 'system' | 'restore' | 'automation' | 'unknown' }
   | { type: 'auto_retry'; sessionId: string; originalMessage: string; sourceSlug: string }
+  | { type: 'restore_input'; text: string }
 
 /**
  * Result of processing an event

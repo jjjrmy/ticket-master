@@ -37,6 +37,8 @@ export type McpClientConfig = HttpMcpClientConfig | StdioMcpClientConfig;
  * Sensitive environment variables that should NOT be passed to MCP subprocesses.
  * These could contain API keys, tokens, or credentials that MCP servers don't need
  * and shouldn't have access to.
+ * NOTE: This list is duplicated in packages/session-tools-core/src/handlers/transform-data.ts (BLOCKED_ENV_VARS).
+ * If you add a new entry here, update it there too.
  */
 const BLOCKED_ENV_VARS = [
   // Craft Agent auth (set by the app itself)
@@ -56,6 +58,16 @@ const BLOCKED_ENV_VARS = [
   'STRIPE_SECRET_KEY',
   'NPM_TOKEN',
 ];
+
+/**
+ * Interface for clients managed by McpClientPool.
+ * Both CraftMcpClient (remote MCP sources) and ApiSourcePoolClient (API sources) implement this.
+ */
+export interface PoolClient {
+  listTools(): Promise<Tool[]>;
+  callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
+  close(): Promise<void>;
+}
 
 export class CraftMcpClient {
   private client: Client;

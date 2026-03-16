@@ -13,7 +13,7 @@ import type {
   TypedErrorEvent,
   SourcesChangedEvent,
   LabelsChangedEvent,
-  TodoStateChangedEvent,
+  SessionStatusChangedEvent,
   SessionFlaggedEvent,
   SessionUnflaggedEvent,
   SessionArchivedEvent,
@@ -33,12 +33,13 @@ import type {
   SessionModelChangedEvent,
   LLMConnectionChangedEvent,
   UserMessageEvent,
+  MessageAnnotationsUpdatedEvent,
   SessionSharedEvent,
   SessionUnsharedEvent,
   AuthRequestEvent,
   AuthCompletedEvent,
   UsageUpdateEvent,
-  TodosUpdatedEvent,
+  Effect,
 } from '../types'
 import type { Message } from '../../../shared/types'
 import { generateMessageId, appendMessage } from '../helpers'
@@ -55,16 +56,26 @@ export function handleComplete(
 ): ProcessResult {
   const { session } = state
 
-  // Fail-safe: mark any running tools as complete
+  // Fail-safe: mark any non-terminal tools as complete.
+  // Catches 'executing' (normal) and 'backgrounded' (spurious — e.g. foreground Agent
+  // whose result contained agentId:). Genuinely backgrounded tasks have isBackground=true
+  // AND a taskId, so they're excluded — task_completed will finalize them.
+  const TERMINAL_TOOL_STATUSES = new Set(['completed', 'error'])
   let updatedMessages = session.messages
   const hasRunningTools = session.messages.some(
-    m => m.role === 'tool' && m.toolStatus === 'executing'
+    m => m.role === 'tool'
+      && !TERMINAL_TOOL_STATUSES.has(m.toolStatus ?? '')
+      && !(m.isBackground && m.taskId)  // Don't force-complete genuine background tasks
   )
 
   if (hasRunningTools) {
     updatedMessages = session.messages.map(m => {
-      if (m.role === 'tool' && m.toolStatus === 'executing') {
-        return { ...m, toolStatus: 'completed' as const }
+      if (
+        m.role === 'tool'
+        && !TERMINAL_TOOL_STATUSES.has(m.toolStatus ?? '')
+        && !(m.isBackground && m.taskId)
+      ) {
+        return { ...m, toolStatus: 'completed' as const, toolResult: m.toolResult ?? '' }
       }
       return m
     })
@@ -109,7 +120,7 @@ export function handleError(
     id: generateMessageId(),
     role: 'error',
     content: event.error,
-    timestamp: Date.now(),
+    timestamp: event.timestamp ?? Date.now(),
   }
 
   return {
@@ -148,7 +159,7 @@ export function handleTypedError(
     content: event.error.title
       ? `${event.error.title}: ${event.error.message}`
       : event.error.message,
-    timestamp: Date.now(),
+    timestamp: event.timestamp ?? Date.now(),
     errorCode: event.error.code,
     errorTitle: event.error.title,
     errorDetails: event.error.details,
@@ -184,7 +195,7 @@ export function handleStatus(
     id: generateMessageId(),
     role: 'status',
     content: event.message,
-    timestamp: Date.now(),
+    timestamp: event.timestamp ?? Date.now(),
     statusType: event.statusType,
   }
 
@@ -240,7 +251,7 @@ export function handleInfo(
     id: generateMessageId(),
     role: 'info',
     content: event.message,
-    timestamp: Date.now(),
+    timestamp: event.timestamp ?? Date.now(),
     infoLevel: event.level,
   }
 
@@ -257,19 +268,24 @@ export function handleInfo(
  * Handle interrupted - agent was interrupted
  * When message is provided, it's a user-initiated stop (shows "Response interrupted")
  * When message is omitted, it's a silent redirect (user sent new message while processing)
+ * When queuedMessages is provided, those messages were waiting to be processed and should
+ * be restored to the input field (the corresponding user bubbles are removed from the chat).
  */
 export function handleInterrupted(
   state: SessionState,
   event: InterruptedEvent
 ): ProcessResult {
   const { session } = state
+  const effects: Effect[] = []
 
   // Clear transient streaming state (isPending, isStreaming) and mark running tools as interrupted
   // These fields are not persisted, so this matches the state after a reload
   // Also filter out status messages - they are transient UI state that shouldn't persist after interruption
   // (similar to isPending/isStreaming, and they're not persisted to disk anyway)
+  // Also remove queued user messages — they are being restored to the input field
   const updatedMessages = session.messages
     .filter(m => m.role !== 'status')  // Remove transient status messages
+    .filter(m => !m.isQueued)          // Remove queued user messages (restored to input)
     .map(m => {
       // Mark running tools as interrupted
       if (m.role === 'tool' && m.toolResult === undefined && m.toolStatus !== 'completed' && m.toolStatus !== 'error') {
@@ -287,6 +303,14 @@ export function handleInterrupted(
     ? [...updatedMessages, event.message]
     : updatedMessages
 
+  // Restore queued message text to the input field
+  if (event.queuedMessages && event.queuedMessages.length > 0) {
+    effects.push({
+      type: 'restore_input',
+      text: event.queuedMessages.join('\n\n'),
+    })
+  }
+
   return {
     state: {
       session: {
@@ -297,7 +321,7 @@ export function handleInterrupted(
       },
       streaming: null,
     },
-    effects: [],
+    effects,
   }
 }
 
@@ -399,6 +423,11 @@ export function handlePermissionModeChanged(
       type: 'permission_mode_changed',
       sessionId: event.sessionId,
       permissionMode: event.permissionMode,
+      previousPermissionMode: event.previousPermissionMode,
+      transitionDisplay: event.transitionDisplay,
+      modeVersion: event.modeVersion,
+      changedAt: event.changedAt,
+      changedBy: event.changedBy,
     }],
   }
 }
@@ -432,7 +461,11 @@ export function handleConnectionChanged(
 
   return {
     state: {
-      session: { ...session, llmConnection: event.connectionSlug },
+      session: {
+        ...session,
+        llmConnection: event.connectionSlug,
+        ...(event.supportsBranching !== undefined && { supportsBranching: event.supportsBranching }),
+      },
       streaming,
     },
     effects: [],
@@ -514,6 +547,31 @@ export function handleUserMessage(
 }
 
 /**
+ * Handle message_annotations_updated - update annotations on a specific message.
+ */
+export function handleMessageAnnotationsUpdated(
+  state: SessionState,
+  event: MessageAnnotationsUpdatedEvent
+): ProcessResult {
+  const { session, streaming } = state
+
+  return {
+    state: {
+      session: {
+        ...session,
+        messages: session.messages.map(m =>
+          m.id === event.messageId
+            ? { ...m, annotations: event.annotations }
+            : m
+        ),
+      },
+      streaming,
+    },
+    effects: [],
+  }
+}
+
+/**
  * Handle sources_changed - update session's enabled sources
  */
 export function handleSourcesChanged(
@@ -556,16 +614,16 @@ export function handleLabelsChanged(
 }
 
 /**
- * Handle todo_state_changed - update session's todoState (external metadata change or agent tool)
+ * Handle session_status_changed - update session's sessionStatus (external metadata change or agent tool)
  */
-export function handleTodoStateChanged(
+export function handleSessionStatusChanged(
   state: SessionState,
-  event: TodoStateChangedEvent
+  event: SessionStatusChangedEvent
 ): ProcessResult {
   const { session, streaming } = state
   return {
     state: {
-      session: { ...session, todoState: event.todoState },
+      session: { ...session, sessionStatus: event.sessionStatus },
       streaming,
     },
     effects: [],
@@ -849,41 +907,3 @@ export function handleUsageUpdate(
   }
 }
 
-/**
- * Handle todos_updated - Codex's turn/plan/updated notification
- *
- * Synthesizes a TodoWrite tool message so the existing turn-utils extraction
- * logic picks up the todos and displays them in TurnCard.
- */
-export function handleTodosUpdated(
-  state: SessionState,
-  event: TodosUpdatedEvent
-): ProcessResult {
-  const { session, streaming } = state
-
-  // Generate a unique tool use ID for this synthetic TodoWrite message
-  const toolUseId = `codex-plan-${event.turnId || Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-
-  // Create a synthetic TodoWrite tool message
-  // This is picked up by extractTodosFromActivities() in turn-utils.ts
-  const syntheticTodoMessage: Message = {
-    id: generateMessageId(),
-    role: 'tool',
-    content: event.explanation || 'Plan updated',
-    timestamp: Date.now(),
-    toolUseId,
-    toolName: 'TodoWrite',
-    toolInput: { todos: event.todos },
-    toolResult: 'Plan updated',
-    toolStatus: 'completed',
-    turnId: event.turnId,
-  }
-
-  return {
-    state: {
-      session: appendMessage(session, syntheticTodoMessage),
-      streaming,
-    },
-    effects: [],
-  }
-}

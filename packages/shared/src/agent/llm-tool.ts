@@ -1,19 +1,19 @@
 /**
  * LLM Tool (call_llm)
  *
- * Session-scoped tool that enables the main agent to invoke secondary Claude calls
+ * Session-scoped tool that enables the main agent to invoke secondary LLM calls
  * for specialized subtasks like summarization, classification, extraction, and analysis.
  *
  * Key features:
- * - Attachment-based file/image loading (agent passes paths, tool loads content)
+ * - Attachment-based file loading (agent passes paths, tool loads content)
  * - Line range support for large files
- * - Predefined output formats + custom JSON Schema
- * - Extended thinking mode for complex reasoning
+ * - Predefined output formats + custom JSON Schema (native structured output)
  * - Parallel execution support (multiple calls run simultaneously)
  * - Comprehensive validation with actionable error messages
+ *
+ * All calls are delegated to the agent backend's queryLlm() implementation.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
 import { tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
@@ -24,25 +24,70 @@ type ToolResult = {
 };
 import { readFile } from 'fs/promises';
 import { existsSync, statSync } from 'fs';
-import { getAnthropicApiKey, getAnthropicBaseUrl, getClaudeOAuthToken } from '../config/storage.ts';
+import path from 'node:path';
+import { getModelById, getDefaultSummarizationModel, MODEL_REGISTRY } from '../config/models.ts';
+
+// ============================================================================
+// QUERY INTERFACES (used by agent backends to implement queryFn)
+// ============================================================================
+
+/**
+ * Request passed to the agent-native queryFn callback.
+ * The prompt includes serialized file content (attachments are pre-processed by the tool).
+ */
+export interface LLMQueryRequest {
+  /** Full prompt including serialized file content */
+  prompt: string;
+  /** Optional system prompt */
+  systemPrompt?: string;
+  /** Model to use (validated against registry) */
+  model?: string;
+  /** Max output tokens */
+  maxTokens?: number;
+  /** Sampling temperature 0-1 */
+  temperature?: number;
+  /** Structured output JSON schema — backends handle natively when possible */
+  outputSchema?: Record<string, unknown>;
+}
+
+/**
+ * Result from an agent-native queryFn callback.
+ */
+export interface LLMQueryResult {
+  text: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+/**
+ * Unified timeout for secondary LLM calls (call_llm and mini-completion flows).
+ * Keep this consistent across backends to avoid model-specific timeout behavior.
+ */
+export const LLM_QUERY_TIMEOUT_MS = 120000;
+
+// ============================================================================
+// UTILITY: TIMEOUT HELPER
+// Races a promise against a timeout, cleaning up the timer on completion
+// ============================================================================
+
+export function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer!));
+}
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-
-const ALLOWED_MODELS = [
-  'claude-opus-4-6',
-  'claude-sonnet-4-5-20250929',
-  'claude-3-5-haiku-latest',
-  'claude-opus-4-5-20251101',
-] as const;
 
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
 
 // Limits - chosen to balance capability with reasonable resource usage
 const MAX_FILE_LINES = 2000;
 const MAX_FILE_BYTES = 500_000; // 500KB per text file
-const MAX_IMAGE_BYTES = 5_000_000; // 5MB per image
 const MAX_ATTACHMENTS = 20;
 const MAX_TOTAL_CONTENT_BYTES = 2_000_000; // 2MB total across all attachments
 
@@ -51,7 +96,7 @@ const MAX_TOTAL_CONTENT_BYTES = 2_000_000; // 2MB total across all attachments
 // These provide structured output schemas for common use cases
 // ============================================================================
 
-const OUTPUT_FORMATS = {
+export const OUTPUT_FORMATS = {
   summary: {
     type: 'object' as const,
     properties: {
@@ -106,6 +151,102 @@ const OUTPUT_FORMATS = {
     required: ['valid', 'errors', 'warnings'],
   },
 };
+
+// ============================================================================
+// SHARED PRE-EXECUTION PIPELINE (used by Codex/Copilot PreToolUse intercepts)
+// Validates input, processes attachments, resolves schema, builds LLMQueryRequest
+// ============================================================================
+
+export interface BuildCallLlmOptions {
+  /** Backend name for error messages (e.g., "Codex", "Copilot") */
+  backendName: string;
+  /** Optional model validation hook — return undefined to reject (falls back to default), or corrected model ID */
+  validateModel?: (resolvedModelId: string) => string | undefined;
+  /** Session directory for resolving relative attachment paths */
+  sessionPath?: string;
+}
+
+/**
+ * Shared pre-execution pipeline for call_llm PreToolUse intercepts.
+ * Validates input, processes attachments, resolves schema, and builds an LLMQueryRequest
+ * ready to be passed to the backend's queryLlm().
+ *
+ * Used by CodexAgent and CopilotAgent to avoid duplicating the same ~80 lines of logic.
+ */
+export async function buildCallLlmRequest(
+  input: Record<string, unknown>,
+  options: BuildCallLlmOptions
+): Promise<LLMQueryRequest> {
+  const prompt = input.prompt as string;
+  if (!prompt?.trim()) {
+    throw new Error('Prompt is required and cannot be empty.');
+  }
+
+  // Process attachments
+  const textParts: string[] = [];
+  const attachments = input.attachments as Array<string | { path: string; startLine?: number; endLine?: number }> | undefined;
+
+  if (attachments?.length) {
+    for (let i = 0; i < attachments.length; i++) {
+      const result = await processAttachment(attachments[i]!, i, options.sessionPath);
+      if (result.type === 'error') {
+        throw new Error(result.message);
+      }
+      if (result.type === 'image') {
+        throw new Error(
+          `Attachment ${i + 1}: Image attachments are not supported in ${options.backendName} mode. Use text files only.`
+        );
+      }
+      if (result.type === 'text') {
+        textParts.push(`<file path="${result.filename}">\n${result.content}\n</file>`);
+      }
+    }
+  }
+
+  textParts.push(prompt);
+
+  // Resolve model against registry, with optional backend-specific validation
+  let model = input.model as string | undefined;
+  if (model) {
+    const modelDef = getModelById(model)
+      || MODEL_REGISTRY.find(m => m.shortName.toLowerCase() === model!.toLowerCase())
+      || MODEL_REGISTRY.find(m => m.name.toLowerCase() === model!.toLowerCase());
+    if (modelDef) {
+      model = modelDef.id;
+    }
+
+    // Backend-specific model validation (e.g., Codex rejects non-OpenAI models)
+    if (options.validateModel) {
+      model = options.validateModel(model) ?? undefined;
+    }
+  }
+
+  // Build system prompt with structured output injection if needed
+  let systemPrompt = (input.systemPrompt as string) || '';
+  const outputFormat = input.outputFormat as string | undefined;
+  const outputSchema = input.outputSchema as Record<string, unknown> | undefined;
+
+  let schema: Record<string, unknown> | null = null;
+  if (outputSchema) {
+    schema = outputSchema;
+  } else if (outputFormat && OUTPUT_FORMATS[outputFormat as keyof typeof OUTPUT_FORMATS]) {
+    schema = OUTPUT_FORMATS[outputFormat as keyof typeof OUTPUT_FORMATS];
+  }
+
+  if (schema) {
+    const schemaJson = JSON.stringify(schema, null, 2);
+    systemPrompt += `${systemPrompt ? '\n\n' : ''}You MUST respond with valid JSON matching this schema:\n${schemaJson}\n\nRespond with ONLY the JSON object, no other text or markdown formatting.`;
+  }
+
+  return {
+    prompt: textParts.join('\n\n'),
+    systemPrompt: systemPrompt || undefined,
+    model,
+    maxTokens: input.maxTokens as number | undefined,
+    temperature: input.temperature as number | undefined,
+    outputSchema: schema ?? undefined,
+  };
+}
 
 // ============================================================================
 // HELPER: ERROR RESPONSE
@@ -196,16 +337,22 @@ type AttachmentResult =
   | { type: 'image'; base64: string; mediaType: string }
   | { type: 'error'; message: string };
 
-async function processAttachment(
+export async function processAttachment(
   input: string | AttachmentInput,
-  index: number
+  index: number,
+  basePath?: string,
 ): Promise<AttachmentResult> {
   // Normalize input to AttachmentInput format
   const attachment: AttachmentInput = typeof input === 'string'
     ? { path: input }
     : input;
 
-  const { path: filePath, startLine, endLine } = attachment;
+  let { path: filePath, startLine, endLine } = attachment;
+
+  // Resolve relative paths against basePath (session directory)
+  if (basePath && filePath && !path.isAbsolute(filePath) && !filePath.startsWith('~')) {
+    filePath = path.resolve(basePath, filePath);
+  }
   const filename = filePath.split('/').pop() || filePath;
   const safeFilename = escapeXml(filename); // Escape for use in XML-like tags
 
@@ -269,9 +416,10 @@ async function processAttachment(
 
   // --- Process image ---
   if (isImage) {
-    if (stats.size > MAX_IMAGE_BYTES) {
+    const maxImageBytes = 5_000_000; // 5MB
+    if (stats.size > maxImageBytes) {
       const sizeMB = (stats.size / 1_000_000).toFixed(1);
-      return { type: 'error', message: `Attachment ${index + 1}: Image too large (${sizeMB}MB, max ${MAX_IMAGE_BYTES / 1_000_000}MB): ${safeFilename}` };
+      return { type: 'error', message: `Attachment ${index + 1}: Image too large (${sizeMB}MB, max ${maxImageBytes / 1_000_000}MB): ${safeFilename}` };
     }
 
     try {
@@ -396,6 +544,14 @@ const OutputSchemaParam = z.object({
 
 export interface LLMToolOptions {
   sessionId: string;
+  /** Session directory for resolving relative attachment paths */
+  sessionPath?: string;
+  /**
+   * Lazy resolver for the agent-native query callback.
+   * Called at execution time to get the current callback from the session registry.
+   * Each backend implements queryLlm() with native structured output support.
+   */
+  getQueryFn: () => ((request: LLMQueryRequest) => Promise<LLMQueryResult>) | undefined;
 }
 
 export function createLLMTool(options: LLMToolOptions) {
@@ -404,24 +560,24 @@ export function createLLMTool(options: LLMToolOptions) {
 
   return tool(
     'call_llm',
-    `Invoke a secondary Claude model for focused subtasks. Use for:
-- Cost optimization: haiku for simple tasks (summarization, classification)
-- Structured output: guaranteed JSON schema compliance
-- Extended thinking: deep reasoning for specific subtasks
+    `Invoke a secondary LLM for focused subtasks. Use for:
+- Cost optimization: use a smaller model for simple tasks (summarization, classification)
+- Structured output: JSON schema compliance via native backend support
 - Parallel processing: call multiple times in one message - all run simultaneously
 - Context isolation: process content without polluting main context
 
-Pass file paths via 'attachments' - the tool loads content automatically.
+Put text/content directly in the 'prompt' parameter. Do NOT pass inline text via attachments.
+Only use 'attachments' for existing file paths on disk - the tool loads file content automatically.
 For large files (>2000 lines), use {path, startLine, endLine} to select a portion.`,
     {
       prompt: z.string().min(1, 'Prompt cannot be empty')
-        .describe('Instructions for Claude'),
+        .describe('Instructions for the LLM'),
 
       attachments: z.array(AttachmentSchema).max(MAX_ATTACHMENTS).optional()
-        .describe(`File/image paths (max ${MAX_ATTACHMENTS}). Use {path, startLine, endLine} for large text files.`),
+        .describe(`File paths on disk (max ${MAX_ATTACHMENTS}). NOT for inline text — put text in prompt instead. Use {path, startLine, endLine} for large files.`),
 
-      model: z.enum(ALLOWED_MODELS).optional()
-        .describe('Model to use. Defaults to claude-3-5-haiku-latest'),
+      model: z.string().optional()
+        .describe('Model ID or short name (e.g., "haiku", "sonnet"). Defaults to a fast model.'),
 
       systemPrompt: z.string().optional()
         .describe('Optional system prompt'),
@@ -430,40 +586,21 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
         .describe('Max output tokens (1-64000). Defaults to 4096'),
 
       temperature: z.number().min(0).max(1).optional()
-        .describe('Sampling temperature 0-1. Ignored if thinking=true (forced to 1)'),
-
-      thinking: z.boolean().optional()
-        .describe('Enable extended thinking. Incompatible with outputFormat/outputSchema'),
-
-      thinkingBudget: z.number().int().min(1024).max(100000).optional()
-        .describe('Token budget for thinking (1024-100000). Defaults to 10000'),
+        .describe('Sampling temperature 0-1'),
 
       outputFormat: z.enum(['summary', 'classification', 'extraction', 'analysis', 'comparison', 'validation']).optional()
-        .describe('Predefined output format. Incompatible with thinking'),
+        .describe('Predefined output format'),
 
       outputSchema: OutputSchemaParam.optional()
-        .describe('Custom JSON Schema. Incompatible with thinking'),
+        .describe('Custom JSON Schema for structured output'),
     },
     async (args) => {
       // ========================================
       // VALIDATION PHASE
-      // Fail fast with clear, actionable error messages
       // ========================================
 
-      // --- Validate prompt ---
       if (!args.prompt?.trim()) {
         return errorResponse('Prompt is required and cannot be empty.');
-      }
-
-      // --- Validate mutual exclusions ---
-      if (args.thinking && (args.outputFormat || args.outputSchema)) {
-        return errorResponse(
-          'Cannot use thinking with structured output.\n\n' +
-          'Options:\n' +
-          '1. Remove thinking=true to use outputFormat/outputSchema\n' +
-          '2. Remove outputFormat/outputSchema to use thinking\n\n' +
-          'These features use incompatible API modes.'
-        );
       }
 
       if (args.outputFormat && args.outputSchema) {
@@ -475,68 +612,57 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
         );
       }
 
-      // --- Validate thinking params ---
-      if (args.thinkingBudget && !args.thinking) {
-        return errorResponse(
-          'thinkingBudget requires thinking=true.\n\n' +
-          'Add thinking=true to enable extended thinking, or remove thinkingBudget.'
-        );
-      }
-
-      // --- Validate model + thinking compatibility ---
-      if (args.thinking && args.model === 'claude-3-5-haiku-latest') {
-        return errorResponse(
-          'Extended thinking not supported on Haiku.\n\n' +
-          'Use claude-sonnet-4-5-20250929 or claude-opus-4-6 for thinking mode.'
-        );
+      // --- Validate and resolve model against registry ---
+      if (args.model) {
+        let modelDef = getModelById(args.model);
+        if (!modelDef) {
+          modelDef = MODEL_REGISTRY.find(m => m.shortName.toLowerCase() === args.model!.toLowerCase())
+            || MODEL_REGISTRY.find(m => m.name.toLowerCase() === args.model!.toLowerCase());
+          if (modelDef) {
+            args.model = modelDef.id;
+          } else {
+            const available = MODEL_REGISTRY.map(m => `  - ${m.id} (${m.shortName})`).join('\n');
+            return errorResponse(
+              `Unknown model: "${args.model}"\n\n` +
+              `Available models:\n${available}`
+            );
+          }
+        }
       }
 
       // ========================================
-      // AUTHENTICATION
+      // RESOLVE QUERY FUNCTION
       // ========================================
 
-      const apiKey = await getAnthropicApiKey();
-      const oauthToken = await getClaudeOAuthToken();
+      const queryFn = options.getQueryFn();
 
-      if (!apiKey && !oauthToken) {
+      if (!queryFn) {
         return errorResponse(
-          'No authentication configured.\n\n' +
-          'Configure one of:\n' +
-          '1. Anthropic API key in settings\n' +
-          '2. Claude OAuth login'
-        );
-      }
-
-      // OAuth tokens cannot be used for direct API calls - Anthropic's API only accepts API keys
-      // The main agent works with OAuth because the Claude Code SDK has special internal handling,
-      // but the basic Anthropic SDK used here does not support OAuth authentication.
-      if (!apiKey && oauthToken) {
-        return errorResponse(
-          'call_llm requires an Anthropic API key.\n\n' +
-          'You are signed in with Claude OAuth (Max subscription), which works for the main agent ' +
-          'but cannot be used for secondary API calls.\n\n' +
-          'To use call_llm:\n' +
-          '1. Add an Anthropic API key in Settings → API Key\n' +
-          '2. The API key will be used only for call_llm subtasks\n\n' +
-          'Alternative: Use the Task tool to spawn subagents (works with OAuth).'
+          'No authentication configured for call_llm.\n\n' +
+          'Sign in with your AI provider to use this tool.'
         );
       }
 
       // ========================================
       // PROCESS ATTACHMENTS
-      // Load files/images and build message content
       // ========================================
 
-      const messageContent: Anthropic.MessageCreateParams['messages'][0]['content'] = [];
+      const textParts: string[] = [];
       let totalContentBytes = 0;
 
       if (args.attachments?.length) {
         for (let i = 0; i < args.attachments.length; i++) {
           const attachment = args.attachments[i]!;
-          const result = await processAttachment(attachment, i);
+          const result = await processAttachment(attachment, i, options.sessionPath);
 
           if (result.type === 'error') {
             return errorResponse(result.message);
+          }
+
+          if (result.type === 'image') {
+            return errorResponse(
+              `Attachment ${i + 1}: Image attachments are not supported. Use text files only.`
+            );
           }
 
           if (result.type === 'text') {
@@ -552,193 +678,39 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
               );
             }
 
-            messageContent.push({
-              type: 'text',
-              text: `<file path="${result.filename}">\n${result.content}\n</file>`,
-            });
-          }
-
-          if (result.type === 'image') {
-            messageContent.push({
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: result.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-                data: result.base64,
-              },
-            });
+            textParts.push(`<file path="${result.filename}">\n${result.content}\n</file>`);
           }
         }
       }
 
-      // Add the prompt as the final content block
-      messageContent.push({ type: 'text', text: args.prompt });
+      textParts.push(args.prompt);
 
       // ========================================
-      // BUILD CLIENT
+      // EXECUTE QUERY
       // ========================================
 
-      const baseUrl = getAnthropicBaseUrl();
-
-      // Build client with API key (OAuth-only case already handled above with clear error)
-      const client = new Anthropic({
-        apiKey: apiKey!,
-        ...(baseUrl ? { baseURL: baseUrl } : {}),
-      });
-
-      // ========================================
-      // BUILD REQUEST
-      // ========================================
-
-      const model = args.model || 'claude-3-5-haiku-latest';
-      const thinkingEnabled = args.thinking === true;
-      const thinkingBudget = thinkingEnabled ? (args.thinkingBudget || 10000) : 0;
-      const outputTokens = args.maxTokens || 4096;
-      // Extended thinking: max_tokens must cover both thinking AND output
-      const maxTokens = thinkingEnabled ? thinkingBudget + outputTokens : outputTokens;
-      // Extended thinking requires temperature=1
-      const temperature = thinkingEnabled ? 1 : args.temperature;
-
-      const request: Anthropic.MessageCreateParams = {
-        model,
-        max_tokens: maxTokens,
-        messages: [{ role: 'user', content: messageContent }],
-        ...(args.systemPrompt ? { system: args.systemPrompt } : {}),
-        ...(temperature !== undefined ? { temperature } : {}),
-      };
-
-      // Add thinking configuration
-      if (thinkingEnabled) {
-        request.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
-      }
-
-      // Add structured output via tool use pattern
-      // This is more broadly compatible than output_config
+      const model = args.model || getDefaultSummarizationModel();
       const schema = args.outputSchema || (args.outputFormat ? OUTPUT_FORMATS[args.outputFormat] : null);
-      if (schema) {
-        request.tools = [{
-          name: 'structured_output',
-          description: 'Output structured data matching the required schema',
-          input_schema: schema as Anthropic.Tool['input_schema'],
-        }];
-        request.tool_choice = { type: 'tool', name: 'structured_output' };
-      }
-
-      // ========================================
-      // EXECUTE API CALL
-      // ========================================
 
       try {
-        const response = await client.messages.create(request);
+        const result = await queryFn({
+          prompt: textParts.join('\n\n'),
+          systemPrompt: args.systemPrompt || undefined,
+          model,
+          maxTokens: args.maxTokens,
+          temperature: args.temperature,
+          outputSchema: schema ? (schema as Record<string, unknown>) : undefined,
+        });
 
-        // --- Structured output: extract from tool_use block ---
-        if (schema) {
-          const toolUse = response.content.find(
-            (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
-          );
-          if (toolUse) {
-            return {
-              content: [{ type: 'text' as const, text: JSON.stringify(toolUse.input, null, 2) }],
-            };
-          }
-          // Fallback if model didn't use tool (shouldn't happen with tool_choice)
-          return errorResponse('Structured output expected but model did not return tool_use block. Try rephrasing the prompt.');
-        }
-
-        // --- Thinking mode: extract thinking and text blocks ---
-        if (thinkingEnabled) {
-          const thinkingBlock = response.content.find(
-            (block): block is Anthropic.ThinkingBlock => block.type === 'thinking'
-          );
-          const textBlock = response.content.find(
-            (block): block is Anthropic.TextBlock => block.type === 'text'
-          );
-
-          const parts: string[] = [];
-          if (thinkingBlock) {
-            parts.push(`<thinking>\n${thinkingBlock.thinking}\n</thinking>`);
-          }
-          if (textBlock) {
-            parts.push(textBlock.text);
-          }
-
-          if (parts.length === 0) {
-            return errorResponse('Thinking mode returned no content. Try increasing thinkingBudget or simplifying the task.');
-          }
-
-          return { content: [{ type: 'text' as const, text: parts.join('\n\n') }] };
-        }
-
-        // --- Standard text response ---
-        const textContent = response.content
-          .filter((block): block is Anthropic.TextBlock => block.type === 'text')
-          .map(block => block.text)
-          .join('\n');
-
-        if (!textContent) {
+        if (!result.text) {
           return { content: [{ type: 'text' as const, text: '(Model returned empty response)' }] };
         }
 
-        return { content: [{ type: 'text' as const, text: textContent }] };
-
+        return { content: [{ type: 'text' as const, text: result.text }] };
       } catch (error) {
-        // ========================================
-        // ERROR HANDLING
-        // Provide context-aware error messages with recovery suggestions
-        // ========================================
-
-        if (error instanceof Anthropic.APIError) {
-          const status = error.status;
-          const message = error.message;
-
-          const parts = [`API Error (${status}): ${message}`];
-
-          switch (status) {
-            case 400:
-              if (message.includes('thinking')) {
-                parts.push('\nThinking mode issue. Try:\n- Use a supported model (Sonnet or Opus)\n- Reduce thinkingBudget\n- Remove thinking=true for this task');
-              } else if (message.includes('content') || message.includes('image')) {
-                parts.push('\nContent issue. Try:\n- Reduce attachment sizes with line ranges\n- Check file encodings (UTF-8 required)\n- Verify image format is supported (png, jpg, gif, webp)');
-              } else if (message.includes('tool')) {
-                parts.push('\nTool/schema issue. Try:\n- Simplify outputSchema\n- Use a predefined outputFormat instead');
-              }
-              break;
-
-            case 401:
-              parts.push('\nAuthentication failed.\n- Check API key is valid and not expired\n- Verify the key has not been revoked');
-              break;
-
-            case 403:
-              parts.push('\nAccess denied.\n- Check API key permissions\n- Verify model access on your plan');
-              break;
-
-            case 429:
-              parts.push('\nRate limited.\n- Reduce parallel call_llm calls\n- Wait a few seconds before retrying\n- Consider using haiku instead of sonnet/opus');
-              break;
-
-            case 500:
-            case 502:
-            case 503:
-              parts.push('\nAnthropic API temporarily unavailable.\n- Retry in a few seconds\n- Check status.anthropic.com for outages');
-              break;
-
-            case 529:
-              parts.push('\nAnthropic API overloaded.\n- Retry with exponential backoff\n- Reduce parallel calls\n- Try a less busy time');
-              break;
-          }
-
-          return errorResponse(parts.join(''));
-        }
-
-        // Non-API errors (network issues, etc.)
         if (error instanceof Error) {
-          if (error.message.includes('fetch') || error.message.includes('network')) {
-            return errorResponse(`Network error: ${error.message}\n\nCheck internet connection and try again.`);
-          }
-          return errorResponse(`Unexpected error: ${error.message}`);
+          return errorResponse(`call_llm failed: ${error.message}`);
         }
-
-        // Unknown error type - rethrow
         throw error;
       }
     }

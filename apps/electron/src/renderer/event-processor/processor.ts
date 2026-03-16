@@ -14,14 +14,14 @@
 
 import type { SessionState, AgentEvent, ProcessResult } from './types'
 import { handleTextDelta, handleTextComplete } from './handlers/text'
-import { handleToolStart, handleToolResult, handleTaskBackgrounded, handleShellBackgrounded, handleTaskProgress } from './handlers/tool'
+import { handleToolStart, handleToolResult, handleTaskBackgrounded, handleShellBackgrounded, handleTaskProgress, handleTaskCompleted } from './handlers/tool'
 import {
   handleComplete,
   handleError,
   handleTypedError,
   handleSourcesChanged,
   handleLabelsChanged,
-  handleTodoStateChanged,
+  handleSessionStatusChanged,
   handleSessionFlagged,
   handleSessionUnflagged,
   handleSessionArchived,
@@ -41,12 +41,12 @@ import {
   handleSessionModelChanged,
   handleConnectionChanged,
   handleUserMessage,
+  handleMessageAnnotationsUpdated,
   handleSessionShared,
   handleSessionUnshared,
   handleAuthRequest,
   handleAuthCompleted,
   handleUsageUpdate,
-  handleTodosUpdated,
 } from './handlers/session'
 
 /**
@@ -99,6 +99,11 @@ export function processEvent(
       return { state: newState, effects: [] }
     }
 
+    case 'task_completed': {
+      const newState = handleTaskCompleted(state, event)
+      return { state: newState, effects: [] }
+    }
+
     case 'complete':
       return handleComplete(state, event)
 
@@ -144,8 +149,8 @@ export function processEvent(
     case 'labels_changed':
       return handleLabelsChanged(state, event)
 
-    case 'todo_state_changed':
-      return handleTodoStateChanged(state, event)
+    case 'session_status_changed':
+      return handleSessionStatusChanged(state, event)
 
     case 'session_flagged':
       return handleSessionFlagged(state, event)
@@ -174,6 +179,9 @@ export function processEvent(
     case 'user_message':
       return handleUserMessage(state, event)
 
+    case 'message_annotations_updated':
+      return handleMessageAnnotationsUpdated(state, event)
+
     case 'session_shared':
       return handleSessionShared(state, event)
 
@@ -200,11 +208,6 @@ export function processEvent(
 
     case 'usage_update':
       return handleUsageUpdate(state, event)
-
-    case 'todos_updated':
-      // Codex's turn/plan/updated notification - synthesize a TodoWrite tool message
-      // This allows reusing existing turn-utils extraction logic for TurnCard todos
-      return handleTodosUpdated(state, event)
 
     default: {
       // Unknown event type - return state unchanged but as new reference

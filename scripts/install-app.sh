@@ -42,12 +42,6 @@ if command -v yq >/dev/null 2>&1; then
     HAS_YQ=true
 fi
 
-# Check if jq is available (optional)
-HAS_JQ=false
-if command -v jq >/dev/null 2>&1; then
-    HAS_JQ=true
-fi
-
 # Download function that works with both curl and wget
 # Usage: download_file <url> [output_file] [show_progress]
 download_file() {
@@ -78,23 +72,6 @@ download_file() {
     else
         return 1
     fi
-}
-
-# Simple JSON parser for extracting values when jq is not available
-get_json_value() {
-    local json="$1"
-    local key="$2"
-
-    # Normalize JSON to single line
-    json=$(echo "$json" | tr -d '\n\r\t' | sed 's/ \+/ /g')
-
-    # Extract value using bash regex
-    if [[ $json =~ \"$key\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
-    fi
-
-    return 1
 }
 
 # Extract sha512 from YAML for a specific architecture
@@ -187,29 +164,26 @@ info "Detected platform: $platform"
 mkdir -p "$DOWNLOAD_DIR"
 mkdir -p "$INSTALL_DIR"
 
-# Get latest version
-info "Fetching latest version..."
-latest_json=$(download_file "$VERSIONS_URL/latest")
-
-if [ "$HAS_JQ" = true ]; then
-    version=$(echo "$latest_json" | jq -r '.version // empty')
-else
-    version=$(get_json_value "$latest_json" "version")
-fi
-
-if [ -z "$version" ]; then
-    error "Failed to get latest version"
-fi
-
-info "Latest version: $version"
-
-# Download YAML manifest and extract checksum
+# Fetch YAML manifest directly from /electron/latest/ (no version endpoint needed)
 info "Fetching release info..."
-manifest_yaml=$(download_file "$VERSIONS_URL/$version/$yml_file")
+manifest_yaml=$(download_file "$VERSIONS_URL/latest/$yml_file")
 
 if [ -z "$manifest_yaml" ]; then
     error "Failed to fetch release info from $yml_file"
 fi
+
+# Extract version from YAML manifest
+if [ "$HAS_YQ" = true ]; then
+    version=$(echo "$manifest_yaml" | yq -r '.version // empty')
+else
+    version=$(echo "$manifest_yaml" | grep -m1 '^version:' | sed 's/^version:[[:space:]]*//')
+fi
+
+if [ -z "$version" ]; then
+    error "Failed to extract version from manifest"
+fi
+
+info "Latest version: $version"
 
 # Extract sha512 and filename for our architecture
 if [ "$HAS_YQ" = true ]; then
@@ -233,7 +207,7 @@ fi
 info "Expected sha512: ${checksum:0:20}..."
 
 # Download installer
-installer_url="$VERSIONS_URL/$version/$filename"
+installer_url="$VERSIONS_URL/latest/$filename"
 installer_path="$DOWNLOAD_DIR/$filename"
 
 info "Downloading $filename..."

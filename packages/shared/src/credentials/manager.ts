@@ -293,6 +293,15 @@ export class CredentialManager {
   }
 
   /**
+   * Delete API key for an LLM connection.
+   * @param connectionSlug - The connection slug
+   * @returns true if deleted, false if not found
+   */
+  async deleteLlmApiKey(connectionSlug: string): Promise<boolean> {
+    return this.delete({ type: 'llm_api_key', connectionSlug });
+  }
+
+  /**
    * Get OAuth token for an LLM connection.
    * @param connectionSlug - The connection slug
    * @returns OAuth credentials or null if not found
@@ -501,12 +510,6 @@ export class CredentialManager {
   ): Promise<boolean> {
     const oauth = await this.getLlmOAuth(connectionSlug);
     if (!oauth) return false;
-
-    // For OpenAI provider OAuth (Codex), we need both idToken and accessToken
-    // CodexAgent.tryInjectStoredChatGptTokens() requires both fields
-    if (providerType === 'openai' && (!oauth.idToken || !oauth.accessToken)) {
-      return false;
-    }
 
     // Check if expired
     if (oauth.expiresAt && this.isExpired({ value: oauth.accessToken, expiresAt: oauth.expiresAt })) {

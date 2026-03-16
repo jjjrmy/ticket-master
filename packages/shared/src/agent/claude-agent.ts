@@ -1,21 +1,30 @@
-import { query, createSdkMcpServer, tool, AbortError, type Query, type SDKMessage, type SDKUserMessage, type SDKAssistantMessageError, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { query, createSdkMcpServer, tool, AbortError, type Query, type SDKUserMessage, type SDKAssistantMessageError, type Options, type SDKResultSuccess } from '@anthropic-ai/claude-agent-sdk';
 import { getDefaultOptions, resetClaudeConfigCheck } from './options.ts';
-import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
+// Local type for SDK user message content blocks (text, image, document)
+// Replaces import from @anthropic-ai/sdk/resources — keeps SDK as agent-only dependency
+type ContentBlockParam =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+  | { type: 'document'; source: { type: 'base64'; media_type: string; data: string } };
 import { z } from 'zod';
 import { getSystemPrompt } from '../prompts/system.ts';
 import { BaseAgent, type MiniAgentConfig, MINI_AGENT_TOOLS, MINI_AGENT_MCP_KEYS } from './base-agent.ts';
-import type { BackendConfig, PermissionRequestType } from './backend/types.ts';
+import type { BackendConfig, PostInitResult, PermissionRequestType, SdkMcpServerConfig } from './backend/types.ts';
 // Plan types are used by UI components; not needed in craft-agent.ts since Safe Mode is user-controlled
 import { parseError, type AgentError } from './errors.ts';
 import { runErrorDiagnostics } from './diagnostics.ts';
 import { loadStoredConfig, loadConfigDefaults, type Workspace, type AuthType, getDefaultLlmConnection, getLlmConnection } from '../config/storage.ts';
-import { isLocalMcpEnabled } from '../workspaces/storage.ts';
+import { getValidClaudeOAuthToken } from '../auth/state.ts';
+import { resolveAuthEnvVars } from '../config/llm-connections.ts';
+import type { McpClientPool } from '../mcp/mcp-pool.ts';
 import { loadPlanFromPath, type SessionConfig as Session } from '../sessions/storage.ts';
 import { DEFAULT_MODEL, isClaudeModel, getDefaultSummarizationModel } from '../config/models.ts';
 import { getCredentialManager } from '../credentials/index.ts';
-import { updatePreferences, loadPreferences, formatPreferencesForPrompt, type UserPreferences } from '../config/preferences.ts';
+import { loadPreferences, formatPreferencesForPrompt } from '../config/preferences.ts';
 import type { FileAttachment } from '../utils/files.ts';
+import type { LLMQueryRequest, LLMQueryResult } from './llm-tool.ts';
 import { debug } from '../utils/debug.ts';
+import { guardLargeResult } from '../utils/large-response.ts';
 import {
   getSessionPlansDir,
   getLastPlanFilePath,
@@ -26,38 +35,30 @@ import {
   cleanupSessionScopedTools,
   type AuthRequest,
 } from './session-scoped-tools.ts';
-import { type HookSystem, type SdkHookCallbackMatcher } from '../hooks-simple/index.ts';
+import { type AutomationSystem, type SdkAutomationCallbackMatcher } from '../automations/index.ts';
 import {
   getPermissionMode,
+  getPermissionModeDiagnostics,
   setPermissionMode,
   cyclePermissionMode,
   initializeModeState,
   cleanupModeState,
-  shouldAllowToolInMode,
   blockWithReason,
-  isApiEndpointAllowed,
   type PermissionMode,
   PERMISSION_MODE_CONFIG,
   SAFE_MODE_CONFIG,
 } from './mode-manager.ts';
-import { type PermissionsContext, permissionsConfigCache } from './permissions-config.ts';
-import { getSessionPlansPath, getSessionPath } from '../sessions/storage.ts';
-import { readFileSync } from 'fs';
-import { expandPath } from '../utils/paths.ts';
+import { getSessionDataPath, getSessionPlansPath, getSessionPath } from '../sessions/storage.ts';
 import { extractWorkspaceSlug } from '../utils/workspace.ts';
 import {
   ConfigWatcher,
   createConfigWatcher,
   type ConfigWatcherCallbacks,
 } from '../config/watcher.ts';
-import type { ValidationIssue } from '../config/validators.ts';
-import { detectConfigFileType, detectAppConfigFileType, validateConfigFileContent, formatValidationResult } from '../config/validators.ts';
-// Shared PreToolUse utilities
+// Centralized PreToolUse pipeline
 import {
-  expandToolPaths,
-  qualifySkillName,
-  stripToolMetadata,
-  validateConfigWrite,
+  runPreToolUseChecks,
+  type PreToolUseCheckResult,
   BUILT_IN_TOOLS,
 } from './core/pre-tool-use.ts';
 import { type ThinkingLevel, getThinkingTokens, DEFAULT_THINKING_LEVEL } from './thinking-levels.ts';
@@ -72,6 +73,11 @@ import type {
   SourceChangeCallback,
   SourceActivationCallback,
 } from './backend/types.ts';
+import { stat } from 'node:fs/promises';
+import { IMAGE_LIMITS } from '../utils/files.ts';
+
+/** Image extensions that may need size-guard in PreToolUse (matches Read tool's image detection) */
+const IMAGE_READ_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff']);
 
 // Re-export permission mode functions for application usage
 export {
@@ -91,7 +97,10 @@ import type { AgentEvent } from '@craft-agent/core/types';
 export type { AgentEvent };
 
 // Stateless tool matching — pure functions for SDK message → AgentEvent conversion
-import { ToolIndex, extractToolStarts, extractToolResults, type ContentBlock } from './tool-matching.ts';
+import { ToolIndex } from './tool-matching.ts';
+
+// Claude event adapter — extracts SDK message → AgentEvent conversion into testable class
+import { ClaudeEventAdapter, buildWindowsSkillsDirError as buildWindowsSkillsDirErrorFn } from './backend/claude/event-adapter.ts';
 
 // Re-export types for UI components
 export type { LoadedSource } from '../sources/types.ts';
@@ -100,6 +109,15 @@ export type { LoadedSource } from '../sources/types.ts';
 // Re-exported for backwards compatibility with existing imports from claude-agent.ts
 import { AbortReason, type RecoveryMessage } from './core/index.ts';
 export { AbortReason, type RecoveryMessage };
+
+/** File extensions that can be converted to readable text by CLI tools. */
+const CONVERTIBLE_FILE_HINTS: Record<string, string> = {
+  pdf: 'markitdown or pdf-tool extract',
+  docx: 'markitdown', xlsx: 'markitdown or xlsx-tool read', pptx: 'markitdown or pptx-tool extract',
+  doc: 'markitdown', xls: 'markitdown', ppt: 'markitdown',
+  msg: 'markitdown', eml: 'markitdown', rtf: 'markitdown',
+  ics: 'ical-tool read',
+};
 
 export interface ClaudeAgentConfig {
   workspace: Workspace;
@@ -122,8 +140,20 @@ export interface ClaudeAgentConfig {
   };
   /** System prompt preset for mini agents ('default' | 'mini' or custom string) */
   systemPromptPreset?: 'default' | 'mini' | string;
-  /** Workspace-level HookSystem instance (shared across all agents in the workspace) */
-  hookSystem?: HookSystem;
+  /** Workspace-level AutomationSystem instance (shared across all agents in the workspace) */
+  automationSystem?: AutomationSystem;
+  /**
+   * Per-session environment variable overrides for the SDK subprocess.
+   * Used to pass connection-specific config like ANTHROPIC_BASE_URL that
+   * must not be clobbered by concurrent sessions.
+   */
+  envOverrides?: Record<string, string>;
+  /** Mini/utility model for summarization, title generation, and mini completions. */
+  miniModel?: string;
+  /** Centralized MCP client pool for source tool execution. */
+  mcpPool?: McpClientPool;
+  /** LLM connection slug for credential lookup in postInit(). */
+  connectionSlug?: string;
 }
 
 // Permission request tracking
@@ -216,176 +246,183 @@ export function clearGlobalPermissions(): void {
   globalPendingPermissions.clear();
 }
 
-// Handle preferences update (extracted for use in MCP tool)
-function handleUpdatePreferences(input: Record<string, unknown>): string {
-  const updates: Partial<UserPreferences> = {};
+/**
+ * Create an in-process MCP server that proxies source tool calls through the McpClientPool.
+ * This replaces direct MCP connections — the pool owns all source connections centrally.
+ *
+ * Returns a McpSdkServerConfigWithInstance that can be added to Options.mcpServers.
+ */
 
-  if (input.name && typeof input.name === 'string') {
-    updates.name = input.name;
-  }
-  if (input.timezone && typeof input.timezone === 'string') {
-    updates.timezone = input.timezone;
-  }
-  if (input.language && typeof input.language === 'string') {
-    updates.language = input.language;
+const MAX_SCHEMA_DEPTH = 5;
+
+/**
+ * Convert a JSON Schema property to a Zod type.
+ * Handles oneOf/anyOf unions, nested objects with properties, typed arrays, allOf merges,
+ * and enums — so the LLM sees the full parameter structure instead of z.unknown().
+ */
+export function jsonPropToZod(prop: any, depth = 0): z.ZodTypeAny {
+  if (!prop || typeof prop !== 'object') return z.unknown();
+  if (depth >= MAX_SCHEMA_DEPTH) return z.unknown();
+
+  // Attach description if present
+  const withDesc = (zodType: z.ZodTypeAny): z.ZodTypeAny =>
+    prop.description ? zodType.describe(prop.description) : zodType;
+
+  // Enum — string literals
+  if (prop.enum && Array.isArray(prop.enum) && prop.enum.length > 0) {
+    return withDesc(z.enum(prop.enum as [string, ...string[]]));
   }
 
-  // Handle location fields
-  if (input.city || input.region || input.country) {
-    updates.location = {};
-    if (input.city && typeof input.city === 'string') {
-      updates.location.city = input.city;
+  // oneOf / anyOf — discriminated or plain unions
+  const unionVariants = prop.oneOf ?? prop.anyOf;
+  if (Array.isArray(unionVariants) && unionVariants.length > 0) {
+    const members = unionVariants.map((v: any) => jsonPropToZod(v, depth + 1));
+    if (members.length === 1) return withDesc(members[0]!);
+    return withDesc(z.union(members as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]));
+  }
+
+  // allOf — merge into a single object shape
+  if (Array.isArray(prop.allOf) && prop.allOf.length > 0) {
+    const mergedProps: Record<string, any> = {};
+    const mergedRequired: string[] = [];
+    for (const sub of prop.allOf) {
+      if (sub.properties) Object.assign(mergedProps, sub.properties);
+      if (Array.isArray(sub.required)) mergedRequired.push(...sub.required);
     }
-    if (input.region && typeof input.region === 'string') {
-      updates.location.region = input.region;
+    if (Object.keys(mergedProps).length > 0) {
+      return withDesc(jsonPropToZod({
+        type: 'object',
+        properties: mergedProps,
+        required: mergedRequired,
+        description: prop.description,
+      }, depth));
     }
-    if (input.country && typeof input.country === 'string') {
-      updates.location.country = input.country;
+    // Fallback: if allOf doesn't have properties, take the first variant
+    return withDesc(jsonPropToZod(prop.allOf[0], depth + 1));
+  }
+
+  switch (prop.type) {
+    case 'string':
+      return withDesc(z.string());
+    case 'number':
+    case 'integer':
+      return withDesc(z.number());
+    case 'boolean':
+      return withDesc(z.boolean());
+    case 'array': {
+      const itemSchema = prop.items
+        ? jsonPropToZod(prop.items, depth + 1)
+        : z.unknown();
+      return withDesc(z.array(itemSchema));
     }
+    case 'object': {
+      // Nested object with known properties → build z.object({...})
+      if (prop.properties && typeof prop.properties === 'object') {
+        const shape = jsonSchemaToZodShape(prop, depth + 1);
+        const obj = z.object(shape);
+        // JSON Schema defaults additionalProperties to true when omitted.
+        // Only use strict (strip) mode when explicitly set to false.
+        if (prop.additionalProperties === false) {
+          return withDesc(obj);
+        }
+        return withDesc(obj.passthrough());
+      }
+      // Generic object (no properties defined)
+      return withDesc(z.record(z.string(), z.unknown()));
+    }
+    default:
+      return withDesc(z.unknown());
   }
-
-  // Handle notes (replace)
-  if (input.notes && typeof input.notes === 'string') {
-    updates.notes = input.notes;
-  }
-
-  // Check if anything was actually updated
-  const fields = Object.keys(updates).filter(k => k !== 'location');
-  if (updates.location) {
-    fields.push(...Object.keys(updates.location).map(k => `location.${k}`));
-  }
-
-  if (fields.length === 0) {
-    return 'No preferences were updated (no valid fields provided)';
-  }
-
-  updatePreferences(updates);
-  return `Updated user preferences: ${fields.join(', ')}`;
 }
 
+function jsonSchemaToZodShape(schema: Record<string, unknown>, depth = 0): Record<string, z.ZodTypeAny> {
+  const properties = (schema.properties as Record<string, any>) || {};
+  const required = new Set((schema.required as string[]) || []);
+  const shape: Record<string, z.ZodTypeAny> = {};
 
-// Base tool: update_user_preferences (always available)
-const updateUserPreferencesTool = tool(
-  'update_user_preferences',
-  `Update stored user preferences. Use this when you learn information about the user that would be helpful to remember for future conversations. This includes their name, timezone, location, preferred language, or any other relevant notes. Only update fields you have confirmed information about - don't guess.`,
-  {
-    name: z.string().optional().describe("The user's preferred name or how they'd like to be addressed"),
-    timezone: z.string().optional().describe("The user's timezone in IANA format (e.g., 'America/New_York', 'Europe/London')"),
-    city: z.string().optional().describe("The user's city"),
-    region: z.string().optional().describe("The user's state/region/province"),
-    country: z.string().optional().describe("The user's country"),
-    language: z.string().optional().describe("The user's preferred language for responses"),
-    notes: z.string().optional().describe('Additional notes about the user that would be helpful to remember (preferences, context, etc.). Replaces any existing notes.'),
-  },
-  async (args) => {
-    try {
-      const result = handleUpdatePreferences(args);
-      return {
-        content: [{ type: 'text', text: result }],
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return {
-        content: [{ type: 'text', text: `Failed to update preferences: ${message}` }],
-        isError: true,
-      };
-    }
+  for (const [key, prop] of Object.entries(properties)) {
+    let zodType = jsonPropToZod(prop, depth);
+    if (!required.has(key)) zodType = zodType.optional();
+    shape[key] = zodType;
   }
-);
 
-// Cached MCP server for preferences
-let cachedPrefToolsServer: ReturnType<typeof createSdkMcpServer> | null = null;
+  return shape;
+}
 
-// Preferences MCP server - user preferences tool
-function getPreferencesServer(_unused?: boolean): ReturnType<typeof createSdkMcpServer> {
-  if (!cachedPrefToolsServer) {
-    cachedPrefToolsServer = createSdkMcpServer({
-      name: 'preferences',
+/**
+ * Create one SDK MCP server per connected source, using original tool names.
+ * The SDK adds its own `mcp__{serverKey}__` prefix, so we use the source slug
+ * as the server key and original tool names to get the correct final names
+ * (e.g., `mcp__linear__createIssue`).
+ */
+function createSourceProxyServers(pool: McpClientPool): Record<string, ReturnType<typeof createSdkMcpServer>> {
+  const servers: Record<string, ReturnType<typeof createSdkMcpServer>> = {};
+
+  for (const slug of pool.getConnectedSlugs()) {
+    const mcpTools = pool.getTools(slug);
+    if (mcpTools.length === 0) continue;
+
+    const proxyTools = mcpTools.map(mcpTool => {
+      const proxyName = `mcp__${slug}__${mcpTool.name}`;
+      return tool(
+        mcpTool.name,
+        mcpTool.description || `Tool from ${slug}`,
+        {
+          ...jsonSchemaToZodShape((mcpTool.inputSchema as Record<string, unknown>) || {}),
+          ...z.object({}).catchall(z.unknown()).shape,
+        },
+        async (args: Record<string, unknown>) => {
+          const result = await pool.callTool(proxyName, args);
+          return {
+            content: [{ type: 'text' as const, text: result.content }],
+            ...(result.isError ? { isError: true } : {}),
+          };
+        }
+      );
+    });
+
+    servers[slug] = createSdkMcpServer({
+      name: `source-proxy-${slug}`,
       version: '1.0.0',
-      tools: [updateUserPreferencesTool],
+      tools: proxyTools,
     });
   }
-  return cachedPrefToolsServer;
+
+  return servers;
 }
 
-/**
- * SDK-compatible MCP server configuration.
- * Supports HTTP/SSE (remote) and stdio (local subprocess) transports.
- */
-export type SdkMcpServerConfig =
-  | { type: 'http' | 'sse'; url: string; headers?: Record<string, string> }
-  | { type: 'stdio'; command: string; args?: string[]; env?: Record<string, string> };
-
-/**
- * Detect the Windows ENOENT .claude/skills directory error from the Claude Code SDK.
- * The SDK scans C:\ProgramData\ClaudeCode\.claude\skills for managed/enterprise skills
- * but crashes if the directory doesn't exist. This is an upstream SDK bug.
- * See: https://github.com/anthropics/claude-code/issues/20571
- *
- * Returns a typed_error event with user-friendly instructions, or null if not this error.
- */
-function buildWindowsSkillsDirError(errorText: string): { type: 'typed_error'; error: AgentError } | null {
-  if (!errorText.includes('ENOENT') || !errorText.includes('skills')) {
-    return null;
-  }
-
-  const pathMatch = errorText.match(/scandir\s+'([^']+)'/);
-  const missingPath = pathMatch?.[1] || 'C:\\ProgramData\\ClaudeCode\\.claude\\skills';
-
-  return {
-    type: 'typed_error',
-    error: {
-      code: 'unknown_error',
-      title: 'Windows Setup Required',
-      message: `The SDK requires a directory that doesn't exist: ${missingPath} — Create this folder in File Explorer, then restart the app.`,
-      details: [
-        `PowerShell (run as Administrator):`,
-        `New-Item -ItemType Directory -Force -Path "${missingPath}"`,
-      ],
-      actions: [],
-      canRetry: true,
-      originalError: errorText,
-    },
-  };
-}
+// buildWindowsSkillsDirError is now in backend/claude/event-adapter.ts (exported)
+const buildWindowsSkillsDirError = buildWindowsSkillsDirErrorFn;
 
 export class ClaudeAgent extends BaseAgent {
+  protected backendName = 'Claude';
   // Note: ClaudeAgentConfig is compatible with BackendConfig, so we use the inherited this.config
   private currentQuery: Query | null = null;
   private currentQueryAbortController: AbortController | null = null;
   private lastAbortReason: AbortReason | null = null;
   private sessionId: string | null = null;
+  private branchFromSdkSessionId: string | null = null;
+  private branchFromSdkCwd: string | null = null;
+  private branchFromSdkTurnId: string | null = null;
   private isHeadless: boolean = false;
   private pendingPermissions: Map<string, PendingPermission> = new Map();
   // Permission whitelists are now managed by this.permissionManager (inherited from BaseAgent)
-  // Pre-built source server configs (user-defined sources, separate from agent)
-  // Supports both HTTP/SSE and stdio transports
-  private sourceMcpServers: Record<string, SdkMcpServerConfig> = {};
-  // In-process MCP servers for source API integrations
-  private sourceApiServers: Record<string, ReturnType<typeof createSdkMcpServer>> = {};
   // Source state tracking is now managed by this.sourceManager (inherited from BaseAgent)
+  // Source MCP connections are managed by this.config.mcpPool (centralized in main process)
+  // Both MCP sources and API sources are routed through the pool.
   // Safe mode state - user-controlled read-only exploration mode
   private safeMode: boolean = false;
-  // SDK tools list (captured from init message)
-  private sdkTools: string[] = [];
-  // Thinking level and ultrathink override are now managed by BaseAgent
+  // Event adapter for SDK message → AgentEvent conversion (testable, pluggable)
+  private eventAdapter!: ClaudeEventAdapter;
+  // Thinking level is managed by BaseAgent
   // Pinned system prompt components (captured on first chat, used for consistency after compaction)
   private pinnedPreferencesPrompt: string | null = null;
   // Track if preference drift notification has been shown this session
   private preferencesDriftNotified: boolean = false;
   // Captured stderr from SDK subprocess (for error diagnostics when process exits with code 1)
   private lastStderrOutput: string[] = [];
-  // Last assistant message usage (for accurate context window display)
-  // result.modelUsage is cumulative across the session (for billing), but we need per-message usage
-  // See: https://github.com/anthropics/claude-agent-sdk-typescript/issues/66
-  private lastAssistantUsage: {
-    input_tokens: number;
-    cache_read_input_tokens: number;
-    cache_creation_input_tokens: number;
-  } | null = null;
-  // Cached context window size from modelUsage (for real-time usage_update events)
-  // This is captured from the first result message and reused for subsequent usage updates
-  private cachedContextWindow?: number;
+  /** Pending steer message — injected via additionalContext on next PreToolUse */
+  private pendingSteerMessage: string | null = null;
 
   /**
    * Get the session ID for mode operations.
@@ -403,7 +440,20 @@ export class ClaudeAgent extends BaseAgent {
   }
 
   // Callback for permission requests - set by application to receive permission prompts
-  public onPermissionRequest: ((request: { requestId: string; toolName: string; command?: string; description: string; type?: PermissionRequestType }) => void) | null = null;
+  public onPermissionRequest: ((request: {
+    requestId: string;
+    toolName: string;
+    command?: string;
+    description: string;
+    type?: PermissionRequestType;
+    appName?: string;
+    reason?: string;
+    impact?: string;
+    requiresSystemPrompt?: boolean;
+    rememberForMinutes?: number;
+    commandHash?: string;
+    approvalTtlSeconds?: number;
+  }) => void) | null = null;
 
   // Debug callback for status messages
   public onDebug: ((message: string) => void) | null = null;
@@ -452,6 +502,11 @@ export class ClaudeAgent extends BaseAgent {
       onSdkSessionIdUpdate: config.onSdkSessionIdUpdate,
       onSdkSessionIdCleared: config.onSdkSessionIdCleared,
       getRecoveryMessages: config.getRecoveryMessages,
+      envOverrides: config.envOverrides,
+      miniModel: config.miniModel,
+      mcpPool: config.mcpPool,
+      connectionSlug: config.connectionSlug,
+      automationSystem: config.automationSystem,
     };
 
     // Call BaseAgent constructor - initializes model, thinkingLevel, permissionManager, sourceManager, etc.
@@ -459,6 +514,13 @@ export class ClaudeAgent extends BaseAgent {
     super(backendConfig, DEFAULT_MODEL, CLAUDE_CONTEXT_WINDOW);
 
     this.isHeadless = config.isHeadless ?? false;
+    this.automationSystem = config.automationSystem;
+
+    // Initialize event adapter for SDK message → AgentEvent conversion
+    this.eventAdapter = new ClaudeEventAdapter({
+      onDebug: (msg) => this.onDebug?.(msg),
+      mapSDKError: (errorCode) => this.mapSDKErrorToTypedError(errorCode),
+    });
 
     // Log which model is being used (helpful for debugging custom models)
     this.debug(`Using model: ${model}`);
@@ -466,6 +528,12 @@ export class ClaudeAgent extends BaseAgent {
     // Initialize sessionId from session config for conversation resumption
     if (config.session?.sdkSessionId) {
       this.sessionId = config.session.sdkSessionId;
+    }
+    // Initialize branch params for SDK-level fork (resume parent + forkSession)
+    if (config.session?.branchFromSdkSessionId) {
+      this.branchFromSdkSessionId = config.session.branchFromSdkSessionId;
+      this.branchFromSdkCwd = config.session.branchFromSdkCwd ?? null;
+      this.branchFromSdkTurnId = config.session.branchFromSdkTurnId ?? null;
     }
 
     // Initialize permission mode state with callbacks
@@ -493,6 +561,8 @@ export class ClaudeAgent extends BaseAgent {
         this.onDebug?.(`[ClaudeAgent] onAuthRequest received: ${request.sourceSlug} (type: ${request.type})`);
         this.onAuthRequest?.(request);
       },
+      queryFn: (request) => this.queryLlm(request),
+      spawnSessionFn: (input) => this.preExecuteSpawnSession(input),
     });
 
     // Start config watcher for hot-reloading source changes
@@ -502,8 +572,45 @@ export class ClaudeAgent extends BaseAgent {
     }
   }
 
+  /**
+   * Post-construction auth setup.
+   * Fetches credentials and sets process.env before the SDK subprocess spawns.
+   * The subprocess spawns lazily on first chat(), so postInit() is early enough.
+   */
+  override async postInit(): Promise<PostInitResult> {
+    const slug = this.config.connectionSlug;
+    if (!slug) {
+      return { authInjected: false, authWarning: 'No connection slug available', authWarningLevel: 'error' };
+    }
+
+    const connection = getLlmConnection(slug);
+    if (!connection) {
+      return { authInjected: false, authWarning: `Connection not found: ${slug}`, authWarningLevel: 'error' };
+    }
+
+    // Clear all auth env vars first for clean state
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_BASE_URL;
+
+    // Resolve auth env vars via shared utility
+    const manager = getCredentialManager();
+    const result = await resolveAuthEnvVars(connection, slug, manager, getValidClaudeOAuthToken);
+
+    if (!result.success) {
+      return { authInjected: false, authWarning: result.warning, authWarningLevel: 'error' };
+    }
+
+    // Apply env vars to process.env (for SDK subprocess) and envOverrides (per-session isolation)
+    for (const [key, value] of Object.entries(result.envVars)) {
+      process.env[key] = value;
+    }
+
+    return { authInjected: true };
+  }
+
   // Config watcher methods (startConfigWatcher, stopConfigWatcher) are now inherited from BaseAgent
-  // Thinking level methods (setThinkingLevel, getThinkingLevel, setUltrathinkOverride) are now inherited from BaseAgent
+  // Thinking level methods (setThinkingLevel, getThinkingLevel) are inherited from BaseAgent
 
   // Permission command utilities (getBaseCommand, isDangerousCommand, extractDomainFromNetworkCommand)
   // are now available via this.permissionManager
@@ -596,13 +703,16 @@ export class ClaudeAgent extends BaseAgent {
     return this.config.mcpToken ?? null;
   }
 
-  async *chat(
+  protected async *chatImpl(
     userMessage: string,
     attachments?: FileAttachment[],
     options?: ChatOptions
   ): AsyncGenerator<AgentEvent> {
     // Extract options (ChatOptions interface from AgentBackend)
     const _isRetry = options?.isRetry ?? false;
+
+    // Clear any leftover steer from a previous turn (safety net — should already be null)
+    this.pendingSteerMessage = null;
 
     try {
       const sessionId = this.config.session?.id || `temp-${Date.now()}`;
@@ -647,20 +757,22 @@ export class ClaudeAgent extends BaseAgent {
       // - EnterPlanMode/ExitPlanMode: We use safe mode instead (user-controlled via UI)
       // - AskUserQuestion: Requires interactive UI to show question options to user
       // Note: Mini agents use a minimal tool list directly, so no additional blocking needed
-      const disallowedTools: string[] = ['EnterPlanMode', 'ExitPlanMode', 'AskUserQuestion'];
+      const disallowedTools: string[] = ['EnterPlanMode', 'ExitPlanMode', 'AskUserQuestion', 'Skill'];
 
       // Build MCP servers config
       // Mini agents: only session tools (config_validate) to minimize token usage
       // Regular agents: full set including preferences, docs, and user sources
-      const sourceMcpResult = this.getSourceMcpServersFiltered();
 
-      debug('[chat] sourceMcpServers:', sourceMcpResult.servers);
-      debug('[chat] sourceApiServers:', this.sourceApiServers);
+      // Build per-source proxy servers from centralized MCP pool (if available)
+      const sourceProxies = this.config.mcpPool ? createSourceProxyServers(this.config.mcpPool) : {};
+      const sourceProxyCount = Object.keys(sourceProxies).length;
+      if (sourceProxyCount > 0) {
+        debug('[chat] Source proxy servers created for', sourceProxyCount, 'sources');
+      }
 
       // Build full MCP servers set first, then filter for mini agents
       const fullMcpServers: Options['mcpServers'] = {
-        preferences: getPreferencesServer(false),
-        // Session-scoped tools (SubmitPlan, source_test, etc.)
+        // Session-scoped tools (SubmitPlan, source_test, update_user_preferences, transform_data, etc.)
         session: getSessionScopedTools(sessionId, this.workspaceRootPath),
         // Craft Agents documentation - always available for searching setup guides
         // This is a public Mintlify MCP server, no auth needed
@@ -668,14 +780,14 @@ export class ClaudeAgent extends BaseAgent {
           type: 'http',
           url: 'https://agents.craft.do/docs/mcp',
         },
-        // Add user-defined source servers (MCP and API, filtered by local MCP setting)
-        // Note: Craft MCP server is now added via sources system
-        ...sourceMcpResult.servers,
-        ...this.sourceApiServers,
+        // Per-source proxy servers from centralized MCP pool (MCP + API sources)
+        // Each source gets its own SDK server keyed by slug (e.g., 'linear', 'github', 'gmail')
+        // so the SDK produces correct tool names: mcp__{slug}__{toolName}
+        ...sourceProxies,
       };
 
       // Mini agents: filter to minimal set using centralized keys
-      // Regular agents: use full set including preferences, docs, and user sources
+      // Regular agents: use full set including docs and user sources
       const mcpServers: Options['mcpServers'] = miniConfig.enabled
         ? this.filterMcpServersForMiniAgent(fullMcpServers, miniConfig.mcpServerKeys)
         : fullMcpServers;
@@ -692,11 +804,8 @@ export class ClaudeAgent extends BaseAgent {
         debug(`[chat] Custom provider: baseUrl=${activeBaseUrl}, model=${model}, hasApiKey=${!!process.env.ANTHROPIC_API_KEY}`);
       }
 
-      // Determine effective thinking level: ultrathink override boosts to max for this message
-      // Uses inherited protected fields from BaseAgent
-      const effectiveThinkingLevel: ThinkingLevel = this._ultrathinkOverride ? 'max' : this._thinkingLevel;
-      const thinkingTokens = getThinkingTokens(effectiveThinkingLevel, model);
-      debug(`[chat] Thinking: level=${this._thinkingLevel}, override=${this._ultrathinkOverride}, effective=${effectiveThinkingLevel}, tokens=${thinkingTokens}`);
+      const thinkingTokens = getThinkingTokens(this._thinkingLevel, model);
+      debug(`[chat] Thinking: level=${this._thinkingLevel}, tokens=${thinkingTokens}`);
 
       // NOTE: Parent-child tracking for subagents is documented below (search for
       // "PARENT-CHILD TOOL TRACKING"). The SDK's parent_tool_use_id is authoritative.
@@ -721,7 +830,7 @@ export class ClaudeAgent extends BaseAgent {
       }
 
       const options: Options = {
-        ...getDefaultOptions(),
+        ...getDefaultOptions(this.config.envOverrides),
         model,
         // Capture stderr from SDK subprocess for error diagnostics
         // This helps identify why sessions fail with "process exited with code 1"
@@ -735,7 +844,7 @@ export class ClaudeAgent extends BaseAgent {
             this.lastStderrOutput.shift();
           }
         },
-        // Extended thinking: tokens based on effective thinking level (session level + ultrathink override)
+        // Extended thinking: tokens based on session thinking level
         // Non-Claude models don't support extended thinking, so pass 0 to disable
         // Mini agents also disable thinking for efficiency (quick config edits don't need deep reasoning)
         maxThinkingTokens: miniConfig.minimizeThinking ? 0 : (isClaude ? thinkingTokens : 0),
@@ -758,8 +867,13 @@ export class ClaudeAgent extends BaseAgent {
         // Use sdkCwd for SDK session storage - this is set once at session creation and never changes.
         // This ensures SDK can always find session transcripts regardless of workingDirectory changes.
         // Note: workingDirectory is still used for context injection and shown to the agent.
-        cwd: this.config.session?.sdkCwd ??
-          (sessionId ? getSessionPath(this.workspaceRootPath, sessionId) : this.workspaceRootPath),
+        // For fork attempts: use the parent's sdkCwd so the SDK subprocess can find the parent's
+        // session file (stored under ~/.claude/projects/{cwd-hash}/). Without this, cross-CWD
+        // branches (e.g., worktree ↔ main repo) fail with "No conversation found".
+        cwd: (!_isRetry && this.branchFromSdkCwd && this.branchFromSdkSessionId)
+          ? this.branchFromSdkCwd
+          : (this.config.session?.sdkCwd ??
+            (sessionId ? getSessionPath(this.workspaceRootPath, sessionId) : this.workspaceRootPath)),
         includePartialMessages: true,
         // Tools configuration:
         // - Mini agents: minimal set for quick config edits (reduces token count ~70%)
@@ -775,470 +889,255 @@ export class ClaudeAgent extends BaseAgent {
         // This allows Safe Mode to properly allow read-only bash commands without SDK interference
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
-        // User hooks from hooks.json are merged with internal hooks
+        // User hooks from automations.json are merged with internal hooks
         hooks: (() => {
-          // Build user-defined hooks from hooks.json using the workspace-level HookSystem
-          const userHooks = this.config.hookSystem?.buildSdkHooks() ?? {};
+          // Build user-defined hooks from automations.json using the workspace-level AutomationSystem
+          const userHooks: Partial<Record<string, SdkAutomationCallbackMatcher[]>> = this.automationSystem?.buildSdkHooks() ?? {};
           if (Object.keys(userHooks).length > 0) {
             debug('[CraftAgent] User SDK hooks loaded:', Object.keys(userHooks).join(', '));
           }
 
           // Internal hooks for permission handling and logging
-          const internalHooks: Record<string, SdkHookCallbackMatcher[]> = {
+          const internalHooks: Record<string, SdkAutomationCallbackMatcher[]> = {
           PreToolUse: [{
-            hooks: [async (input) => {
+            hooks: [async (_hookInput) => {
               // Only handle PreToolUse events
-              if (input.hook_event_name !== 'PreToolUse') {
+              if (_hookInput.hook_event_name !== 'PreToolUse') {
                 return { continue: true };
               }
+              // Validate the fields we depend on are actually present
+              if (!_hookInput.tool_name || !_hookInput.tool_use_id) {
+                return { continue: true };
+              }
+              const input = _hookInput as Required<Pick<typeof _hookInput, 'tool_name' | 'tool_use_id'>> & typeof _hookInput;
 
-              // Get current permission mode (single source of truth)
-              const permissionMode = getPermissionMode(sessionId);
-              this.onDebug?.(`PreToolUse hook: ${input.tool_name} (permissionMode=${permissionMode})`);
-
-              // ============================================================
-              // PERMISSION MODE HANDLING
-              // - 'safe': Block writes entirely (read-only mode)
-              // - 'ask': Prompt for dangerous operations
-              // - 'allow-all': Everything allowed, no prompts
-              // ============================================================
-
-              // Build permissions context for loading custom permissions.json files
-              const permissionsContext: PermissionsContext = {
-                workspaceRootPath: this.workspaceRootPath,
-                activeSourceSlugs: Array.from(this.sourceManager.getActiveSlugs()),
-              };
-
-              // In 'allow-all' mode, still check for explicitly blocked tools
-              if (permissionMode === 'allow-all') {
-                const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
-                const result = shouldAllowToolInMode(
-                  input.tool_name,
-                  input.tool_input,
-                  'allow-all',
-                  { plansFolderPath, permissionsContext }
-                );
-
-                if (!result.allowed) {
-                  // Tool is explicitly blocked in permissions.json
-                  this.onDebug?.(`Allow-all mode: blocking explicitly blocked tool ${input.tool_name}`);
-                  return blockWithReason(result.reason);
-                }
-
-                this.onDebug?.(`Allow-all mode: allowing ${input.tool_name}`);
-                // Fall through to source blocking and other checks below
+              // Track Read tool calls for prerequisite checking
+              if (input.tool_name === 'Read') {
+                this.prerequisiteManager.trackReadTool(input.tool_input as Record<string, unknown>);
               }
 
-              // In 'ask' mode, still check for explicitly blocked tools
-              if (permissionMode === 'ask') {
-                const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
-                const result = shouldAllowToolInMode(
-                  input.tool_name,
-                  input.tool_input,
-                  'ask',
-                  { plansFolderPath, permissionsContext }
-                );
+              // --- Image size guard for Read tool ---
+              // Must run before runPreToolUseChecks. Once an oversized image enters
+              // the conversation history, the session becomes permanently stuck
+              // (API rejects with 400, SDK reports success, no recovery).
+              if (input.tool_name === 'Read') {
+                const filePath = (input.tool_input as { file_path?: string }).file_path;
+                if (filePath) {
+                  const ext = filePath.toLowerCase().split('.').pop() || '';
+                  if (IMAGE_READ_EXTENSIONS.has(ext)) {
+                    try {
+                      const stats = await stat(filePath);
 
-                if (!result.allowed) {
-                  // Tool is explicitly blocked in permissions.json
-                  this.onDebug?.(`Ask mode: blocking explicitly blocked tool ${input.tool_name}`);
-                  return blockWithReason(result.reason);
-                }
-                // Don't return here - fall through to other checks (like prompting for permission)
-              }
+                      if (stats.size > IMAGE_LIMITS.MAX_RAW_SIZE) {
+                        const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
+                        this.onDebug?.(`Image ${filePath} is ${sizeMB}MB, attempting resize...`);
 
-              // In 'safe' mode, check against read-only allowlist
-              if (permissionMode === 'safe') {
-                const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
-                const result = shouldAllowToolInMode(
-                  input.tool_name,
-                  input.tool_input,
-                  'safe',
-                  { plansFolderPath, permissionsContext }
-                );
-
-                if (!result.allowed) {
-                  // In safe mode, always block without prompting
-                  this.onDebug?.(`Safe mode: blocking ${input.tool_name}`);
-                  return blockWithReason(result.reason);
-                }
-
-                this.onDebug?.(`Allowed in safe mode: ${input.tool_name}`);
-                // Fall through to source blocking and other checks below
-              }
-
-              // ============================================================
-              // SOURCE BLOCKING & AUTO-ENABLE: Handle tools from sources
-              // Sources can be disabled mid-conversation, so we check
-              // against the current active source set on each tool call.
-              // If a source exists but isn't enabled, try to auto-enable it.
-              // ============================================================
-              if (input.tool_name.startsWith('mcp__')) {
-                // Extract server name from tool name (mcp__<server>__<tool>)
-                const parts = input.tool_name.split('__');
-                const serverName = parts[1];
-                if (parts.length >= 3 && serverName) {
-                  // Built-in MCP servers that are always available (not user sources)
-                  // - preferences: user preferences storage
-                  // - session: session-scoped tools (SubmitPlan, source_test, etc.)
-                  // - craft-agents-docs: always-available documentation search
-                  const builtInMcpServers = new Set(['preferences', 'session', 'craft-agents-docs']);
-
-                  // Check if this is a source server (not built-in)
-                  if (!builtInMcpServers.has(serverName)) {
-                    // Check if source server is active
-                    const isActive = this.sourceManager.isSourceActive(serverName);
-                    if (!isActive) {
-                      // Check if this source exists in workspace (just not enabled in session)
-                      const sourceExists = this.sourceManager.getAllSources().some(s => s.config.slug === serverName);
-
-                      if (sourceExists && this.onSourceActivationRequest) {
-                        // Try to auto-enable the source
-                        this.onDebug?.(`Source "${serverName}" not active, attempting auto-enable...`);
-                        try {
-                          const activated = await this.onSourceActivationRequest(serverName);
-                          if (activated) {
-                            this.onDebug?.(`Source "${serverName}" auto-enabled successfully, tools available next turn`);
-                            // Source was activated but the SDK was started with old server list.
-                            // The tools will only be available on the NEXT chat() call.
-                            // Return an imperative message to make the model stop and respond.
+                        if (this.config.onImageResize) {
+                          const resizedPath = await this.config.onImageResize(filePath, IMAGE_LIMITS.MAX_RAW_SIZE);
+                          if (resizedPath) {
+                            this.onDebug?.(`Image resized, redirecting Read to: ${resizedPath}`);
                             return {
-                              continue: false,
-                              decision: 'block' as const,
-                              reason: `STOP. Source "${serverName}" has been activated successfully. The tools will be available on the next turn. Do NOT try other tool names or approaches. Respond to the user now: tell them the source is now active and ask them to send their request again.`,
-                            };
-                          } else {
-                            // Activation failed (e.g., needs auth)
-                            this.onDebug?.(`Source "${serverName}" auto-enable failed (may need authentication)`);
-                            return {
-                              continue: false,
-                              decision: 'block' as const,
-                              reason: `Source "${serverName}" could not be activated. It may require authentication. Please check the source status and authenticate if needed.`,
+                              continue: true,
+                              hookSpecificOutput: {
+                                hookEventName: 'PreToolUse' as const,
+                                updatedInput: { ...input.tool_input as Record<string, unknown>, file_path: resizedPath },
+                              },
                             };
                           }
-                        } catch (error) {
-                          this.onDebug?.(`Source "${serverName}" auto-enable error: ${error}`);
-                          return {
-                            continue: false,
-                            decision: 'block' as const,
-                            reason: `Failed to activate source "${serverName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
-                          };
                         }
-                      } else if (sourceExists) {
-                        // Source exists but no activation handler - just inform
-                        this.onDebug?.(`BLOCKED source tool: ${input.tool_name} (source "${serverName}" exists but is not enabled)`);
-                        return {
-                          continue: false,
-                          decision: 'block' as const,
-                          reason: `Source "${serverName}" is available but not enabled for this session. Please enable it in the sources panel.`,
-                        };
-                      } else {
-                        // Source doesn't exist or can't be connected
-                        this.onDebug?.(`BLOCKED source tool: ${input.tool_name} (source "${serverName}" does not exist)`);
-                        return {
-                          continue: false,
-                          decision: 'block' as const,
-                          reason: `Source "${serverName}" could not be connected. It may need re-authentication, or the server may be unreachable. Check the source in the sidebar for details.`,
-                        };
+
+                        return blockWithReason(
+                          `Image too large (${sizeMB}MB). The API limit is 5MB base64 (~3.5MB raw). Use a smaller or compressed version.`
+                        );
+                      }
+                    } catch (err) {
+                      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                        this.onDebug?.(`Image size check failed for ${filePath}: ${err}`);
                       }
                     }
                   }
                 }
               }
 
-              // ============================================================
-              // SHARED PRETOOLUSE CHECKS
-              // Uses shared utilities from core/pre-tool-use.ts for consistency
-              // with CodexAgent implementation
-              // ============================================================
+              // Get current permission mode (single source of truth)
+              const permissionMode = getPermissionMode(sessionId);
+              this.onDebug?.(`PreToolUse hook: ${input.tool_name} (sessionId=${sessionId}, permissionMode=${permissionMode})`);
 
               const toolInput = input.tool_input as Record<string, unknown>;
-              let modifiedInput: Record<string, unknown> | null = null;
 
-              // PATH EXPANSION: Expand ~ in file paths for SDK file tools
-              const pathResult = expandToolPaths(
-                input.tool_name,
-                toolInput,
-                (msg) => this.onDebug?.(msg)
-              );
-              if (pathResult.modified) {
-                modifiedInput = pathResult.input;
+              // Run centralized PreToolUse checks
+              const checkResult = runPreToolUseChecks({
+                toolName: input.tool_name,
+                input: toolInput,
+                sessionId,
+                permissionMode,
+                workspaceRootPath: this.workspaceRootPath,
+                workspaceId: extractWorkspaceSlug(this.workspaceRootPath, this.config.workspace.id),
+                plansFolderPath: sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined,
+                dataFolderPath: sessionId ? getSessionDataPath(this.workspaceRootPath, sessionId) : undefined,
+                workingDirectory: this.config.session?.workingDirectory,
+                activeSourceSlugs: Array.from(this.sourceManager.getActiveSlugs()),
+                allSourceSlugs: this.sourceManager.getAllSources().map(s => s.config.slug),
+                hasSourceActivation: !!this.onSourceActivationRequest,
+                permissionManager: this.permissionManager,
+                prerequisiteManager: this.prerequisiteManager,
+                onDebug: (msg) => this.onDebug?.(msg),
+              });
+
+              // Consume pending steer message (if any) — will be injected via additionalContext
+              const steerMsg = this.pendingSteerMessage;
+              if (steerMsg) {
+                this.pendingSteerMessage = null;
+                this.debug(`Injecting steer via additionalContext on ${input.tool_name}`);
               }
 
-              // CONFIG FILE VALIDATION: Validate config writes before they happen
-              const configResult = validateConfigWrite(
-                input.tool_name,
-                modifiedInput || toolInput,
-                this.workspaceRootPath,
-                (msg) => this.onDebug?.(msg)
-              );
-              if (!configResult.valid) {
-                return {
-                  continue: false,
-                  decision: 'block' as const,
-                  reason: configResult.error!,
-                };
-              }
-
-              // SKILL QUALIFICATION: Ensure skill names are fully-qualified
-              // SDK expects "workspaceSlug:skillSlug" format, NOT UUID
-              if (input.tool_name === 'Skill') {
-                const workspaceSlug = extractWorkspaceSlug(this.workspaceRootPath, this.config.workspace.id);
-                const skillResult = qualifySkillName(
-                  modifiedInput || toolInput,
-                  workspaceSlug,
-                  (msg) => this.onDebug?.(msg)
-                );
-                if (skillResult.modified) {
-                  modifiedInput = skillResult.input;
-                }
-              }
-
-              // TOOL METADATA STRIPPING: Remove _intent/_displayName from ALL tools
-              // (extracted for UI in tool-matching.ts, stripped here before SDK execution)
-              const metadataResult = stripToolMetadata(
-                input.tool_name,
-                modifiedInput || toolInput,
-                (msg) => this.onDebug?.(msg)
-              );
-              if (metadataResult.modified) {
-                modifiedInput = metadataResult.input;
-              }
-
-              // If any modifications were made, return with updated input
-              if (modifiedInput) {
-                return {
-                  continue: true,
-                  hookSpecificOutput: {
-                    hookEventName: 'PreToolUse' as const,
-                    updatedInput: modifiedInput,
-                  },
-                };
-              }
-
-              // ============================================================
-              // ASK MODE: Prompt for permission on dangerous operations
-              // In 'safe' mode, these are blocked by shouldAllowToolInMode above
-              // In 'allow-all' mode, permission checks are skipped entirely
-              // ============================================================
-
-              // Helper to request permission and wait for response
-              const requestPermission = async (
-                toolUseId: string,
-                toolName: string,
-                command: string,
-                baseCommand: string,
-                description: string
-              ): Promise<{ allowed: boolean }> => {
-                const requestId = `perm-${toolUseId}`;
-                debug(`[PreToolUse] Requesting permission for ${toolName}: ${command}`);
-
-                const permissionPromise = new Promise<boolean>((resolve) => {
-                  this.pendingPermissions.set(requestId, {
-                    resolve,
-                    toolName,
-                    command,
-                    baseCommand,
-                  });
-                });
-
-                if (this.onPermissionRequest) {
-                  this.onPermissionRequest({
-                    requestId,
-                    toolName,
-                    command,
-                    description,
-                  });
-                } else {
-                  this.pendingPermissions.delete(requestId);
-                  return { allowed: false };
-                }
-
-                const allowed = await permissionPromise;
-                return { allowed };
-              };
-
-              // For file write operations in 'ask' mode, prompt for permission
-              const fileWriteTools = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
-              if (fileWriteTools.has(input.tool_name) && permissionMode === 'ask') {
-                const toolInput = input.tool_input as Record<string, unknown>;
-                const filePath = (toolInput.file_path as string) || (toolInput.notebook_path as string) || 'unknown';
-
-                // Check if this tool type is already allowed for this session
-                if (this.permissionManager.isCommandWhitelisted(input.tool_name)) {
-                  this.onDebug?.(`Auto-allowing "${input.tool_name}" (previously approved)`);
+              // Translate result to SDK format
+              switch (checkResult.type) {
+                case 'allow':
+                  if (steerMsg) {
+                    return {
+                      continue: true,
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse' as const,
+                        additionalContext: `The user just sent a new message while you were working. Stop what you are currently doing and address their message instead:\n\n${steerMsg}`,
+                      },
+                    };
+                  }
                   return { continue: true };
-                }
 
-                const result = await requestPermission(
-                  input.tool_use_id,
-                  input.tool_name,
-                  filePath,
-                  input.tool_name,
-                  `${input.tool_name}: ${filePath}`
-                );
-
-                if (!result.allowed) {
+                case 'modify':
                   return {
-                    continue: false,
-                    decision: 'block' as const,
-                    reason: 'User denied permission',
+                    continue: true,
+                    hookSpecificOutput: {
+                      hookEventName: 'PreToolUse' as const,
+                      updatedInput: checkResult.input,
+                      ...(steerMsg ? { additionalContext: `The user just sent a new message while you were working. Stop what you are currently doing and address their message instead:\n\n${steerMsg}` } : {}),
+                    },
                   };
+
+                case 'block': {
+                  const diagnostics = getPermissionModeDiagnostics(sessionId);
+                  this.onDebug?.(`__PERMISSION_BLOCK__${JSON.stringify({
+                    sessionId,
+                    toolName: input.tool_name,
+                    effectiveMode: diagnostics.permissionMode,
+                    modeVersion: diagnostics.modeVersion,
+                    changedBy: diagnostics.lastChangedBy,
+                    changedAt: diagnostics.lastChangedAt,
+                    reason: checkResult.reason,
+                  })}`);
+                  return blockWithReason(checkResult.reason);
                 }
-              }
 
-              // For MCP mutation tools in 'ask' mode, prompt for permission
-              if (input.tool_name.startsWith('mcp__') && permissionMode === 'ask') {
-                // Check if this is a mutation tool by testing against safe mode's read-only patterns
-                const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
-                const safeModeResult = shouldAllowToolInMode(
-                  input.tool_name,
-                  input.tool_input,
-                  'safe',
-                  { plansFolderPath }
-                );
+                case 'source_activation_needed': {
+                  const { sourceSlug, sourceExists } = checkResult;
+                  if (sourceExists && this.onSourceActivationRequest) {
+                    this.onDebug?.(`Source "${sourceSlug}" not active, attempting auto-enable...`);
+                    try {
+                      const activated = await this.onSourceActivationRequest(sourceSlug);
+                      if (activated) {
+                        this.onDebug?.(`Source "${sourceSlug}" auto-enabled successfully, tools available next turn`);
+                        return {
+                          continue: false,
+                          decision: 'block' as const,
+                          reason: `STOP. Source "${sourceSlug}" has been activated successfully. The tools will be available on the next turn. Do NOT try other tool names or approaches. Respond to the user now: tell them the source is now active and ask them to send their request again.`,
+                        };
+                      } else {
+                        return {
+                          continue: false,
+                          decision: 'block' as const,
+                          reason: `Source "${sourceSlug}" could not be activated. It may require authentication. Please check the source status and authenticate if needed.`,
+                        };
+                      }
+                    } catch (error) {
+                      return {
+                        continue: false,
+                        decision: 'block' as const,
+                        reason: `Failed to activate source "${sourceSlug}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+                      };
+                    }
+                  } else if (sourceExists) {
+                    return {
+                      continue: false,
+                      decision: 'block' as const,
+                      reason: `Source "${sourceSlug}" is available but not enabled for this session. Please enable it in the sources panel.`,
+                    };
+                  } else {
+                    return {
+                      continue: false,
+                      decision: 'block' as const,
+                      reason: `Source "${sourceSlug}" could not be connected. It may need re-authentication, or the server may be unreachable. Check the source in the sidebar for details.`,
+                    };
+                  }
+                }
 
-                // If it would be blocked in safe mode, it's a mutation and needs permission
-                if (!safeModeResult.allowed) {
-                  const serverAndTool = input.tool_name.replace('mcp__', '').replace(/__/g, '/');
+                case 'call_llm_intercept':
+                case 'spawn_session_intercept':
+                  // Claude's session tools run in-process via SDK — just allow
+                  return { continue: true };
 
-                  // Check if this tool is already allowed for this session
-                  if (this.permissionManager.isCommandWhitelisted(input.tool_name)) {
-                    this.onDebug?.(`Auto-allowing "${input.tool_name}" (previously approved)`);
-                    return { continue: true };
+                case 'prompt': {
+                  const requestId = `perm-${input.tool_use_id}`;
+                  const command = checkResult.command || '';
+                  const baseCommand = this.permissionManager.getBaseCommand(command);
+
+                  debug(`[PreToolUse] Requesting permission for ${input.tool_name}: ${command}`);
+
+                  const permissionPromise = new Promise<boolean>((resolve) => {
+                    this.pendingPermissions.set(requestId, {
+                      resolve,
+                      toolName: input.tool_name,
+                      command,
+                      baseCommand,
+                    });
+                  });
+
+                  if (this.onPermissionRequest) {
+                    this.onPermissionRequest({
+                      requestId,
+                      toolName: input.tool_name,
+                      command,
+                      description: checkResult.description,
+                      type: checkResult.promptType,
+                      appName: checkResult.appName,
+                      reason: checkResult.reason,
+                      impact: checkResult.impact,
+                      requiresSystemPrompt: checkResult.requiresSystemPrompt,
+                      rememberForMinutes: checkResult.rememberForMinutes,
+                      commandHash: checkResult.commandHash,
+                      approvalTtlSeconds: checkResult.approvalTtlSeconds,
+                    });
+                  } else {
+                    this.pendingPermissions.delete(requestId);
+                    return {
+                      continue: false,
+                      decision: 'block' as const,
+                      reason: 'No permission handler available',
+                    };
                   }
 
-                  const result = await requestPermission(
-                    input.tool_use_id,
-                    'MCP Tool',
-                    serverAndTool,
-                    input.tool_name,
-                    `MCP: ${serverAndTool}`
-                  );
-
-                  if (!result.allowed) {
+                  const allowed = await permissionPromise;
+                  if (!allowed) {
                     return {
                       continue: false,
                       decision: 'block' as const,
                       reason: 'User denied permission',
                     };
                   }
-                }
-              }
 
-              // For API mutation calls in 'ask' mode, prompt for permission
-              if (input.tool_name.startsWith('api_') && permissionMode === 'ask') {
-                const toolInput = input.tool_input as Record<string, unknown>;
-                const method = ((toolInput?.method as string) || 'GET').toUpperCase();
-                const path = toolInput?.path as string | undefined;
-
-                // Only prompt for mutation methods (not GET)
-                if (method !== 'GET') {
-                  const apiDescription = `${method} ${path || ''}`;
-
-                  // Check if this API endpoint is whitelisted in permissions.json
-                  if (isApiEndpointAllowed(method, path, permissionsContext)) {
-                    this.onDebug?.(`Auto-allowing API "${apiDescription}" (whitelisted in permissions.json)`);
-                    return { continue: true };
-                  }
-
-                  // Check if this API pattern is already allowed (session whitelist)
-                  if (this.permissionManager.isCommandWhitelisted(apiDescription)) {
-                    this.onDebug?.(`Auto-allowing API "${apiDescription}" (previously approved)`);
-                    return { continue: true };
-                  }
-
-                  const result = await requestPermission(
-                    input.tool_use_id,
-                    'API Call',
-                    apiDescription,
-                    apiDescription,
-                    `API: ${apiDescription}`
-                  );
-
-                  if (!result.allowed) {
+                  // User approved — return with modified input if transforms were applied
+                  if (checkResult.modifiedInput) {
                     return {
-                      continue: false,
-                      decision: 'block' as const,
-                      reason: 'User denied permission',
+                      continue: true,
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse' as const,
+                        updatedInput: checkResult.modifiedInput,
+                      },
                     };
                   }
-                }
-              }
-
-              // For Bash in 'ask' mode, check if we need permission
-              if (input.tool_name === 'Bash' && permissionMode === 'ask') {
-                // Extract command and base command
-                const command = typeof input.tool_input === 'object' && input.tool_input !== null
-                  ? (input.tool_input as Record<string, unknown>).command
-                  : JSON.stringify(input.tool_input);
-                const commandStr = String(command);
-                const baseCommand = this.permissionManager.getBaseCommand(commandStr);
-
-                // Auto-allow read-only commands (same ones allowed in Explore mode)
-                // Use merged config to get actual patterns from default.json (SAFE_MODE_CONFIG has empty arrays)
-                const mergedConfig = permissionsConfigCache.getMergedConfig(permissionsContext);
-                const isReadOnly = mergedConfig.readOnlyBashPatterns.some(pattern => pattern.regex.test(commandStr.trim()));
-                if (isReadOnly) {
-                  this.onDebug?.(`Auto-allowing read-only command: ${baseCommand}`);
                   return { continue: true };
                 }
-
-                // Check if this base command is already allowed (and not dangerous)
-                if (this.permissionManager.isCommandWhitelisted(baseCommand) && !this.permissionManager.isDangerousCommand(baseCommand)) {
-                  this.onDebug?.(`Auto-allowing "${baseCommand}" (previously approved)`);
-                  return { continue: true };
-                }
-
-                // For curl/wget, check if the domain is whitelisted
-                if (['curl', 'wget'].includes(baseCommand)) {
-                  const domain = this.permissionManager.extractDomainFromNetworkCommand(commandStr);
-                  if (domain && this.permissionManager.isDomainWhitelisted(domain)) {
-                    this.onDebug?.(`Auto-allowing ${baseCommand} to "${domain}" (domain whitelisted)`);
-                    return { continue: true };
-                  }
-                }
-
-                // Ask for permission
-                const requestId = `perm-${input.tool_use_id}`;
-                debug(`[PreToolUse] Requesting permission for Bash command: ${commandStr}`);
-
-                const permissionPromise = new Promise<boolean>((resolve) => {
-                  this.pendingPermissions.set(requestId, {
-                    resolve,
-                    toolName: input.tool_name,
-                    command: commandStr,
-                    baseCommand,
-                  });
-                });
-
-                if (this.onPermissionRequest) {
-                  this.onPermissionRequest({
-                    requestId,
-                    toolName: input.tool_name,
-                    command: commandStr,
-                    description: `Execute: ${commandStr}`,
-                  });
-                } else {
-                  this.pendingPermissions.delete(requestId);
-                  return {
-                    continue: false,
-                    decision: 'block' as const,
-                    reason: 'No permission handler available',
-                  };
-                }
-
-                const allowed = await permissionPromise;
-                if (!allowed) {
-                  return {
-                    continue: false,
-                    decision: 'block' as const,
-                    reason: 'User denied permission',
-                  };
-                }
               }
-
-              return { continue: true };
             }],
           }],
           // NOTE: PostToolUse hook was removed because updatedMCPToolOutput is not a valid SDK output field.
@@ -1258,20 +1157,21 @@ export class ClaudeAgent extends BaseAgent {
           }],
           SubagentStop: [{
             hooks: [async (input, _toolUseID) => {
-              const typedInput = input as { agent_id?: string };
-              debug(`[ClaudeAgent] SubagentStop: agent_id=${typedInput.agent_id}`);
+              const typedInput = input as { agent_id?: string; agent_transcript_path?: string };
+              debug(`[ClaudeAgent] SubagentStop: agent_id=${typedInput.agent_id}, transcript=${typedInput.agent_transcript_path ?? 'none'}`);
               return { continue: true };
             }],
           }],
           };
 
-          // Merge internal hooks with user hooks from hooks.json
+          // Merge internal hooks with user hooks from automations.json
           // Internal hooks run first (permissions), then user hooks
-          const mergedHooks: Record<string, SdkHookCallbackMatcher[]> = { ...internalHooks };
-          for (const [event, matchers] of Object.entries(userHooks)) {
+          const mergedHooks: Record<string, SdkAutomationCallbackMatcher[]> = { ...internalHooks };
+          for (const [event, matchers] of Object.entries(userHooks) as [string, SdkAutomationCallbackMatcher[]][]) {
+            if (!matchers) continue;
             if (mergedHooks[event]) {
               // Append user hooks after internal hooks
-              mergedHooks[event] = [...mergedHooks[event], ...matchers];
+              mergedHooks[event] = [...mergedHooks[event]!, ...matchers];
             } else {
               // Add new event hooks
               mergedHooks[event] = matchers;
@@ -1282,29 +1182,46 @@ export class ClaudeAgent extends BaseAgent {
         })(),
         // Continue from previous session if we have one (enables conversation history & auto compaction)
         // Skip resume on retry (after session expiry) to start fresh
-        ...(!_isRetry && this.sessionId ? { resume: this.sessionId } : {}),
+        // For branched sessions: fork the parent session so the agent has full conversation context
+        ...(!_isRetry && this.sessionId
+          ? { resume: this.sessionId }
+          : !_isRetry && this.branchFromSdkSessionId
+            ? {
+                resume: this.branchFromSdkSessionId,
+                forkSession: true,
+                // Trim the forked conversation at the branch point so the model
+                // only sees messages up to where the user branched, not the full parent.
+                ...(this.branchFromSdkTurnId ? { resumeSessionAt: this.branchFromSdkTurnId } : {}),
+              }
+            : {}),
         mcpServers,
         // NOTE: This callback is NOT called by the SDK because we set `permissionMode: 'bypassPermissions'` above.
         // All permission logic is handled via the PreToolUse hook instead (see hooks.PreToolUse above).
-        // Skill qualification and Bash permission logic are in PreToolUse where they actually execute.
+        // Bash permission logic is in PreToolUse where it actually executes.
         canUseTool: async (_toolName, input) => {
           return { behavior: 'allow' as const, updatedInput: input as Record<string, unknown> };
         },
         // Selectively disable tools - file tools are disabled (use MCP), web/code controlled by settings
         disallowedTools,
-        // Load workspace as SDK plugin (enables skills, commands, agents from workspace)
-        plugins: [{ type: 'local' as const, path: this.workspaceRootPath }],
+        // No plugins — skills are handled by BaseAgent.chat() via read-before-execute
+        // (the model reads SKILL.md files directly, enforced by PrerequisiteManager)
+        plugins: [],
       };
 
       // Track whether we're trying to resume a session (for error handling)
-      const wasResuming = !_isRetry && !!this.sessionId;
+      // Also covers branch fork attempts where sessionId is null but branchFromSdkSessionId is set
+      const wasResuming = !_isRetry && (!!this.sessionId || !!this.branchFromSdkSessionId);
+      // Track whether this turn attempted branch-point cutoff via resumeSessionAt.
+      // Needed for targeted fallback when the parent message UUID no longer exists server-side.
+      const attemptedBranchCutoff = !_isRetry && !!this.branchFromSdkSessionId && !!this.branchFromSdkTurnId;
 
       // Log resume attempt for debugging session failures
       if (wasResuming) {
-        console.error(`[ClaudeAgent] Attempting to resume SDK session: ${this.sessionId}`);
         debug(`[ClaudeAgent] Attempting to resume SDK session: ${this.sessionId}`);
+        if (this.branchFromSdkSessionId) {
+          debug(`[ClaudeAgent] Branch fork: parentSdkSessionId=${this.branchFromSdkSessionId}, branchFromSdkCwd=${this.branchFromSdkCwd}, resumeSessionAt=${this.branchFromSdkTurnId}, childSdkCwd=${this.config.session?.sdkCwd}`);
+        }
       } else {
-        console.error(`[ClaudeAgent] Starting fresh SDK session (no resume)`);
         debug(`[ClaudeAgent] Starting fresh SDK session (no resume)`);
       }
 
@@ -1329,6 +1246,20 @@ export class ClaudeAgent extends BaseAgent {
         SDK_SLASH_COMMANDS.includes(commandName as typeof SDK_SLASH_COMMANDS[number]) &&
         !attachments?.length;
 
+      // For SDK-fork branches: prepend a one-time context hint so the model treats
+      // the parent conversation history (already in the SDK's messages via --fork-session)
+      // as part of this conversation. Without this, the model sees new session metadata
+      // and treats prior messages as "not this session."
+      // branchFromSdkSessionId is non-null only on the first message (cleared after fork/recovery).
+      let effectiveUserMessage = userMessage;
+      if (!_isRetry && this.branchFromSdkSessionId) {
+        const branchHint = `<branch_context>
+This is a branched conversation. All prior messages in this conversation are part of your shared context with the user. When the user refers to "this conversation" or asks what you discussed, include the full conversation history — not just messages after the branch point.
+</branch_context>`;
+        effectiveUserMessage = `${branchHint}\n\n${userMessage}`;
+        debug('[chat] Injected SDK-fork branch context hint into first message');
+      }
+
       // Create the query - handle slash commands, binary attachments, or regular messages
       if (isSlashCommand) {
         // Send slash commands directly to SDK without context wrapping.
@@ -1336,50 +1267,31 @@ export class ClaudeAgent extends BaseAgent {
         debug(`[chat] Detected SDK slash command: ${trimmedMessage}`);
         this.currentQuery = query({ prompt: trimmedMessage, options: optionsWithAbort });
       } else if (hasBinaryAttachments) {
-        const sdkMessage = this.buildSDKUserMessage(userMessage, attachments);
+        const sdkMessage = this.buildSDKUserMessage(effectiveUserMessage, attachments);
         async function* singleMessage(): AsyncIterable<SDKUserMessage> {
           yield sdkMessage;
         }
         this.currentQuery = query({ prompt: singleMessage(), options: optionsWithAbort });
       } else {
         // Simple string prompt for text-only messages (may include text file contents)
-        const prompt = this.buildTextPrompt(userMessage, attachments);
+        const prompt = this.buildTextPrompt(effectiveUserMessage, attachments);
         this.currentQuery = query({ prompt, options: optionsWithAbort });
       }
 
-      // ═══════════════════════════════════════════════════════════════════════════
-      // STATELESS TOOL MATCHING (see tool-matching.ts for details)
-      // ═══════════════════════════════════════════════════════════════════════════
-      //
-      // Tool matching uses direct ID-based lookup instead of FIFO queues.
-      // The SDK provides:
-      // - parent_tool_use_id on every message → identifies subagent context
-      // - tool_use_id on tool_result content blocks → directly identifies which tool
-      //
-      // This eliminates order-dependent matching. Same messages → same output.
-      //
-      // Three data structures are needed:
-      // - toolIndex: append-only map of toolUseId → {name, input} (order-independent)
-      // - emittedToolStarts: append-only set for stream/assistant dedup (order-independent)
-      // - activeParentTools: tracks running Task tool IDs for fallback parent assignment
-      //   (used when SDK's parent_tool_use_id is null but a Task is active)
-      // ═══════════════════════════════════════════════════════════════════════════
-      const toolIndex = new ToolIndex();
-      const emittedToolStarts = new Set<string>();
-      const activeParentTools = new Set<string>();
-      // Session directory for reading tool metadata — prevents race condition when
-      // concurrent sessions clobber the singleton _sessionDir in toolMetadataStore.
+      // Initialize event adapter for this turn
+      // Session directory prevents race condition when concurrent sessions clobber toolMetadataStore.
       const metadataSessionDir = getSessionPath(this.workspaceRootPath, sessionId);
+      this.eventAdapter.updateSessionDir(metadataSessionDir);
+      this.eventAdapter.startTurn();
 
       // Process SDK messages and convert to AgentEvents
+      const summarizeCallback = this.getSummarizeCallback();
       let receivedComplete = false;
-      // Track text waiting for stop_reason from message_delta
-      let pendingTextForStopReason: string | null = null;
-      // Track current turn ID from message_start (correlation ID for grouping events)
-      let currentTurnId: string | null = null;
       // Track whether we received any assistant content (for empty response detection)
       // When SDK returns empty response (e.g., failed resume), we need to detect and recover
       let receivedAssistantContent = false;
+      let suppressedSessionExpiredError = false;
+      let suppressedBranchCutoffError = false;
       try {
         for await (const message of this.currentQuery) {
           // Track if we got any text content from assistant
@@ -1402,22 +1314,19 @@ export class ClaudeAgent extends BaseAgent {
             this.sessionId = message.session_id;
             // Notify caller of new SDK session ID (for immediate persistence)
             this.config.onSdkSessionIdUpdate?.(message.session_id);
+            // Retire in-memory branch fork metadata (persistence handled by callback)
+            if (this.branchFromSdkSessionId) {
+              debug(`[ClaudeAgent] Branch fork established, retiring in-memory fork metadata`);
+              this.branchFromSdkSessionId = null;
+              this.branchFromSdkCwd = null;
+              this.branchFromSdkTurnId = null;
+            }
           }
 
-          const events = await this.convertSDKMessage(
-            message,
-            toolIndex,
-            emittedToolStarts,
-            activeParentTools,
-            pendingTextForStopReason,
-            (text) => { pendingTextForStopReason = text; },
-            currentTurnId,
-            (id) => { currentTurnId = id; },
-            metadataSessionDir,
-          );
+          const events = await this.eventAdapter.adapt(message);
           for (const event of events) {
             // Check for tool-not-found errors on inactive sources and attempt auto-activation
-            const inactiveSourceError = this.detectInactiveSourceToolError(event, toolIndex);
+            const inactiveSourceError = this.detectInactiveSourceToolError(event, this.eventAdapter.getToolIndex());
 
             if (inactiveSourceError && this.onSourceActivationRequest) {
               const { sourceSlug, toolName } = inactiveSourceError;
@@ -1463,6 +1372,78 @@ export class ClaudeAgent extends BaseAgent {
               }
             }
 
+            // Reset prerequisite state on compaction (LLM loses guide content)
+            if (event.type === 'info' && event.message === 'Compacted Conversation') {
+              this.resetPrerequisiteState();
+            }
+
+            // Intercept large/binary/media-rich tool results — save assets to disk,
+            // preserve original JSON when needed, and/or summarize oversized text.
+            if (event.type === 'tool_result' && !event.isError && event.result) {
+              const guarded = await guardLargeResult(event.result, {
+                sessionPath: metadataSessionDir,
+                toolName: event.toolName || 'unknown',
+                input: event.input,
+                summarize: summarizeCallback,
+              });
+              if (guarded) {
+                yield { ...event, result: guarded };
+                continue;
+              }
+            }
+
+            // Suggest CLI tools when Read fails on convertible file types
+            if (event.type === 'tool_result' && event.toolName === 'Read' && event.isError && event.result) {
+              const filePath = typeof event.input?.file_path === 'string' ? event.input.file_path : undefined;
+              if (filePath) {
+                const ext = filePath.split('.').pop()?.toLowerCase();
+                const hint = ext ? CONVERTIBLE_FILE_HINTS[ext] : undefined;
+                if (hint) {
+                  // Split "or" alternatives into separate backtick-wrapped commands
+                  const commands = hint.split(' or ').map(cmd => `\`${cmd} "${filePath}"\``).join(' or ');
+                  yield { ...event, result: `${event.result}\n\nTip: Use ${commands} to convert this file to readable text.` };
+                  continue;
+                }
+              }
+            }
+
+            // Suppress session-expired errors during resume/fork — don't yield
+            // them to the caller. The post-loop recovery (wasResuming check)
+            // will handle the retry. Without this, the error event reaches the
+            // SessionManager which shows it as a toast before recovery runs.
+            if (
+              wasResuming && !_isRetry &&
+              event.type === 'error' &&
+              'message' in event && typeof event.message === 'string' &&
+              event.message.includes('No conversation found with session ID')
+            ) {
+              debug('[SESSION_DEBUG] Suppressing session-expired error event for recovery:', event.message);
+              suppressedSessionExpiredError = true;
+              continue;
+            }
+
+            // Suppress resumeSessionAt branch-cutoff failures when the requested
+            // parent message UUID no longer exists server-side (e.g., compaction/TTL).
+            // We'll retry once without resumeSessionAt.
+            if (
+              attemptedBranchCutoff && wasResuming && !_isRetry &&
+              event.type === 'error' &&
+              'message' in event && typeof event.message === 'string' &&
+              event.message.includes('No message found with message.uuid')
+            ) {
+              debug('[SESSION_DEBUG] Suppressing missing-UUID branch cutoff error for fallback:', event.message);
+              suppressedBranchCutoffError = true;
+              continue;
+            }
+
+            // Also suppress the complete event that follows a suppressed error —
+            // recovery will produce its own completion flow.
+            if ((suppressedSessionExpiredError || suppressedBranchCutoffError) && event.type === 'complete') {
+              debug('[SESSION_DEBUG] Suppressing complete event after suppressed resume/fork error');
+              receivedComplete = true; // prevent duplicate complete emission
+              continue;
+            }
+
             if (event.type === 'complete') {
               receivedComplete = true;
             }
@@ -1470,13 +1451,29 @@ export class ClaudeAgent extends BaseAgent {
           }
         }
 
+        // Missing-UUID fallback: branch cutoff failed because resumeSessionAt target
+        // no longer exists server-side. Retry once by resuming the child session
+        // that was already established (without re-applying resumeSessionAt).
+        if (suppressedBranchCutoffError && !_isRetry && this.sessionId) {
+          debug('[SESSION_DEBUG] >>> DETECTED MISSING-UUID BRANCH CUTOFF ERROR - retrying on child session without cutoff');
+          yield { type: 'info', message: 'Branch point was compacted on server, retrying with nearest available context...' };
+          yield* this.chat(userMessage, attachments);
+          return;
+        }
+
         // Detect empty response when resuming - SDK silently fails resume if session is invalid
         // In this case, we got a new session ID but no assistant content
         debug('[SESSION_DEBUG] Post-loop check: wasResuming=', wasResuming, 'receivedAssistantContent=', receivedAssistantContent, '_isRetry=', _isRetry);
         if (wasResuming && !receivedAssistantContent && !_isRetry) {
           debug('[SESSION_DEBUG] >>> DETECTED EMPTY RESPONSE - triggering recovery');
+          if (this.branchFromSdkSessionId) {
+            debug(`[ClaudeAgent] Branch fork failed (empty response) before child session establishment (parent=${this.branchFromSdkSessionId}), recovering as fresh session`);
+          }
           // SDK resume failed silently - clear session and retry with context
           this.sessionId = null;
+          this.branchFromSdkSessionId = null; // prevent retry from re-attempting fork with dead parent
+          this.branchFromSdkCwd = null;
+          this.branchFromSdkTurnId = null;
           // Notify that we're clearing the session ID (for persistence)
           this.config.onSdkSessionIdCleared?.();
           // Clear pinned state for fresh start
@@ -1484,6 +1481,8 @@ export class ClaudeAgent extends BaseAgent {
           this.preferencesDriftNotified = false;
 
           // Build recovery context from previous messages to inject into retry
+          // Skip for branch failures — the messages are already in the UI, and
+          // injecting 300+ messages as recovery context overflows the SDK.
           const recoveryContext = this.buildRecoveryContext();
           const messageWithContext = recoveryContext
             ? recoveryContext + userMessage
@@ -1497,10 +1496,10 @@ export class ClaudeAgent extends BaseAgent {
 
         // Defensive: flush any pending text that wasn't emitted
         // This can happen if the SDK sends an assistant message with text but skips the
-        // message_delta event that normally triggers text_complete (e.g., in some ultrathink scenarios)
-        if (pendingTextForStopReason) {
-          yield { type: 'text_complete', text: pendingTextForStopReason, isIntermediate: false, turnId: currentTurnId || undefined };
-          pendingTextForStopReason = null;
+        // message_delta event that normally triggers text_complete (rare edge scenarios)
+        const flushedEvent = this.eventAdapter.flushPending();
+        if (flushedEvent) {
+          yield flushedEvent;
         }
 
         // Defensive: emit complete if SDK didn't send result message
@@ -1629,6 +1628,11 @@ export class ClaudeAgent extends BaseAgent {
         // The SDK's internal Claude Code process exits with code 1 for various API errors
         const isProcessError = errorMsg.includes('process exited with code');
 
+        // Include captured stderr in diagnostics (used by multiple checks below)
+        const stderrContext = this.lastStderrOutput.length > 0
+          ? this.lastStderrOutput.join('\n')
+          : undefined;
+
         // [SESSION_DEBUG] Comprehensive logging for session recovery investigation
         debug('[SESSION_DEBUG] === ERROR HANDLER ENTRY ===');
         debug('[SESSION_DEBUG] errorMsg:', errorMsg);
@@ -1640,33 +1644,53 @@ export class ClaudeAgent extends BaseAgent {
         debug('[SESSION_DEBUG] lastStderrOutput length:', this.lastStderrOutput.length);
         debug('[SESSION_DEBUG] lastStderrOutput:', this.lastStderrOutput.join('\n'));
 
+        // Check for expired session error - SDK session no longer exists server-side.
+        // This happens when sessions expire (TTL) or are cleaned up by Anthropic.
+        // Check error message, raw error, AND stderr — the SDK may propagate the error
+        // through different paths depending on version/timing.
+        const SESSION_EXPIRED_MARKER = 'No conversation found with session ID';
+        const isSessionExpired =
+          suppressedSessionExpiredError ||  // stream-level suppression already detected this
+          errorMsg.includes(SESSION_EXPIRED_MARKER) ||
+          (rawErrorMsg || '').includes(SESSION_EXPIRED_MARKER) ||
+          (stderrContext || '').includes(SESSION_EXPIRED_MARKER);
+        debug('[SESSION_DEBUG] isSessionExpired:', isSessionExpired, 'suppressedSessionExpiredError:', suppressedSessionExpiredError);
+
+        // Missing-UUID fallback may surface as a generic process-exit error in catch,
+        // even after we suppressed the underlying stream error event above.
+        // If branch cutoff failed but child session is established, retry once without cutoff.
+        if (suppressedBranchCutoffError && wasResuming && !_isRetry && this.sessionId) {
+          debug('[SESSION_DEBUG] >>> TAKING PATH: missing-UUID branch-cutoff fallback from catch');
+          yield { type: 'info', message: 'Branch point was compacted on server, retrying with nearest available context...' };
+          yield* this.chat(userMessage, attachments);
+          return;
+        }
+
+        if (isSessionExpired && wasResuming && !_isRetry) {
+          debug('[SESSION_DEBUG] >>> TAKING PATH: Session expired recovery');
+          if (this.branchFromSdkSessionId) {
+            debug(`[ClaudeAgent] Branch fork failed (session expired) before child session establishment (parent=${this.branchFromSdkSessionId}), recovering as fresh session`);
+          }
+          console.error('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
+          debug('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
+          this.sessionId = null;
+          this.branchFromSdkSessionId = null; // prevent retry from re-attempting fork with dead parent
+          this.branchFromSdkCwd = null;
+          this.branchFromSdkTurnId = null;
+          this.config.onSdkSessionIdCleared?.(); // persist cleared ID to JSONL header
+          // Clear pinned state so retry captures fresh values
+          this.pinnedPreferencesPrompt = null;
+          this.preferencesDriftNotified = false;
+          // Use 'info' instead of 'status' to show message without spinner
+          yield { type: 'info', message: 'Session expired, restoring context...' };
+          // Recursively call with isRetry=true (yield* delegates all events)
+          yield* this.chat(userMessage, attachments, { isRetry: true });
+          return;
+        }
+
         if (isProcessError) {
-          // Include captured stderr in diagnostics - this is often where the real error is
-          const stderrContext = this.lastStderrOutput.length > 0
-            ? this.lastStderrOutput.join('\n')
-            : undefined;
           if (stderrContext) {
             debug('[SDK process error] Captured stderr:', stderrContext);
-          }
-
-          // Check for expired session error - SDK session no longer exists server-side
-          // This happens when sessions expire (TTL) or are cleaned up by Anthropic
-          const isSessionExpired = stderrContext?.includes('No conversation found with session ID');
-          debug('[SESSION_DEBUG] isSessionExpired:', isSessionExpired);
-
-          if (isSessionExpired && wasResuming && !_isRetry) {
-            debug('[SESSION_DEBUG] >>> TAKING PATH: Session expired recovery');
-            console.error('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
-            debug('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
-            this.sessionId = null;
-            // Clear pinned state so retry captures fresh values
-            this.pinnedPreferencesPrompt = null;
-            this.preferencesDriftNotified = false;
-            // Use 'info' instead of 'status' to show message without spinner
-            yield { type: 'info', message: 'Session expired, restoring context...' };
-            // Recursively call with isRetry=true (yield* delegates all events)
-            yield* this.chat(userMessage, attachments, { isRetry: true });
-            return;
           }
 
           // Check for Windows SDK setup error (missing .claude/skills directory)
@@ -1674,6 +1698,28 @@ export class ClaudeAgent extends BaseAgent {
           if (windowsSkillsError) {
             yield windowsSkillsError;
             yield { type: 'complete' };
+            return;
+          }
+
+          // Detect spawn ENOENT — Node.js error when the SDK subprocess binary has
+          // been moved/deleted (e.g., during app bundle swap on auto-update).
+          // Structured fields first (precise), regex fallback for stringified stderr.
+          const spawnError = sdkError as NodeJS.ErrnoException;
+          const isSpawnEnoent =
+            (spawnError.code === 'ENOENT' && spawnError.syscall?.startsWith('spawn')) ||
+            /\bspawn\b[\s\S]*\bENOENT\b/.test(stderrContext || '') ||
+            /\bspawn\b[\s\S]*\bENOENT\b/.test(rawErrorMsg || '');
+
+          if (isSpawnEnoent && !_isRetry) {
+            console.error('[ClaudeAgent] spawn ENOENT detected, retrying in 2s', {
+              sessionId: this.config.session?.id,
+              errorCode: spawnError.code,
+              errorSyscall: spawnError.syscall,
+              stderr: (stderrContext || '').slice(0, 200),
+            });
+            yield { type: 'info', message: 'Reconnecting after update...' };
+            await new Promise(r => setTimeout(r, 2000));
+            yield* this.chat(userMessage, attachments, { isRetry: true });
             return;
           }
 
@@ -1697,6 +1743,8 @@ export class ClaudeAgent extends BaseAgent {
             authType: diagnosticAuthType,
             workspaceId: this.config.workspace?.id,
             rawError: stderrContext || rawErrorMsg,
+            providerType: this.config.providerType || connection?.providerType,
+            baseUrl: connection?.baseUrl,
           });
 
           debug('[SESSION_DEBUG] diagnostics.code:', diagnostics.code);
@@ -1742,7 +1790,14 @@ export class ClaudeAgent extends BaseAgent {
         debug('[SESSION_DEBUG] isProcessError=false, checking wasResuming fallback');
         if (wasResuming && !_isRetry) {
           debug('[SESSION_DEBUG] >>> TAKING PATH: wasResuming fallback retry');
+          if (this.branchFromSdkSessionId) {
+            debug(`[ClaudeAgent] Branch fork failed (generic error) before child session establishment (parent=${this.branchFromSdkSessionId}), recovering as fresh session`);
+          }
           this.sessionId = null;
+          this.branchFromSdkSessionId = null; // prevent retry from re-attempting fork with dead parent
+          this.branchFromSdkCwd = null;
+          this.branchFromSdkTurnId = null;
+          this.config.onSdkSessionIdCleared?.(); // persist cleared ID to JSONL header
           // Clear pinned state so retry captures fresh values
           this.pinnedPreferencesPrompt = null;
           this.preferencesDriftNotified = false;
@@ -1795,9 +1850,15 @@ export class ClaudeAgent extends BaseAgent {
       yield { type: 'complete' };
     } finally {
       this.currentQuery = null;
-      // Reset ultrathink override after query completes (single-shot per-message boost)
-      // Note: thinkingLevel is NOT reset - it's sticky for the session
-      this._ultrathinkOverride = false;
+
+      // If a steer message was never delivered (no PreToolUse fired), notify the session
+      // layer so it can re-queue the message for the next turn.
+      const undeliveredSteer = this.pendingSteerMessage;
+      if (undeliveredSteer) {
+        this.pendingSteerMessage = null;
+        this.debug(`Steer message was not delivered (no tool call fired) — emitting steer_undelivered`);
+        yield { type: 'steer_undelivered' as const, message: undeliveredSteer };
+      }
     }
   }
 
@@ -1817,6 +1878,11 @@ export class ClaudeAgent extends BaseAgent {
     // Add context parts using centralized PromptBuilder
     // This includes: date/time, session state (with plansFolderPath),
     // workspace capabilities, and working directory context
+    const textPromptDiagnostics = getPermissionModeDiagnostics(this.modeSessionId)
+    this.debug(
+      `[ModeSnapshot] sessionId=${this.modeSessionId} buildTextPrompt mode=${textPromptDiagnostics.permissionMode} ` +
+      `modeVersion=${textPromptDiagnostics.modeVersion} changedBy=${textPromptDiagnostics.lastChangedBy} changedAt=${textPromptDiagnostics.lastChangedAt}`
+    )
     const contextParts = this.promptBuilder.buildContextParts(
       { plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId) },
       this.sourceManager.formatSourceState()
@@ -1858,6 +1924,11 @@ export class ClaudeAgent extends BaseAgent {
     // Add context parts using centralized PromptBuilder
     // This includes: date/time, session state (with plansFolderPath),
     // workspace capabilities, and working directory context
+    const sdkPromptDiagnostics = getPermissionModeDiagnostics(this.modeSessionId)
+    this.debug(
+      `[ModeSnapshot] sessionId=${this.modeSessionId} buildSDKUserMessage mode=${sdkPromptDiagnostics.permissionMode} ` +
+      `modeVersion=${sdkPromptDiagnostics.modeVersion} changedBy=${sdkPromptDiagnostics.lastChangedBy} changedAt=${sdkPromptDiagnostics.lastChangedAt}`
+    )
     const contextParts = this.promptBuilder.buildContextParts(
       { plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId) },
       this.sourceManager.formatSourceState()
@@ -2091,6 +2162,17 @@ export class ClaudeAgent extends BaseAgent {
         canRetry: true,
         retryDelayMs: 2000,
       },
+      'max_output_tokens': {
+        code: 'invalid_request',
+        title: 'Output Too Large',
+        message: 'The response exceeded the maximum output token limit.',
+        details: ['Try breaking the task into smaller parts', 'Reduce the scope of the request'],
+        actions: [
+          { key: 'r', label: 'Retry', action: 'retry' },
+        ],
+        canRetry: true,
+        retryDelayMs: 1000,
+      },
       'unknown': {
         code: 'unknown_error',
         title: 'Unknown Error',
@@ -2117,380 +2199,6 @@ export class ClaudeAgent extends BaseAgent {
       type: 'typed_error',
       error,
     };
-  }
-
-  private async convertSDKMessage(
-    message: SDKMessage,
-    toolIndex: ToolIndex,
-    emittedToolStarts: Set<string>,
-    activeParentTools: Set<string>,
-    pendingText: string | null,
-    setPendingText: (text: string | null) => void,
-    turnId: string | null,
-    setTurnId: (id: string | null) => void,
-    sessionDir?: string,
-  ): Promise<AgentEvent[]> {
-    const events: AgentEvent[] = [];
-
-    // Debug: log all SDK message types to understand MCP tool result flow
-    if (this.onDebug) {
-      const msgInfo = message.type === 'user' && 'tool_use_result' in message
-        ? `user (tool_result for ${(message as any).parent_tool_use_id})`
-        : message.type;
-      this.onDebug(`SDK message: ${msgInfo}`);
-    }
-
-    switch (message.type) {
-      case 'assistant': {
-        // Check for SDK-level errors FIRST (auth, network, rate limits, etc.)
-        // These errors are set by the SDK when API calls fail
-        if ('error' in message && message.error) {
-          // Extract actual API error from SDK debug log for better error details
-          // Uses async to allow retry with delays for race condition handling
-          const errorEvent = await this.mapSDKErrorToTypedError(message.error);
-          events.push(errorEvent);
-          // Don't process content blocks when there's an error
-          break;
-        }
-
-        // Skip replayed messages when resuming a session - they're historical
-        if ('isReplay' in message && message.isReplay) {
-          break;
-        }
-
-        // Track usage from non-sidechain assistant messages for accurate context window display
-        // Skip sidechain messages (from subagents) - only main chain affects primary context
-        const isSidechain = message.parent_tool_use_id !== null;
-        if (!isSidechain && message.message.usage) {
-          this.lastAssistantUsage = {
-            input_tokens: message.message.usage.input_tokens,
-            cache_read_input_tokens: message.message.usage.cache_read_input_tokens ?? 0,
-            cache_creation_input_tokens: message.message.usage.cache_creation_input_tokens ?? 0,
-          };
-
-          // Emit real-time usage update for context display
-          // inputTokens = context size actually sent to API (includes cache tokens)
-          const currentInputTokens =
-            this.lastAssistantUsage.input_tokens +
-            this.lastAssistantUsage.cache_read_input_tokens +
-            this.lastAssistantUsage.cache_creation_input_tokens;
-
-          events.push({
-            type: 'usage_update',
-            usage: {
-              inputTokens: currentInputTokens,
-              // contextWindow comes from modelUsage in result - use cached value if available
-              contextWindow: this.cachedContextWindow,
-            },
-          });
-        }
-
-        // Full assistant message with content blocks
-        const content = message.message.content;
-
-        // Extract text from content blocks
-        let textContent = '';
-        for (const block of content) {
-          if (block.type === 'text') {
-            textContent += block.text;
-          }
-        }
-
-        // Stateless tool start extraction — uses SDK's parent_tool_use_id directly.
-        // Falls back to activeParentTools when SDK doesn't provide parent info.
-        const sdkParentId = message.parent_tool_use_id;
-        const toolStartEvents = extractToolStarts(
-          content as ContentBlock[],
-          sdkParentId,
-          toolIndex,
-          emittedToolStarts,
-          turnId || undefined,
-          activeParentTools,
-          sessionDir,
-        );
-
-        // Track active Task tools for fallback parent assignment.
-        // When a Task tool starts, add it to the active set.
-        // This enables fallback parent assignment for child tools when SDK's
-        // parent_tool_use_id is null.
-        for (const event of toolStartEvents) {
-          if (event.type === 'tool_start' && event.toolName === 'Task') {
-            activeParentTools.add(event.toolUseId);
-          }
-        }
-
-        events.push(...toolStartEvents);
-
-        if (textContent) {
-          // Don't emit text_complete yet - wait for message_delta to get actual stop_reason
-          // The assistant message arrives with stop_reason: null during streaming
-          // The actual stop_reason comes in the message_delta event
-          setPendingText(textContent);
-        }
-        break;
-      }
-
-      case 'stream_event': {
-        // Streaming partial message
-        const event = message.event;
-        // Debug: log all stream events to understand tool result flow
-        if (this.onDebug && event.type !== 'content_block_delta') {
-          this.onDebug(`stream_event: ${event.type}, content_type=${(event as any).content_block?.type || (event as any).delta?.type || 'n/a'}`);
-        }
-        // Capture turn ID from message_start (arrives before any content events)
-        // This ID correlates all events in an assistant turn
-        if (event.type === 'message_start') {
-          const messageId = (event as any).message?.id;
-          if (messageId) {
-            setTurnId(messageId);
-          }
-        }
-        // message_delta contains the actual stop_reason - emit pending text now
-        if (event.type === 'message_delta') {
-          const stopReason = (event as any).delta?.stop_reason;
-          if (pendingText) {
-            const isIntermediate = stopReason === 'tool_use';
-            // SDK's parent_tool_use_id identifies the subagent context for this text
-            // (null = main agent, Task ID = inside subagent)
-            events.push({ type: 'text_complete', text: pendingText, isIntermediate, turnId: turnId || undefined, parentToolUseId: message.parent_tool_use_id || undefined });
-            setPendingText(null);
-          }
-        }
-        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-          events.push({ type: 'text_delta', text: event.delta.text, turnId: turnId || undefined, parentToolUseId: message.parent_tool_use_id || undefined });
-        } else if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') {
-          // Stateless tool start extraction from stream events.
-          // SDK's parent_tool_use_id is authoritative for parent assignment.
-          // Falls back to activeParentTools when SDK doesn't provide parent info.
-          // Stream events arrive with empty input — the full input comes later
-          // in the assistant message (extractToolStarts handles dedup + re-emit).
-          const toolBlock = event.content_block;
-          const sdkParentId = message.parent_tool_use_id;
-          const streamBlocks: ContentBlock[] = [{
-            type: 'tool_use' as const,
-            id: toolBlock.id,
-            name: toolBlock.name,
-            input: (toolBlock.input ?? {}) as Record<string, unknown>,
-          }];
-          const streamEvents = extractToolStarts(
-            streamBlocks,
-            sdkParentId,
-            toolIndex,
-            emittedToolStarts,
-            turnId || undefined,
-            activeParentTools,
-            sessionDir,
-          );
-
-          // Track active Task tools for fallback parent assignment
-          for (const evt of streamEvents) {
-            if (evt.type === 'tool_start' && evt.toolName === 'Task') {
-              activeParentTools.add(evt.toolUseId);
-            }
-          }
-
-          events.push(...streamEvents);
-        }
-        break;
-      }
-
-      case 'user': {
-        // Skip replayed messages when resuming a session - they're historical
-        if ('isReplay' in message && message.isReplay) {
-          break;
-        }
-
-        // ─────────────────────────────────────────────────────────────────────────
-        // STATELESS TOOL RESULT MATCHING
-        // ─────────────────────────────────────────────────────────────────────────
-        // Uses extractToolResults() which matches results by explicit tool_use_id
-        // from content blocks — no FIFO queues, no parent stacks needed.
-        // Falls back to convenience field tool_use_result when content blocks
-        // are unavailable (e.g., some in-process MCP tools).
-        // ─────────────────────────────────────────────────────────────────────────
-        if (message.tool_use_result !== undefined || ('message' in message && message.message)) {
-          // Extract content blocks from the SDK message
-          const msgContent = ('message' in message && message.message)
-            ? ((message.message as { content?: unknown[] }).content ?? [])
-            : [];
-          const contentBlocks = (Array.isArray(msgContent) ? msgContent : []) as ContentBlock[];
-
-          const sdkParentId = message.parent_tool_use_id;
-          const toolUseResultValue = message.tool_use_result;
-
-          const resultEvents = extractToolResults(
-            contentBlocks,
-            sdkParentId,
-            toolUseResultValue,
-            toolIndex,
-            turnId || undefined,
-          );
-
-          // Remove completed Task tools from activeParentTools.
-          // When a Task tool result arrives, we no longer need to track it
-          // as an active parent for fallback assignment.
-          for (const event of resultEvents) {
-            if (event.type === 'tool_result' && event.toolName === 'Task') {
-              activeParentTools.delete(event.toolUseId);
-            }
-          }
-
-          events.push(...resultEvents);
-        }
-        break;
-      }
-
-      case 'tool_progress': {
-        // tool_progress events are emitted for subagent child tools.
-        // Uses SDK's parent_tool_use_id as authoritative parent assignment.
-        const progress = message as {
-          tool_use_id: string;
-          tool_name: string;
-          parent_tool_use_id: string | null;
-          elapsed_time_seconds?: number;
-        };
-
-        // Forward elapsed time to UI for live progress updates
-        // Use parent_tool_use_id if this is a child tool, so progress updates the parent Task
-        if (progress.elapsed_time_seconds !== undefined) {
-          events.push({
-            type: 'task_progress',
-            toolUseId: progress.parent_tool_use_id || progress.tool_use_id,
-            elapsedSeconds: progress.elapsed_time_seconds,
-            turnId: turnId || undefined,
-          });
-        }
-
-        // If we haven't seen this tool yet, emit a tool_start via extractToolStarts.
-        // This handles child tools discovered through progress events before
-        // stream_event or assistant message arrives.
-        if (!emittedToolStarts.has(progress.tool_use_id)) {
-          const progressBlocks: ContentBlock[] = [{
-            type: 'tool_use' as const,
-            id: progress.tool_use_id,
-            name: progress.tool_name,
-            input: {},
-          }];
-          const progressEvents = extractToolStarts(
-            progressBlocks,
-            progress.parent_tool_use_id,
-            toolIndex,
-            emittedToolStarts,
-            turnId || undefined,
-            activeParentTools,
-            sessionDir,
-          );
-
-          // Track active Task tools discovered via progress events
-          for (const evt of progressEvents) {
-            if (evt.type === 'tool_start' && evt.toolName === 'Task') {
-              activeParentTools.add(evt.toolUseId);
-            }
-          }
-
-          events.push(...progressEvents);
-        }
-        break;
-      }
-
-      case 'result': {
-        // Debug: log result message details (stderr to avoid SDK JSON pollution)
-        console.error(`[ClaudeAgent] result message: subtype=${message.subtype}, errors=${'errors' in message ? JSON.stringify((message as any).errors) : 'none'}`);
-
-        // Get contextWindow from modelUsage (this is correct - it's the model's context window size)
-        const modelUsageEntries = Object.values(message.modelUsage || {});
-        const primaryModelUsage = modelUsageEntries[0];
-
-        // Cache contextWindow for real-time usage_update events in subsequent turns
-        if (primaryModelUsage?.contextWindow) {
-          this.cachedContextWindow = primaryModelUsage.contextWindow;
-        }
-
-        // Use lastAssistantUsage for context window display (per-message, not cumulative)
-        // result.modelUsage is cumulative across the entire session (for billing)
-        // but we need the actual current context size from the last assistant message
-        // See: https://github.com/anthropics/claude-agent-sdk-typescript/issues/66
-        let inputTokens: number;
-        let cacheRead: number;
-        let cacheCreation: number;
-
-        if (this.lastAssistantUsage) {
-          // Use tracked per-message usage (correct for context display)
-          inputTokens = this.lastAssistantUsage.input_tokens +
-                        this.lastAssistantUsage.cache_read_input_tokens +
-                        this.lastAssistantUsage.cache_creation_input_tokens;
-          cacheRead = this.lastAssistantUsage.cache_read_input_tokens;
-          cacheCreation = this.lastAssistantUsage.cache_creation_input_tokens;
-        } else {
-          // Fallback to result.usage if no assistant message was tracked
-          cacheRead = message.usage.cache_read_input_tokens ?? 0;
-          cacheCreation = message.usage.cache_creation_input_tokens ?? 0;
-          inputTokens = message.usage.input_tokens + cacheRead + cacheCreation;
-        }
-
-        const usage = {
-          inputTokens,
-          outputTokens: message.usage.output_tokens,
-          cacheReadTokens: cacheRead,
-          cacheCreationTokens: cacheCreation,
-          costUsd: message.total_cost_usd,
-          contextWindow: primaryModelUsage?.contextWindow,
-        };
-
-        if (message.subtype === 'success') {
-          events.push({ type: 'complete', usage });
-        } else {
-          // Error result - emit error then complete with whatever usage we have
-          const errorMsg = 'errors' in message ? message.errors.join(', ') : 'Query failed';
-
-          // Check for Windows SDK setup error (missing .claude/skills directory)
-          const windowsError = buildWindowsSkillsDirError(errorMsg);
-          if (windowsError) {
-            events.push(windowsError);
-          } else {
-            events.push({ type: 'error', message: errorMsg });
-          }
-          events.push({ type: 'complete', usage });
-        }
-        break;
-      }
-
-      case 'system': {
-        // System messages (init, compaction, status)
-        if (message.subtype === 'init') {
-          // Capture tools list from SDK init message
-          if ('tools' in message && Array.isArray(message.tools)) {
-            this.sdkTools = message.tools;
-            this.onDebug?.(`SDK init: captured ${this.sdkTools.length} tools`);
-          }
-        } else if (message.subtype === 'compact_boundary') {
-          events.push({
-            type: 'info',
-            message: 'Compacted Conversation',
-          });
-        } else if (message.subtype === 'status' && message.status === 'compacting') {
-          events.push({ type: 'status', message: 'Compacting conversation...' });
-        }
-        break;
-      }
-
-      case 'auth_status': {
-        if (message.error) {
-          events.push({ type: 'error', message: `Auth error: ${message.error}. Try running /auth to re-authenticate.` });
-        }
-        break;
-      }
-
-      default: {
-        // Log unhandled message types for debugging
-        if (this.onDebug) {
-          this.onDebug(`Unhandled SDK message type: ${(message as any).type}`);
-        }
-        break;
-      }
-    }
-
-    return events;
   }
 
   /**
@@ -2569,6 +2277,23 @@ export class ClaudeAgent extends BaseAgent {
   }
 
   /**
+   * Redirect mid-stream via additionalContext injection.
+   * Stores the message; the next PreToolUse hook injects it into the conversation.
+   * If no tool call fires before the turn ends, yields steer_undelivered so the
+   * session layer can re-queue the message.
+   */
+  override redirect(message: string): boolean {
+    if (!this.currentQuery || !this.currentQueryAbortController) {
+      // Not actively streaming — fall back to abort + queue
+      this.forceAbort(AbortReason.Redirect);
+      return false;
+    }
+    this.debug(`Steering mid-stream: "${message.slice(0, 100)}"`);
+    this.pendingSteerMessage = message;
+    return true;
+  }
+
+  /**
    * Force-abort the current query using the SDK's AbortController.
    * This immediately stops processing (SIGTERM/SIGKILL) without waiting for graceful shutdown.
    * Use this when you need instant termination (e.g., queuing a new message).
@@ -2577,6 +2302,7 @@ export class ClaudeAgent extends BaseAgent {
    */
   forceAbort(reason: AbortReason = AbortReason.UserStop): void {
     this.lastAbortReason = reason;
+    this.pendingSteerMessage = null; // Clear any undelivered steer
     if (this.currentQueryAbortController) {
       this.currentQueryAbortController.abort(reason);
       this.currentQueryAbortController = null;
@@ -2592,12 +2318,11 @@ export class ClaudeAgent extends BaseAgent {
    * Get the list of SDK tools (captured from init message)
    */
   getSdkTools(): string[] {
-    return this.sdkTools;
+    return this.eventAdapter.sdkTools;
   }
 
   setModel(model: string): void {
-    this.config.model = model;
-    // Note: Model change takes effect on the next query
+    super.setModel(model);
   }
 
   // ============================================================
@@ -2665,65 +2390,11 @@ export class ClaudeAgent extends BaseAgent {
    * @param intendedSlugs Optional list of source slugs that should be considered active
    *                      (what the UI shows as active, even if build failed)
    */
-  setSourceServers(
-    mcpServers: Record<string, SdkMcpServerConfig>,
-    apiServers: Record<string, unknown>,
-    intendedSlugs?: string[]
-  ): void {
-    // Store server configs for SDK options building
-    this.sourceMcpServers = mcpServers;
-    this.sourceApiServers = apiServers as Record<string, ReturnType<typeof createSdkMcpServer>>;
-
-    // Delegate state tracking to sourceManager (inherited from BaseAgent)
-    this.sourceManager.updateActiveState(
-      Object.keys(mcpServers),
-      Object.keys(apiServers),
-      intendedSlugs
-    );
-  }
 
   // isSourceServerActive, getActiveSourceServerNames, setAllSources, getAllSources, markSourceUnseen
   // are now inherited from BaseAgent and delegate to this.sourceManager
 
   // setTemporaryClarifications is now inherited from BaseAgent
-
-  /**
-   * Get filtered source MCP servers based on local MCP setting
-   * @returns Object with filtered servers and names of any skipped stdio servers
-   */
-  private getSourceMcpServersFiltered(): { servers: Record<string, SdkMcpServerConfig>; skipped: string[] } {
-    return this.filterMcpServersByLocalEnabled(this.sourceMcpServers);
-  }
-
-  /**
-   * Filter MCP servers based on whether local (stdio) MCP is enabled for this workspace.
-   * When local MCP is disabled, stdio servers are filtered out.
-   *
-   * @returns Object with filtered servers and names of any skipped stdio servers
-   */
-  private filterMcpServersByLocalEnabled(
-    servers: Record<string, SdkMcpServerConfig>
-  ): { servers: Record<string, SdkMcpServerConfig>; skipped: string[] } {
-    const localEnabled = isLocalMcpEnabled(this.workspaceRootPath);
-
-    if (localEnabled) {
-      // Local MCP is enabled, return all servers
-      return { servers, skipped: [] };
-    }
-
-    // Local MCP is disabled, filter out stdio servers
-    const filtered: Record<string, SdkMcpServerConfig> = {};
-    const skipped: string[] = [];
-    for (const [name, config] of Object.entries(servers)) {
-      if (config.type !== 'stdio') {
-        filtered[name] = config;
-      } else {
-        debug(`[filterMcpServers] Filtering out stdio server "${name}" (local MCP disabled)`);
-        skipped.push(name);
-      }
-    }
-    return { servers: filtered, skipped };
-  }
 
   async close(): Promise<void> {
     this.forceAbort();
@@ -2806,6 +2477,29 @@ export class ClaudeAgent extends BaseAgent {
   // getActiveSourceSlugs() is now inherited from BaseAgent
 
   // ============================================================
+  // Branch preflight
+  // ============================================================
+
+  /**
+   * Branch preflight is intentionally a no-op for Claude sessions.
+   *
+   * The SDK's fork mechanism (resume + forkSession) runs naturally on the
+   * first user message in chat(). Attempting to pre-fork with a separate
+   * SDK subprocess is unreliable — the forked session gets garbage-collected
+   * by Anthropic before the user sends their first message, or the subprocess
+   * crashes during initialization.
+   *
+   * Defense-in-depth recovery in chat() handles fork failures:
+   * - wasResuming covers branchFromSdkSessionId
+   * - Session-expired detection checks errorMsg, rawErrorMsg, and stderr
+   * - branchFromSdkSessionId is cleared on recovery to prevent retry loops
+   */
+  override async ensureBranchReady(): Promise<void> {
+    // No preflight needed — fork happens on first chat() call via
+    // resume: branchFromSdkSessionId + forkSession: true
+  }
+
+  // ============================================================
   // Mini Completion (for title generation and other quick tasks)
   // ============================================================
 
@@ -2815,32 +2509,73 @@ export class ClaudeAgent extends BaseAgent {
    * Uses the same auth infrastructure as the main agent.
    */
   async runMiniCompletion(prompt: string): Promise<string | null> {
-    try {
-      const model = this.config.miniModel ?? getDefaultSummarizationModel();
+    if (!this.config.miniModel) {
+      throw new Error('ClaudeAgent.runMiniCompletion: config.miniModel is required');
+    }
+    const model = this.config.miniModel;
 
-      const options = {
-        ...getDefaultOptions(),
-        model,
-        maxTurns: 1,
-        systemPrompt: 'Reply with ONLY the requested text. No explanation.', // Minimal - no Claude Code preset
-      };
+    const options = {
+      ...getDefaultOptions(this.config.envOverrides),
+      model,
+      maxTurns: 1,
+      systemPrompt: 'Reply with ONLY the requested text. No explanation.', // Minimal - no Claude Code preset
+    };
 
-      let result = '';
-      for await (const msg of query({ prompt, options })) {
-        if (msg.type === 'assistant') {
-          for (const block of msg.message.content) {
-            if (block.type === 'text') {
-              result += block.text;
-            }
+    let result = '';
+    for await (const msg of query({ prompt, options })) {
+      if (msg.type === 'assistant') {
+        for (const block of msg.message.content) {
+          if (block.type === 'text') {
+            result += block.text;
           }
         }
       }
-
-      return result.trim() || null;
-    } catch (error) {
-      this.debug(`[runMiniCompletion] Failed: ${error}`);
-      return null;
     }
+
+    return result.trim() || null;
+  }
+
+  // ============================================================
+  // queryLlm — Agent-native LLM query for call_llm tool (OAuth path)
+  // ============================================================
+
+  async queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
+    const model = request.model ?? this.config.miniModel ?? getDefaultSummarizationModel();
+
+    const options = {
+      ...getDefaultOptions(this.config.envOverrides),
+      model,
+      maxTurns: 1,
+      systemPrompt: request.systemPrompt ?? 'Reply with ONLY the requested text. No explanation.',
+      ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
+      ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+      ...(request.outputSchema ? {
+        outputFormat: { type: 'json_schema' as const, schema: request.outputSchema },
+      } : {}),
+    };
+
+    let result = '';
+    let structuredOutput: unknown = undefined;
+
+    for await (const msg of query({ prompt: request.prompt, options })) {
+      if (msg.type === 'assistant') {
+        for (const block of msg.message.content) {
+          if (block.type === 'text') {
+            result += block.text;
+          }
+        }
+      }
+      // Extract structured output from SDK result message
+      if (msg.type === 'result' && (msg as SDKResultSuccess).subtype === 'success') {
+        structuredOutput = (msg as SDKResultSuccess).structured_output;
+      }
+    }
+
+    // Prefer structured output when available
+    if (structuredOutput !== undefined) {
+      return { text: JSON.stringify(structuredOutput, null, 2) };
+    }
+    return { text: result.trim() };
   }
 
   // ============================================================

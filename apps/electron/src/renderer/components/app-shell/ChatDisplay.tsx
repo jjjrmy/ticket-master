@@ -9,10 +9,10 @@ import {
   CircleAlert,
   ExternalLink,
   Info,
-  PenLine,
   X,
 } from "lucide-react"
 import { motion, AnimatePresence } from "motion/react"
+import { toast } from "sonner"
 
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
@@ -25,6 +25,8 @@ import {
   parseGrepResult,
   parseGlobResult,
   extractOverlayData,
+  extractOverlayCards,
+  ActivityCardsOverlay,
   CodePreviewOverlay,
   MultiDiffPreviewOverlay,
   TerminalPreviewOverlay,
@@ -33,7 +35,6 @@ import {
   DocumentFormattedMarkdownOverlay,
   detectLanguage,
   type ActivityItem,
-  type OverlayData,
   type FileChange,
   type DiffViewerSettings,
 } from "@craft-agent/ui"
@@ -42,16 +43,34 @@ import { useTheme } from "@/hooks/useTheme"
 import type { Session, Message, FileAttachment, StoredAttachment, PermissionRequest, CredentialRequest, CredentialResponse, LoadedSource, LoadedSkill } from "../../../shared/types"
 import type { PermissionMode } from "@craft-agent/shared/agent/modes"
 import type { ThinkingLevel } from "@craft-agent/shared/agent/thinking-levels"
-import { TurnCard, UserMessageBubble, groupMessagesByTurn, formatTurnAsMarkdown, formatActivityAsMarkdown, type Turn, type AssistantTurn, type UserTurn, type SystemTurn, type AuthRequestTurn } from "@craft-agent/ui"
+import {
+  TurnCard,
+  UserMessageBubble,
+  groupMessagesByTurn,
+  formatTurnAsMarkdown,
+  formatActivityAsMarkdown,
+  getAssistantTurnUiKey,
+  asRecord,
+  getAnnotationNoteText,
+  isAnnotationFollowUpSent,
+  extractAnnotationSelectedText,
+  normalizeFollowUpText,
+  type Turn,
+  type AssistantTurn,
+  type UserTurn,
+  type SystemTurn,
+  type AuthRequestTurn,
+} from "@craft-agent/ui"
 import { MemoizedAuthRequestCard } from "@/components/chat/AuthRequestCard"
-import { ActiveOptionBadges } from "./ActiveOptionBadges"
-import { InputContainer, type StructuredInputState, type StructuredResponse, type PermissionResponse } from "./input"
+import { ChatInputZone, type StructuredInputState, type StructuredResponse, type PermissionResponse, type AdminApprovalResponse } from "./input"
 import type { RichTextInputHandle } from "@/components/ui/rich-text-input"
 import { useBackgroundTasks } from "@/hooks/useBackgroundTasks"
 import { useTurnCardExpansion } from "@/hooks/useTurnCardExpansion"
-import type { SessionMeta } from "@/atoms/sessions"
+import { useNavigation } from "@/contexts/NavigationContext"
+import { useAppShellContext } from "@/context/AppShellContext"
+import { routes } from "@/lib/navigate"
 import { CHAT_LAYOUT } from "@/config/layout"
-import { flattenLabels } from "@craft-agent/shared/labels"
+import { resolveBranchNewPanelOption } from "./branching"
 
 // ============================================================================
 // Overlay State Types
@@ -81,14 +100,16 @@ type OverlayState =
   | MarkdownOverlayState
   | null
 
-/**
- * Checks if a file path is in a plans folder and is a markdown file.
- * Used to conditionally show the PLAN header in DocumentFormattedMarkdownOverlay.
- */
-function isPlanFilePath(filePath: string | undefined): boolean {
-  if (!filePath) return false
-  return (filePath.includes('/plans/') || filePath.startsWith('plans/')) &&
-         filePath.endsWith('.md')
+function isStackedActivityTool(activity: ActivityItem): boolean {
+  const toolName = activity.toolName?.toLowerCase() || ''
+  return toolName === 'bash' || toolName.startsWith('mcp__') || toolName.startsWith('browser_')
+}
+
+function getTurnKey(turn: Turn): string {
+  if (turn.type === 'user') return `user-${turn.message.id}`
+  if (turn.type === 'system') return `system-${turn.message.id}`
+  if (turn.type === 'auth-request') return `auth-${turn.message.id}`
+  return `turn-${turn.turnId}-${turn.timestamp}`
 }
 
 interface ChatDisplayProps {
@@ -109,7 +130,13 @@ interface ChatDisplayProps {
   /** Pending permission request for this session */
   pendingPermission?: PermissionRequest
   /** Callback to respond to permission request */
-  onRespondToPermission?: (sessionId: string, requestId: string, allowed: boolean, alwaysAllow: boolean) => void
+  onRespondToPermission?: (
+    sessionId: string,
+    requestId: string,
+    allowed: boolean,
+    alwaysAllow: boolean,
+    options?: import('../../../shared/types').PermissionResponseOptions
+  ) => void
   /** Pending credential request for this session */
   pendingCredential?: CredentialRequest
   /** Callback to respond to credential request */
@@ -120,9 +147,6 @@ interface ChatDisplayProps {
   /** Callback when thinking level changes */
   onThinkingLevelChange?: (level: ThinkingLevel) => void
   // Advanced options
-  /** Enable ultrathink mode for extended reasoning */
-  ultrathinkEnabled?: boolean
-  onUltrathinkChange?: (enabled: boolean) => void
   /** Current permission mode */
   permissionMode?: PermissionMode
   onPermissionModeChange?: (mode: PermissionMode) => void
@@ -148,9 +172,9 @@ interface ChatDisplayProps {
   onLabelsChange?: (labels: string[]) => void
   // State/status selection (for # menu and ActiveOptionBadges)
   /** Available workflow states */
-  todoStates?: import('@/config/todo-states').TodoState[]
+  sessionStatuses?: import('@/config/session-status-config').SessionStatus[]
   /** Callback when session state changes */
-  onTodoStateChange?: (stateId: string) => void
+  onSessionStatusChange?: (stateId: string) => void
   /** Workspace ID for loading skill icons */
   workspaceId?: string
   // Working directory (per session)
@@ -184,6 +208,84 @@ interface ChatDisplayProps {
   emptyStateLabel?: string
   /** When true, the session's locked connection has been removed - disables send and shows unavailable state */
   connectionUnavailable?: boolean
+}
+
+type PendingFollowUpAnnotation = {
+  messageId: string
+  annotationId: string
+  note: string
+  selectedText: string
+  createdAt: number
+  color?: string
+  meta?: Record<string, unknown>
+}
+
+function normalizeExcerptForMessage(text: string, maxLength = 280): string {
+  const normalized = normalizeFollowUpText(text)
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`
+}
+
+function formatFollowUpSection(
+  followUps: PendingFollowUpAnnotation[],
+  options?: { includeTopSeparator?: boolean }
+): string {
+  if (followUps.length === 0) return ''
+
+  const includeTopSeparator = options?.includeTopSeparator ?? true
+
+  const items = followUps.map((followUp, idx) => {
+    const quoteText = normalizeExcerptForMessage(followUp.selectedText)
+    return [
+      `> [#${idx + 1}] ${quoteText}`,
+      `→ ${followUp.note}`,
+    ].join('\n')
+  })
+
+  const body = ['**Follow-ups**', items.join('\n\n---\n\n')].join('\n\n')
+  return includeTopSeparator ? `---\n\n${body}` : body
+}
+
+function normalizeFollowUpsMarkdown(message: string): string {
+  const normalizedInput = message.replace(/\r\n/g, '\n')
+  const headingMatch = /(?:\*\*Follow-ups\*\*|Follow-up annotations:)/i.exec(normalizedInput)
+  if (!headingMatch || headingMatch.index == null) return message
+
+  const headingIndex = headingMatch.index
+  const beforeHeading = normalizedInput.slice(0, headingIndex).trimEnd()
+  const hasTrailingSeparator = /(?:^|\n)\s*---\s*$/.test(beforeHeading)
+  const sectionText = normalizedInput.slice(headingIndex)
+
+  // Remove heading and optional leading separator so we can parse items robustly.
+  const body = sectionText
+    .replace(/^\s*(?:---\s*)?(?:\*\*Follow-ups\*\*|Follow-up annotations:)\s*/i, '')
+
+  const itemRegex = />?\s*\[#(\d+)\]\s*([\s\S]*?)\s*→\s*([\s\S]*?)(?=(?:\s*---\s*>?\s*\[#\d+\])|$)/g
+  const parsedItems: Array<{ quote: string; note: string }> = []
+
+  for (const match of body.matchAll(itemRegex)) {
+    const quote = match[2]?.replace(/\s+/g, ' ').trim()
+    const note = match[3]?.replace(/\s+/g, ' ').trim()
+    if (!quote || !note) continue
+    parsedItems.push({ quote, note })
+  }
+
+  if (parsedItems.length === 0) {
+    return message
+  }
+
+  const rebuiltItems = parsedItems.map((item, idx) => [
+    `> [#${idx + 1}] ${item.quote}`,
+    `→ ${item.note}`,
+  ].join('\n'))
+
+  const includeTopSeparator = beforeHeading.length > 0 && !hasTrailingSeparator
+  const rebuiltBody = ['**Follow-ups**', rebuiltItems.join('\n\n---\n\n')].join('\n\n')
+  const rebuiltSection = includeTopSeparator
+    ? `---\n\n${rebuiltBody}`
+    : rebuiltBody
+
+  return beforeHeading.length > 0 ? `${beforeHeading}\n\n${rebuiltSection}` : rebuiltSection
 }
 
 /**
@@ -389,8 +491,6 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   thinkingLevel = 'think',
   onThinkingLevelChange,
   // Advanced options
-  ultrathinkEnabled = false,
-  onUltrathinkChange,
   permissionMode = 'ask',
   onPermissionModeChange,
   enabledModes,
@@ -406,8 +506,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   labels,
   onLabelsChange,
   // States (for # menu and badge)
-  todoStates,
-  onTodoStateChange,
+  sessionStatuses,
+  onSessionStatusChange,
   workspaceId,
   // Working directory
   workingDirectory,
@@ -429,6 +529,10 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Connection unavailable
   connectionUnavailable = false,
 }, ref) {
+  // Panel focus state (for multi-panel auto-scroll behavior)
+  const appShellContext = useAppShellContext()
+  const isFocusedPanel = appShellContext?.isFocusedPanel ?? true
+
   // Input is only disabled when explicitly disabled (e.g., agent needs activation)
   // User can type during streaming - submitting will stop the stream and send
   const isInputDisabled = disabled
@@ -440,20 +544,45 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   const [visibleTurnCount, setVisibleTurnCount] = React.useState(TURNS_PER_PAGE)
   // Sticky-bottom: When true, auto-scroll on content changes. Toggled by user scroll behavior.
   const isStickToBottomRef = React.useRef(true)
+  // Mirror isFocusedPanel into a ref so the ResizeObserver closure reads the latest value
+  const isFocusedPanelRef = React.useRef(isFocusedPanel)
+  isFocusedPanelRef.current = isFocusedPanel
   // Skip smooth scroll briefly after session switch (instant scroll already happened)
   const skipSmoothScrollUntilRef = React.useRef(0)
+  // Track message commit boundaries so we can auto-scroll when a new user message
+  // actually lands in state (important when attachments delay optimistic insertion).
+  const prevLastMessageIdRef = React.useRef<string | null>(null)
+  const prevMessageCountRef = React.useRef(0)
+  const prevSessionIdForCommitScrollRef = React.useRef<string | null>(null)
   const internalTextareaRef = React.useRef<RichTextInputHandle>(null)
   const textareaRef = externalTextareaRef || internalTextareaRef
+  const [sendMessageKey, setSendMessageKey] = useState<'enter' | 'cmd-enter'>('enter')
+  const [openAnnotationRequest, setOpenAnnotationRequest] = React.useState<{
+    messageId: string
+    annotationId: string
+    mode: 'view' | 'edit'
+    anchorX?: number
+    anchorY?: number
+    nonce: number
+  } | null>(null)
+  const followUpOpenNonceRef = React.useRef(0)
+
+  // Navigation for session branching
+  const { navigate } = useNavigation()
 
   // Get isDark from useTheme hook for overlay theme
   // This accounts for scenic themes (like Haze) that force dark mode
   const { isDark } = useTheme()
 
   // Register as focus zone - when zone gains focus, focus the textarea
+  // Guard with isFocusedPanelRef so only the focused panel responds in multi-panel layouts
   const { zoneRef, isFocused } = useFocusZone({
     zoneId: 'chat',
+    enabled: isFocusedPanel,
     focusFirst: () => {
-      textareaRef.current?.focus()
+      if (isFocusedPanelRef.current) {
+        textareaRef.current?.focus()
+      }
     },
   })
 
@@ -470,9 +599,6 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     setExpandedActivityGroups,
   } = useTurnCardExpansion(session?.id)
 
-  // Track which label should auto-open its value popover after being added via # menu.
-  // Set when a valued label is selected, cleared once the popover opens.
-  const [autoOpenLabelId, setAutoOpenLabelId] = useState<string | null>(null)
 
   // ============================================================================
   // Search Highlighting (from session list search)
@@ -500,11 +626,34 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Does NOT auto-focus just because session changed (that would steal focus from SessionList)
   // Uses isSearchModeActive (prop) instead of isSearchActive (query-based) to prevent
   // focus stealing when search is open but query is empty
+  // In multi-panel layouts, only the focused panel should auto-focus its textarea
   useEffect(() => {
-    if (session && !isSearchModeActive && isFocused) {
+    if (session && !isSearchModeActive && isFocused && isFocusedPanel) {
       textareaRef.current?.focus()
     }
-  }, [session?.id, isFocused, isSearchModeActive])
+  }, [session?.id, isFocused, isSearchModeActive, isFocusedPanel])
+
+  useEffect(() => {
+    let isMounted = true
+
+    const loadSendMessageKey = async () => {
+      if (!window.electronAPI) return
+
+      try {
+        const key = await window.electronAPI.getSendMessageKey()
+        if (!isMounted) return
+        setSendMessageKey(key ?? 'enter')
+      } catch (error) {
+        console.error('Failed to load send message key for follow-up view:', error)
+      }
+    }
+
+    loadSendMessageKey()
+
+    return () => {
+      isMounted = false
+    }
+  }, [])
 
   // Reset match state when session or search query changes
   useEffect(() => {
@@ -995,11 +1144,22 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     setOverlayState(null)
   }, [])
 
-  // Extract overlay data for activity-based overlays
-  // Uses the shared extractOverlayData parser from @craft-agent/ui
-  const overlayData: OverlayData | null = useMemo(() => {
+  // Extract overlay cards for activity-based overlays (Input/Output, future extensible)
+  const overlayCards = useMemo(() => {
+    if (!overlayState || overlayState.type !== 'activity') return []
+    return extractOverlayCards(overlayState.activity)
+  }, [overlayState])
+
+  // Parsed output data for legacy output-only activity overlays
+  const activityOutputOverlayData = useMemo(() => {
     if (!overlayState || overlayState.type !== 'activity') return null
     return extractOverlayData(overlayState.activity)
+  }, [overlayState])
+
+  // Stacked input/output cards are only enabled for Bash and MCP tools
+  const useStackedActivityOverlay = useMemo(() => {
+    if (!overlayState || overlayState.type !== 'activity') return false
+    return isStackedActivityTool(overlayState.activity)
   }, [overlayState])
 
   // Pop-out handler - opens message in overlay (read-only markdown)
@@ -1014,8 +1174,10 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
 
   // Helper to collect Edit/Write activities into FileChange array
   // Used by both onOpenActivityDetails and onOpenMultiFileDiff
-  // Supports both Claude Code format (file_path, old_string, new_string) and
-  // Codex format (changes array with path and diff fields)
+  // Supports:
+  // - Claude Code format: { file_path, old_string, new_string }
+  // - PI format: { path, oldText, newText }
+  // - Codex format: { changes: Array<{ path, kind, diff }> }
   const collectFileChanges = useCallback((activities: ActivityItem[]): FileChange[] => {
     const changes: FileChange[] = []
     for (const a of activities) {
@@ -1036,20 +1198,20 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
             })
           }
         } else {
-          // Claude Code format: { file_path, old_string, new_string }
+          // Claude fields take precedence; PI fields are additive fallbacks
           changes.push({
             id: a.id,
-            filePath: (input.file_path as string) || 'unknown',
+            filePath: (input.file_path as string) || (input.path as string) || 'unknown',
             toolType: 'Edit',
-            original: (input.old_string as string) || '',
-            modified: (input.new_string as string) || '',
+            original: (input.old_string as string) || (input.oldText as string) || '',
+            modified: (input.new_string as string) || (input.newText as string) || '',
             error: a.error || undefined,
           })
         }
       } else if (a.toolName === 'Write' && input) {
         changes.push({
           id: a.id,
-          filePath: (input.file_path as string) || 'unknown',
+          filePath: (input.file_path as string) || (input.path as string) || 'unknown',
           toolType: 'Write',
           original: '',
           modified: (input.content as string) || '',
@@ -1062,6 +1224,53 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
 
   // Ref to track total turn count for scroll handler
   const totalTurnCountRef = React.useRef(0)
+
+  // Latest message metadata (for commit-time auto-scroll)
+  const messageCount = session?.messages.length ?? 0
+  const lastMessage = messageCount > 0 ? session?.messages[messageCount - 1] : undefined
+  const lastMessageId = lastMessage?.id
+  const lastMessageRole = lastMessage?.role
+
+  const pendingFollowUpAnnotations = useMemo<PendingFollowUpAnnotation[]>(() => {
+    if (!session?.messages?.length) return []
+
+    const pending: PendingFollowUpAnnotation[] = []
+
+    for (const message of session.messages) {
+      if (message.role !== 'assistant' && message.role !== 'plan') continue
+      if (!message.annotations?.length) continue
+
+      for (const annotation of message.annotations) {
+        const note = getAnnotationNoteText(annotation)
+        if (!note) continue
+        if (isAnnotationFollowUpSent(annotation)) continue
+
+        pending.push({
+          messageId: message.id,
+          annotationId: annotation.id,
+          note,
+          selectedText: extractAnnotationSelectedText(annotation, message.content),
+          createdAt: annotation.updatedAt ?? annotation.createdAt,
+          color: annotation.style?.color,
+          meta: asRecord(annotation.meta) ?? undefined,
+        })
+      }
+    }
+
+    return pending.sort((a, b) => a.createdAt - b.createdAt)
+  }, [session?.messages])
+
+  const followUpInputItems = useMemo(() => {
+    return pendingFollowUpAnnotations.map((followUp, idx) => ({
+      id: `${followUp.messageId}:${followUp.annotationId}`,
+      messageId: followUp.messageId,
+      annotationId: followUp.annotationId,
+      index: idx + 1,
+      noteLabel: normalizeExcerptForMessage(followUp.note, 140),
+      selectedText: normalizeExcerptForMessage(followUp.selectedText, 260),
+      color: followUp.color,
+    }))
+  }, [pendingFollowUpAnnotations])
 
   // Track scroll position to toggle sticky-bottom behavior
   // - User scrolls up → unstick (stop auto-scrolling)
@@ -1123,6 +1332,13 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
     const resizeObserver = new ResizeObserver(() => {
+      // Unfocused panels: always scroll to bottom instantly (user isn't reading them)
+      if (!isFocusedPanelRef.current) {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'instant' })
+        return
+      }
+
+      // Focused panel: respect sticky-bottom preference
       if (!isStickToBottomRef.current) return
 
       // Clear pending scroll and wait for layout to settle
@@ -1146,12 +1362,87 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     }
   }, [session?.id])
 
+  // Commit-time auto-scroll for new user messages.
+  // This complements submit-time scrolling and covers cases where attachments delay
+  // optimistic message insertion (e.g., thumbnail generation/resizing).
+  React.useEffect(() => {
+    const currentSessionId = session?.id ?? null
+
+    // Reset baseline on session switch; defer to ScrollOnMount/session-switch logic.
+    if (prevSessionIdForCommitScrollRef.current !== currentSessionId) {
+      prevSessionIdForCommitScrollRef.current = currentSessionId
+      prevLastMessageIdRef.current = lastMessageId ?? null
+      prevMessageCountRef.current = messageCount
+      return
+    }
+
+    const previousCount = prevMessageCountRef.current
+    const previousLastId = prevLastMessageIdRef.current
+    const messageActuallyChanged = !!lastMessageId && lastMessageId !== previousLastId
+    const countIncreased = messageCount > previousCount
+
+    // Update baselines before early returns to keep refs consistent.
+    prevLastMessageIdRef.current = lastMessageId ?? null
+    prevMessageCountRef.current = messageCount
+
+    if (!messageActuallyChanged || !countIncreased) return
+    if (lastMessageRole !== 'user') return
+
+    // Sending a message should always re-stick to bottom.
+    isStickToBottomRef.current = true
+
+    requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({
+        behavior: isFocusedPanelRef.current ? 'smooth' : 'instant',
+      })
+    })
+  }, [session?.id, messageCount, lastMessageId, lastMessageRole])
+
   // Handle message submission from InputContainer
   // Backend handles interruption and queueing if currently processing
   const handleSubmit = (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => {
+    const hasBaseMessage = message.trim().length > 0
+    const followUpSection = formatFollowUpSection(pendingFollowUpAnnotations, {
+      includeTopSeparator: hasBaseMessage,
+    })
+    const messageWithFollowUps = followUpSection.length > 0
+      ? (hasBaseMessage ? `${message}\n\n${followUpSection}` : followUpSection)
+      : message
+    const normalizedMessage = normalizeFollowUpsMarkdown(messageWithFollowUps)
+
     // Force stick-to-bottom when user sends a message
     isStickToBottomRef.current = true
-    onSendMessage(message, attachments, skillSlugs)
+    onSendMessage(normalizedMessage, attachments, skillSlugs)
+
+    // Persist sent marker on follow-up annotations so TurnCard can distinguish
+    // sent vs pending follow-ups. If user edits a follow-up later, TurnCard
+    // clears these markers and the annotation becomes pending again.
+    if (session && pendingFollowUpAnnotations.length > 0) {
+      const sentAt = Date.now()
+      void Promise.all(pendingFollowUpAnnotations.map((followUp) => {
+        const currentMeta = followUp.meta ?? {}
+        const currentFollowUpMeta = asRecord(currentMeta.followUp) ?? {}
+
+        return window.electronAPI.sessionCommand(session.id, {
+          type: 'updateAnnotation',
+          messageId: followUp.messageId,
+          annotationId: followUp.annotationId,
+          patch: {
+            meta: {
+              ...currentMeta,
+              followUp: {
+                ...currentFollowUpMeta,
+                text: followUp.note,
+                lastSentAt: sentAt,
+                lastSentText: followUp.note,
+              },
+            },
+          },
+        })
+      })).catch((error) => {
+        console.error('[ChatDisplay] Failed to mark follow-up annotations as sent:', error)
+      })
+    }
 
     // Immediately scroll to bottom after sending - use requestAnimationFrame
     // to ensure the DOM has updated with the new message
@@ -1159,6 +1450,29 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     })
   }
+
+  const handleSaveAndSendFollowUp = useCallback((_target: {
+    messageId: string
+    annotationId: string
+    note: string
+    selectedText: string
+  }) => {
+    if (!session) return
+
+    if (isInputDisabled || disableSend || connectionUnavailable) {
+      toast.error('Cannot send right now', {
+        description: 'Sending is currently disabled for this session.',
+      })
+      return
+    }
+
+    // Mimic pressing Send in the input after Save completes.
+    window.setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('craft:submit-input', {
+        detail: { sessionId: session.id },
+      }))
+    }, 0)
+  }, [session, isInputDisabled, disableSend, connectionUnavailable])
 
   // Handle stop request from InputContainer
   // silent=true when redirecting (sending new message), silent=false when user clicks Stop button
@@ -1181,13 +1495,25 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
 
   // Handle structured input responses (permissions and credentials)
   const handleStructuredResponse = (response: StructuredResponse) => {
-    if (response.type === 'permission' && pendingPermission && onRespondToPermission) {
-      const permResponse = response as PermissionResponse
+    if ((response.type === 'permission' || response.type === 'admin_approval') && pendingPermission && onRespondToPermission) {
+      if (response.type === 'permission') {
+        const permResponse = response as PermissionResponse
+        onRespondToPermission(
+          pendingPermission.sessionId,
+          pendingPermission.requestId,
+          permResponse.allowed,
+          permResponse.alwaysAllow
+        )
+        return
+      }
+
+      const adminResponse = response as AdminApprovalResponse
       onRespondToPermission(
         pendingPermission.sessionId,
         pendingPermission.requestId,
-        permResponse.allowed,
-        permResponse.alwaysAllow
+        adminResponse.approved,
+        false,
+        { rememberForMinutes: adminResponse.rememberForMinutes }
       )
     } else if (response.type === 'credential' && pendingCredential && onRespondToCredential) {
       const credResponse = response as CredentialResponse
@@ -1202,6 +1528,19 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Build structured input state from pending requests (permissions take priority)
   const structuredInput: StructuredInputState | undefined = React.useMemo(() => {
     if (pendingPermission) {
+      if (pendingPermission.type === 'admin_approval') {
+        return {
+          type: 'admin_approval',
+          data: {
+            appName: pendingPermission.appName || pendingPermission.toolName || 'System action',
+            reason: pendingPermission.reason || pendingPermission.description,
+            impact: pendingPermission.impact,
+            command: pendingPermission.command || '',
+            requiresSystemPrompt: pendingPermission.requiresSystemPrompt ?? true,
+            rememberForMinutes: pendingPermission.rememberForMinutes ?? 10,
+          },
+        }
+      }
       return { type: 'permission', data: pendingPermission }
     }
     if (pendingCredential) {
@@ -1223,6 +1562,88 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   const startIndex = Math.max(0, allTurns.length - visibleTurnCount)
   const turns = allTurns.slice(startIndex)
   const hasMoreAbove = startIndex > 0
+
+  const assistantTurnIndexByMessageId = useMemo(() => {
+    const map = new Map<string, number>()
+    allTurns.forEach((turn, index) => {
+      if (turn.type !== 'assistant') return
+      const messageId = turn.response?.messageId
+      if (messageId) map.set(messageId, index)
+    })
+    return map
+  }, [allTurns])
+
+  const scrollToFollowUpTurn = useCallback((item: {
+    messageId: string
+    annotationId: string
+  }) => {
+    const targetTurnIndex = assistantTurnIndexByMessageId.get(item.messageId)
+    if (targetTurnIndex == null) return
+
+    const ensureVisibleCount = allTurns.length - targetTurnIndex
+
+    const scrollToTurn = () => {
+      const targetTurn = allTurns[targetTurnIndex]
+      if (!targetTurn) return false
+
+      const turnKey = getTurnKey(targetTurn)
+      const turnContainer = turnRefs.current.get(turnKey)
+      if (!turnContainer) return false
+
+      turnContainer.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      return true
+    }
+
+    if (ensureVisibleCount > visibleTurnCount) {
+      setVisibleTurnCount(ensureVisibleCount)
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (!scrollToTurn()) {
+            setTimeout(() => {
+              void scrollToTurn()
+            }, 80)
+          }
+        })
+      })
+      return
+    }
+
+    if (!scrollToTurn()) {
+      requestAnimationFrame(() => {
+        void scrollToTurn()
+      })
+    }
+  }, [assistantTurnIndexByMessageId, allTurns, visibleTurnCount])
+
+  const handleFollowUpChipClick = useCallback((item: {
+    messageId: string
+    annotationId: string
+  }, anchor?: { x: number; y: number }) => {
+    const targetTurnIndex = assistantTurnIndexByMessageId.get(item.messageId)
+    if (targetTurnIndex != null) {
+      const ensureVisibleCount = allTurns.length - targetTurnIndex
+      if (ensureVisibleCount > visibleTurnCount) {
+        setVisibleTurnCount(ensureVisibleCount)
+      }
+    }
+
+    followUpOpenNonceRef.current += 1
+    setOpenAnnotationRequest({
+      messageId: item.messageId,
+      annotationId: item.annotationId,
+      mode: 'view',
+      anchorX: anchor?.x,
+      anchorY: anchor?.y,
+      nonce: followUpOpenNonceRef.current,
+    })
+  }, [assistantTurnIndexByMessageId, allTurns, visibleTurnCount])
+
+  const handleFollowUpIndexClick = useCallback((item: {
+    messageId: string
+    annotationId: string
+  }) => {
+    scrollToFollowUpTurn(item)
+  }, [scrollToFollowUpTurn])
 
   // Compute if we should skip scroll-to-bottom (when search is active on session switch)
   // At render time, prevSessionIdForScrollRef still has the OLD session ID, so we can detect the switch
@@ -1304,13 +1725,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                   )}
                   {turns.map((turn, index) => {
                     // Compute turn key and check if it's a search match
-                    const getTurnKey = () => {
-                      if (turn.type === 'user') return `user-${turn.message.id}`
-                      if (turn.type === 'system') return `system-${turn.message.id}`
-                      if (turn.type === 'auth-request') return `auth-${turn.message.id}`
-                      return `turn-${turn.turnId}-${turn.timestamp}`
-                    }
-                    const turnKey = getTurnKey()
+                    const turnKey = getTurnKey(turn)
                     const isCurrentMatch = isSearchActive && matchingTurnIds[currentMatchIndex] === turnKey
                     const isAnyMatch = isSearchActive && matchingTurnIds.includes(turnKey)
 
@@ -1388,6 +1803,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                     const isLastResponse = index === turns.length - 1 || !turns.slice(index + 1).some(t => t.type === 'user')
 
                     // Assistant turns - render with TurnCard (buffered streaming)
+                    const assistantUiKey = getAssistantTurnUiKey(turn, index)
                     return (
                       <div
                         key={turnKey}
@@ -1402,14 +1818,15 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                       <TurnCard
                         sessionId={session.id}
                         sessionFolderPath={session.sessionFolderPath}
+                        hasActiveFollowUpAnnotations={pendingFollowUpAnnotations.length > 0}
                         turnId={turn.turnId}
                         activities={turn.activities}
                         response={turn.response}
                         intent={turn.intent}
                         isStreaming={turn.isStreaming}
                         isComplete={turn.isComplete}
-                        isExpanded={expandedTurns.has(turn.turnId)}
-                        onExpandedChange={(expanded) => toggleTurn(turn.turnId, expanded)}
+                        isExpanded={expandedTurns.has(assistantUiKey)}
+                        onExpandedChange={(expanded) => toggleTurn(assistantUiKey, expanded)}
                         expandedActivityGroups={expandedActivityGroups}
                         onExpandedActivityGroupsChange={setExpandedActivityGroups}
                         todos={turn.todos}
@@ -1417,22 +1834,105 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                         onOpenUrl={onOpenUrl}
                         isLastResponse={isLastResponse}
                         compactMode={compactMode}
-                        onAcceptPlan={() => {
-                          window.dispatchEvent(new CustomEvent('craft:approve-plan', {
-                            detail: { text: 'Plan approved, please execute.', sessionId: session?.id }
-                          }))
+                        sendMessageKey={sendMessageKey}
+                        openAnnotationRequest={openAnnotationRequest}
+                        onBranch={session?.supportsBranching ? async (messageId: string, options?: { newPanel?: boolean }) => {
+                          if (!session) return
+                          try {
+                            const child = await appShellContext.onCreateSession(
+                              session.workspaceId,
+                              {
+                                branchFromMessageId: messageId,
+                                branchFromSessionId: session.id,
+                                name: `Branch of ${session.name || 'Untitled'}`,
+                                // Keep branch on the same backend/provider by inheriting parent session settings.
+                                llmConnection: session.llmConnection,
+                                model: session.model,
+                                permissionMode: session.permissionMode,
+                                workingDirectory: session.workingDirectory,
+                                enabledSourceSlugs: session.enabledSourceSlugs,
+                              }
+                            )
+                            navigate(routes.view.allSessions(child.id), { newPanel: resolveBranchNewPanelOption(options) })
+                          } catch (error) {
+                            const rawMessage = error instanceof Error ? error.message : 'Failed to create branch'
+                            const message = rawMessage.includes('source and target providers must match')
+                              || rawMessage.includes('same provider/backend')
+                              ? 'Branching is only supported within the same provider/backend. Switch this panel connection and try again.'
+                              : rawMessage
+                            toast.error('Could not create branch', { description: message })
+                          }
+                        } : undefined}
+                        onAddAnnotation={async (messageId, annotation) => {
+                          if (!session) return
+                          try {
+                            await window.electronAPI.sessionCommand(session.id, {
+                              type: 'addAnnotation',
+                              messageId,
+                              annotation,
+                            })
+                          } catch (error) {
+                            toast.error('Could not save highlight', {
+                              description: error instanceof Error ? error.message : 'Unknown error',
+                            })
+                            throw error
+                          }
                         }}
-                        onAcceptPlanWithCompact={() => {
-                          // Find the most recent plan message to get its path
-                          // After compaction, Claude needs to know which plan file to read
+                        onRemoveAnnotation={async (messageId, annotationId) => {
+                          if (!session) return
+                          try {
+                            await window.electronAPI.sessionCommand(session.id, {
+                              type: 'removeAnnotation',
+                              messageId,
+                              annotationId,
+                            })
+                          } catch (error) {
+                            toast.error('Could not remove highlight', {
+                              description: error instanceof Error ? error.message : 'Unknown error',
+                            })
+                          }
+                        }}
+                        onUpdateAnnotation={async (messageId, annotationId, patch) => {
+                          if (!session) return
+                          try {
+                            await window.electronAPI.sessionCommand(session.id, {
+                              type: 'updateAnnotation',
+                              messageId,
+                              annotationId,
+                              patch,
+                            })
+                          } catch (error) {
+                            toast.error('Could not update highlight', {
+                              description: error instanceof Error ? error.message : 'Unknown error',
+                            })
+                            throw error
+                          }
+                        }}
+                        onSaveAndSendFollowUp={handleSaveAndSendFollowUp}
+                        onAcceptPlan={() => {
                           const planMessage = session?.messages.findLast(m => m.role === 'plan')
                           const planPath = planMessage?.planPath
 
-                          // Dispatch event to compact conversation first, then execute plan
-                          // FreeFormInput handles this by sending /compact, waiting for completion,
-                          // then sending a message with the plan path for Claude to read and execute
+                          window.dispatchEvent(new CustomEvent('craft:approve-plan', {
+                            detail: {
+                              sessionId: session?.id,
+                              planPath,
+                              includeDraftInput: true,
+                              source: 'plan-card',
+                            },
+                          }))
+                        }}
+                        onAcceptPlanWithCompact={() => {
+                          const planMessage = session?.messages.findLast(m => m.role === 'plan')
+                          const planPath = planMessage?.planPath
+
                           window.dispatchEvent(new CustomEvent('craft:approve-plan-with-compact', {
-                            detail: { sessionId: session?.id, planPath }
+                            detail: {
+                              sessionId: session?.id,
+                              planPath,
+                              includeDraftInput: true,
+                              source: 'plan-card',
+                            },
                           }))
                         }}
                         onPopOut={(text) => {
@@ -1476,7 +1976,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                               })
                             }
                           } else {
-                            // All other tools → Use extractOverlayData for appropriate overlay
+                            // All other tools → open generic activity cards overlay (Input/Output)
                             setOverlayState({ type: 'activity', activity })
                           }
                         }}
@@ -1521,97 +2021,60 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
           </div>
 
           {/* === INPUT CONTAINER: FreeForm or Structured Input === */}
-          <div className={cn(
-            CHAT_LAYOUT.maxWidth,
-            "mx-auto w-full px-4 mt-1",
-            compactMode ? "pb-4" : "pb-4"
-          )}>
-            {/* Active option badges and tasks - positioned above input */}
-            {!compactMode && (
-            <ActiveOptionBadges
-              ultrathinkEnabled={ultrathinkEnabled}
-              onUltrathinkChange={onUltrathinkChange}
-              permissionMode={permissionMode}
-              onPermissionModeChange={onPermissionModeChange}
-              tasks={backgroundTasks}
-              sessionId={session.id}
-              onKillTask={(taskId) => killTask(taskId, backgroundTasks.find(t => t.id === taskId)?.type ?? 'shell')}
-              onInsertMessage={onInputChange}
-              sessionLabels={session.labels}
-              labels={labels}
-              onLabelsChange={onLabelsChange}
-              onRemoveLabel={(labelId) => {
-                // Remove label from session and persist (legacy fallback)
-                const newLabels = (session.labels || []).filter(id => id !== labelId)
-                onLabelsChange?.(newLabels)
-              }}
-              autoOpenLabelId={autoOpenLabelId}
-              onAutoOpenConsumed={() => setAutoOpenLabelId(null)}
-              todoStates={todoStates}
-              currentTodoState={session.todoState || 'todo'}
-              onTodoStateChange={onTodoStateChange}
-            />
-            )}
-            <InputContainer
-              compactMode={compactMode}
-              placeholder={placeholder}
-              disabled={isInputDisabled}
-              isProcessing={session.isProcessing}
-              onAnimatedHeightChange={handleAnimatedHeightChange}
-              onSubmit={handleSubmit}
-              onStop={handleStop}
-              textareaRef={textareaRef}
-              currentModel={currentModel}
-              onModelChange={onModelChange}
-              thinkingLevel={thinkingLevel}
-              onThinkingLevelChange={onThinkingLevelChange}
-              ultrathinkEnabled={ultrathinkEnabled}
-              onUltrathinkChange={onUltrathinkChange}
-              permissionMode={permissionMode}
-              onPermissionModeChange={onPermissionModeChange}
-              enabledModes={enabledModes}
-              structuredInput={structuredInput}
-              onStructuredResponse={handleStructuredResponse}
-              inputValue={inputValue}
-              onInputChange={onInputChange}
-              sources={sources}
-              enabledSourceSlugs={session.enabledSourceSlugs}
-              onSourcesChange={onSourcesChange}
-              skills={skills}
-              labels={labels}
-              sessionLabels={session.labels}
-              onLabelAdd={(labelId) => {
-                // Add label to session (prevent duplicates) and persist
-                const current = session.labels || []
-                if (!current.includes(labelId)) {
-                  onLabelsChange?.([...current, labelId])
-                  // If the label has a valueType, auto-open its popover so the user
-                  // can set the value immediately without an extra click.
-                  const flat = flattenLabels(labels || [])
-                  const config = flat.find(l => l.id === labelId)
-                  if (config?.valueType) {
-                    setAutoOpenLabelId(labelId)
-                  }
-                }
-              }}
-              workspaceId={workspaceId}
-              workingDirectory={workingDirectory}
-              onWorkingDirectoryChange={onWorkingDirectoryChange}
-              sessionFolderPath={sessionFolderPath}
-              sessionId={session.id}
-              currentTodoState={session.todoState || 'todo'}
-              disableSend={disableSend || connectionUnavailable}
-              connectionUnavailable={connectionUnavailable}
-              isEmptySession={session.messages.length === 0}
-              currentConnection={session.llmConnection}
-              onConnectionChange={onConnectionChange}
-              contextStatus={{
+          <ChatInputZone
+            compactMode={compactMode}
+            permissionMode={permissionMode}
+            onPermissionModeChange={onPermissionModeChange}
+            tasks={backgroundTasks}
+            sessionId={session.id}
+            sessionFolderPath={sessionFolderPath}
+            onKillTask={(taskId) => killTask(taskId, backgroundTasks.find(t => t.id === taskId)?.type ?? 'shell')}
+            onInsertMessage={onInputChange}
+            sessionLabels={session.labels}
+            labels={labels}
+            onLabelsChange={onLabelsChange}
+            sessionStatuses={sessionStatuses}
+            currentSessionStatus={session.sessionStatus || 'todo'}
+            onSessionStatusChange={onSessionStatusChange}
+            inputProps={{
+              placeholder,
+              disabled: isInputDisabled,
+              isProcessing: session.isProcessing,
+              onAnimatedHeightChange: handleAnimatedHeightChange,
+              onSubmit: handleSubmit,
+              onStop: handleStop,
+              textareaRef,
+              currentModel,
+              onModelChange,
+              thinkingLevel,
+              onThinkingLevelChange,
+              enabledModes,
+              structuredInput,
+              onStructuredResponse: handleStructuredResponse,
+              inputValue,
+              onInputChange,
+              sources,
+              enabledSourceSlugs: session.enabledSourceSlugs,
+              onSourcesChange,
+              skills,
+              workspaceId,
+              workingDirectory,
+              onWorkingDirectoryChange,
+              disableSend: disableSend || connectionUnavailable,
+              connectionUnavailable,
+              isEmptySession: session.messages.length === 0,
+              currentConnection: session.llmConnection,
+              onConnectionChange,
+              contextStatus: {
                 isCompacting: session.currentStatus?.statusType === 'compacting',
                 inputTokens: session.tokenUsage?.inputTokens,
                 contextWindow: session.tokenUsage?.contextWindow,
-              }}
-            />
-          </div>
+              },
+              followUpItems: followUpInputItems,
+              onFollowUpClick: handleFollowUpChipClick,
+              onFollowUpIndexClick: handleFollowUpIndexClick,
+            }}
+          />
           </div>
         </div>
       ) : null}
@@ -1620,21 +2083,95 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
       {/* Preview Overlays - Rendered outside the main chat flow            */}
       {/* ================================================================== */}
 
-      {/* Code preview overlay (Read tool) */}
-      {overlayData?.type === 'code' && (
-        <CodePreviewOverlay
-          isOpen={!!overlayState}
+      {/* Activity details overlay */}
+      {overlayState?.type === 'activity' && useStackedActivityOverlay && (
+        <ActivityCardsOverlay
+          isOpen={true}
           onClose={handleCloseOverlay}
-          content={overlayData.content}
-          filePath={overlayData.filePath}
-          mode={overlayData.mode}
-          startLine={overlayData.startLine}
-          totalLines={overlayData.totalLines}
-          numLines={overlayData.numLines}
+          cards={overlayCards}
+          title={overlayState.activity.displayName || overlayState.activity.toolName || 'Activity'}
           theme={isDark ? 'dark' : 'light'}
-          error={overlayData.error}
-          command={overlayData.command}
+          onOpenUrl={onOpenUrl}
+          onOpenFile={onOpenFile}
         />
+      )}
+
+      {/* Legacy output-only activity overlay for non-bash/non-mcp tools */}
+      {overlayState?.type === 'activity' && !useStackedActivityOverlay && activityOutputOverlayData && (
+        activityOutputOverlayData.type === 'code' ? (
+          <CodePreviewOverlay
+            isOpen={true}
+            onClose={handleCloseOverlay}
+            content={activityOutputOverlayData.content}
+            filePath={activityOutputOverlayData.filePath}
+            mode={activityOutputOverlayData.mode}
+            startLine={activityOutputOverlayData.startLine}
+            totalLines={activityOutputOverlayData.totalLines}
+            numLines={activityOutputOverlayData.numLines}
+            command={activityOutputOverlayData.command}
+            error={activityOutputOverlayData.error}
+            theme={isDark ? 'dark' : 'light'}
+          />
+        ) : activityOutputOverlayData.type === 'terminal' ? (
+          <TerminalPreviewOverlay
+            isOpen={true}
+            onClose={handleCloseOverlay}
+            command={activityOutputOverlayData.command}
+            output={activityOutputOverlayData.output}
+            exitCode={activityOutputOverlayData.exitCode}
+            toolType={activityOutputOverlayData.toolType}
+            description={activityOutputOverlayData.description}
+            error={activityOutputOverlayData.error}
+            theme={isDark ? 'dark' : 'light'}
+          />
+        ) : activityOutputOverlayData.type === 'json' ? (
+          <JSONPreviewOverlay
+            isOpen={true}
+            onClose={handleCloseOverlay}
+            data={activityOutputOverlayData.data}
+            title={activityOutputOverlayData.title}
+            error={activityOutputOverlayData.error}
+            theme={isDark ? 'dark' : 'light'}
+          />
+        ) : activityOutputOverlayData.type === 'document' ? (
+          <DocumentFormattedMarkdownOverlay
+            isOpen={true}
+            onClose={handleCloseOverlay}
+            content={activityOutputOverlayData.content}
+            onOpenUrl={onOpenUrl}
+            onOpenFile={onOpenFile}
+            filePath={activityOutputOverlayData.filePath}
+            typeBadge={{
+              icon: Info,
+              label: activityOutputOverlayData.toolName,
+              variant: 'blue',
+            }}
+            error={activityOutputOverlayData.error}
+          />
+        ) : detectLanguage(activityOutputOverlayData.content) === 'markdown' ? (
+          <DocumentFormattedMarkdownOverlay
+            isOpen={true}
+            onClose={handleCloseOverlay}
+            content={activityOutputOverlayData.content}
+            onOpenUrl={onOpenUrl}
+            onOpenFile={onOpenFile}
+            typeBadge={{
+              icon: Info,
+              label: overlayState.activity.displayName || overlayState.activity.toolName || 'Activity',
+              variant: 'blue',
+            }}
+            error={activityOutputOverlayData.error}
+          />
+        ) : (
+          <GenericOverlay
+            isOpen={true}
+            onClose={handleCloseOverlay}
+            content={activityOutputOverlayData.content}
+            title={activityOutputOverlayData.title}
+            error={activityOutputOverlayData.error}
+            theme={isDark ? 'dark' : 'light'}
+          />
+        )
       )}
 
       {/* Multi-diff preview overlay (Edit/Write tools) */}
@@ -1648,48 +2185,6 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
           theme={isDark ? 'dark' : 'light'}
           diffViewerSettings={diffViewerSettings}
           onDiffViewerSettingsChange={handleDiffViewerSettingsChange}
-        />
-      )}
-
-      {/* Terminal preview overlay (Bash/Grep/Glob tools) */}
-      {overlayData?.type === 'terminal' && (
-        <TerminalPreviewOverlay
-          isOpen={!!overlayState}
-          onClose={handleCloseOverlay}
-          command={overlayData.command}
-          output={overlayData.output}
-          exitCode={overlayData.exitCode}
-          toolType={overlayData.toolType}
-          description={overlayData.description}
-          theme={isDark ? 'dark' : 'light'}
-          error={overlayData.error}
-        />
-      )}
-
-      {/* JSON preview overlay (MCP tools, WebSearch, etc.) */}
-      {overlayData?.type === 'json' && (
-        <JSONPreviewOverlay
-          isOpen={!!overlayState}
-          onClose={handleCloseOverlay}
-          data={overlayData.data}
-          title={overlayData.title}
-          theme={isDark ? 'dark' : 'light'}
-          error={overlayData.error}
-        />
-      )}
-
-      {/* Document overlay (Write tool → .md/.txt files) — rendered markdown with tool badge */}
-      {overlayData?.type === 'document' && (
-        <DocumentFormattedMarkdownOverlay
-          isOpen={!!overlayState}
-          onClose={handleCloseOverlay}
-          content={overlayData.content}
-          filePath={overlayData.filePath}
-          typeBadge={{ icon: PenLine, label: overlayData.toolName, variant: 'write' }}
-          onOpenUrl={onOpenUrl}
-          onOpenFile={onOpenFile}
-          error={overlayData.error}
-          variant={isPlanFilePath(overlayData.filePath) ? 'plan' : 'response'}
         />
       )}
 
@@ -1714,29 +2209,6 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
             content={overlayState.content}
             onOpenUrl={onOpenUrl}
             onOpenFile={onOpenFile}
-          />
-        )
-      )}
-
-      {/* Generic overlay for unknown tool types - route markdown to fullscreen viewer */}
-      {overlayData?.type === 'generic' && (
-        detectLanguage(overlayData.content) === 'markdown' ? (
-          <DocumentFormattedMarkdownOverlay
-            isOpen={true}
-            onClose={handleCloseOverlay}
-            content={overlayData.content}
-            onOpenUrl={onOpenUrl}
-            onOpenFile={onOpenFile}
-            error={overlayData.error}
-          />
-        ) : (
-          <GenericOverlay
-            isOpen={!!overlayState}
-            onClose={handleCloseOverlay}
-            content={overlayData.content}
-            title={overlayData.title}
-            theme={isDark ? 'dark' : 'light'}
-            error={overlayData.error}
           />
         )
       )}
@@ -1839,7 +2311,6 @@ function MessageBubble({
         badges={message.badges}
         isPending={message.isPending}
         isQueued={message.isQueued}
-        ultrathink={message.ultrathink}
         onUrlClick={onOpenUrl}
         onFileClick={onOpenFile}
         compactMode={compactMode}

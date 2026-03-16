@@ -24,22 +24,29 @@ import {
 } from './types.ts';
 import type { CredentialId, StoredCredential } from '../credentials/types.ts';
 import { getCredentialManager } from '../credentials/index.ts';
-import { CraftOAuth, getMcpBaseUrl, type OAuthCallbacks, type OAuthTokens } from '../auth/oauth.ts';
+import { CraftOAuth, getMcpBaseUrl, prepareMcpOAuth, exchangeMcpOAuth, type OAuthCallbacks, type OAuthTokens } from '../auth/oauth.ts';
 import { type OAuthSessionContext } from '../auth/types.ts';
+import type { PreparedOAuthFlow, OAuthExchangeParams, OAuthExchangeResult, OAuthProvider } from '../auth/oauth-flow-types.ts';
 import {
   startGoogleOAuth,
+  prepareGoogleOAuth,
+  exchangeGoogleOAuth,
   refreshGoogleToken,
   type GoogleOAuthResult,
   type GoogleOAuthOptions,
 } from '../auth/google-oauth.ts';
 import {
   startSlackOAuth,
+  prepareSlackOAuth,
+  exchangeSlackOAuth,
   refreshSlackToken,
   type SlackOAuthResult,
   type SlackOAuthOptions,
 } from '../auth/slack-oauth.ts';
 import {
   startMicrosoftOAuth,
+  prepareMicrosoftOAuth,
+  exchangeMicrosoftOAuth,
   refreshMicrosoftToken,
   type MicrosoftOAuthResult,
   type MicrosoftOAuthOptions,
@@ -213,17 +220,20 @@ export class SourceCredentialManager {
    */
   async getApiCredential(source: LoadedSource): Promise<ApiCredential | null> {
     const cred = await this.load(source);
-    debug(`[SourceCredentialManager] getApiCredential for ${source.config.slug}: cred.value exists=${!!cred?.value}, headerNames=${JSON.stringify(source.config.api?.headerNames)}`);
+    // Check both API and MCP headerNames (same credential store pattern)
+    const headerNames = source.config.api?.headerNames || source.config.mcp?.headerNames;
+    debug(`[SourceCredentialManager] getApiCredential for ${source.config.slug}: cred.value exists=${!!cred?.value}, headerNames=${JSON.stringify(headerNames)}`);
     if (!cred?.value) return null;
 
     // Check for multi-header auth (JSON with header names as keys)
-    if (source.config.api?.headerNames?.length) {
+    // Works for both API sources (api.headerNames) and MCP sources (mcp.headerNames)
+    if (headerNames?.length) {
       debug(`[SourceCredentialManager] Attempting multi-header parse for ${source.config.slug}, raw value length=${cred.value.length}`);
       try {
         const parsed = JSON.parse(cred.value);
         debug(`[SourceCredentialManager] Parsed JSON keys: ${Object.keys(parsed).join(', ')}`);
         // Validate all required headers are present
-        const hasAllHeaders = source.config.api.headerNames.every((h) => h in parsed);
+        const hasAllHeaders = headerNames.every((h) => h in parsed);
         debug(`[SourceCredentialManager] hasAllHeaders=${hasAllHeaders}`);
         if (hasAllHeaders) {
           return parsed as MultiHeaderCredential;
@@ -342,7 +352,159 @@ export class SourceCredentialManager {
   }
 
   // ============================================================
-  // OAuth Authentication
+  // Server-Owned OAuth (Prepare / Exchange)
+  // ============================================================
+
+  /**
+   * Detect the OAuth provider for a source.
+   */
+  detectProvider(source: LoadedSource): OAuthProvider {
+    if (source.config.provider === 'google') return 'google';
+    if (source.config.provider === 'slack') return 'slack';
+    if (source.config.provider === 'microsoft') return 'microsoft';
+    return 'mcp';
+  }
+
+  /**
+   * Prepare an OAuth flow for a source (server-side).
+   *
+   * Generates PKCE, state, and auth URL without opening a browser or starting
+   * a callback server. The caller provides the callbackPort; this function
+   * builds the provider-specific redirectUri.
+   *
+   * Returns a PreparedOAuthFlow that should be stored in the flow store
+   * and partially returned to the client (authUrl, state, flowId).
+   */
+  async prepareOAuth(source: LoadedSource, callbackPort: number): Promise<PreparedOAuthFlow> {
+    const provider = this.detectProvider(source);
+
+    switch (provider) {
+      case 'google': {
+        const api = source.config.api;
+        let service: GoogleService | undefined;
+        let scopes: string[] | undefined;
+
+        if (api?.googleScopes && api.googleScopes.length > 0) {
+          scopes = api.googleScopes;
+        } else if (api?.googleService) {
+          service = api.googleService;
+        } else {
+          service = inferGoogleServiceFromUrl(api?.baseUrl);
+          if (!service) {
+            throw new Error(
+              `Cannot determine Google service for source '${source.config.slug}'. ` +
+              `Set googleService in api config.`
+            );
+          }
+        }
+
+        return prepareGoogleOAuth({
+          service,
+          scopes,
+          callbackPort,
+          clientId: api?.googleOAuthClientId,
+          clientSecret: api?.googleOAuthClientSecret,
+        });
+      }
+
+      case 'slack': {
+        const api = source.config.api;
+        let service: import('./types.ts').SlackService | undefined;
+        let userScopes: string[] | undefined;
+
+        if (api?.slackUserScopes && api.slackUserScopes.length > 0) {
+          userScopes = api.slackUserScopes;
+        } else if (api?.slackService) {
+          service = api.slackService;
+        } else {
+          service = inferSlackServiceFromUrl(api?.baseUrl) || 'full';
+        }
+
+        return prepareSlackOAuth({ service, userScopes, callbackPort });
+      }
+
+      case 'microsoft': {
+        const api = source.config.api;
+        let service: MicrosoftService | undefined;
+        let scopes: string[] | undefined;
+
+        if (api?.microsoftScopes && api.microsoftScopes.length > 0) {
+          scopes = api.microsoftScopes;
+        } else if (api?.microsoftService) {
+          service = api.microsoftService;
+        } else {
+          service = inferMicrosoftServiceFromUrl(api?.baseUrl);
+          if (!service) {
+            throw new Error(
+              `Cannot determine Microsoft service for source '${source.config.slug}'. ` +
+              `Set microsoftService in api config.`
+            );
+          }
+        }
+
+        return prepareMicrosoftOAuth({ service, scopes, callbackPort });
+      }
+
+      case 'mcp': {
+        if (!source.config.mcp?.url) {
+          throw new Error('MCP URL not configured');
+        }
+        return prepareMcpOAuth(source.config.mcp.url, callbackPort);
+      }
+    }
+  }
+
+  /**
+   * Exchange an authorization code for tokens and store them (server-side).
+   *
+   * Called after the client forwards the code from the OAuth callback.
+   * Routes to the correct provider exchange, saves credentials, and marks
+   * the source as authenticated.
+   */
+  async exchangeAndStore(
+    source: LoadedSource,
+    provider: OAuthProvider,
+    params: OAuthExchangeParams
+  ): Promise<AuthResult> {
+    let result: OAuthExchangeResult;
+
+    switch (provider) {
+      case 'google':
+        result = await exchangeGoogleOAuth(params);
+        break;
+      case 'slack':
+        result = await exchangeSlackOAuth(params);
+        break;
+      case 'microsoft':
+        result = await exchangeMicrosoftOAuth(params);
+        break;
+      case 'mcp':
+        result = await exchangeMcpOAuth(params);
+        break;
+    }
+
+    if (!result.success) {
+      return { success: false, error: result.error };
+    }
+
+    // Save credentials
+    await this.save(source, {
+      value: result.accessToken!,
+      refreshToken: result.refreshToken,
+      expiresAt: result.expiresAt,
+      clientId: result.oauthClientId,
+      clientSecret: result.oauthClientSecret,
+    });
+
+    // Mark source as authenticated in config.json
+    markSourceAuthenticated(source.workspaceRootPath, source.config.slug);
+
+    debug(`[SourceCredentialManager] OAuth exchange+store complete for ${source.config.slug}`);
+    return { success: true, email: result.email };
+  }
+
+  // ============================================================
+  // OAuth Authentication (Monolithic — convenience wrapper for CLI/test)
   // ============================================================
 
   /**

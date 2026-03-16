@@ -35,6 +35,12 @@ export {
   SystemMessage,
   FileTypeIcon,
   getFileTypeLabel,
+  asRecord,
+  getAnnotationNoteText,
+  getAnnotationFollowUpState,
+  isAnnotationFollowUpSent,
+  extractAnnotationSelectedText,
+  normalizeFollowUpText,
   // Inline execution for EditPopover
   InlineExecution,
   mapToolEventToActivity,
@@ -68,10 +74,18 @@ export {
   useCollapsibleMarkdown,
   MarkdownDatatableBlock,
   MarkdownSpreadsheetBlock,
+  MarkdownImageBlock,
+  ImageCardStack,
   type MarkdownProps,
   type RenderMode,
+  TiptapMarkdownEditor,
+  type TiptapMarkdownEditorProps,
+  type MarkdownEngine,
   type MarkdownDatatableBlockProps,
   type MarkdownSpreadsheetBlockProps,
+  type MarkdownImageBlockProps,
+  type ImageCardStackProps,
+  type ImageCardStackItem,
 } from './components/markdown'
 
 // UI primitives
@@ -91,12 +105,37 @@ export {
   StyledDropdownMenuSeparator,
   StyledDropdownMenuSubTrigger,
   StyledDropdownMenuSubContent,
+  BrowserShader,
+  BrowserControls,
+  BrowserEmptyStateCard,
+  FilterableSelectPopover,
+  Island,
+  IslandContentView,
+  IslandFollowUpContentView,
+  useIslandNavigation,
   type SpinnerProps,
   type SimpleDropdownProps,
   type SimpleDropdownItemProps,
   type PreviewHeaderProps,
   type PreviewHeaderBadgeProps,
   type PreviewBadgeVariant,
+  type BrowserShaderProps,
+  type BrowserControlsProps,
+  type BrowserEmptyStateCardProps,
+  type BrowserEmptyPromptSample,
+  type FilterableSelectPopoverProps,
+  type FilterableSelectRenderState,
+  type IslandProps,
+  type IslandContentViewProps,
+  type IslandTransitionConfig,
+  type IslandActiveViewSize,
+  type IslandMorphTarget,
+  type IslandFollowUpContentViewProps,
+  type IslandFollowUpMode,
+  type IslandNavigation,
+  type IslandDialogBehavior,
+  type AnchorX,
+  type AnchorY,
 } from './components/ui'
 
 // Tooltip
@@ -180,6 +219,8 @@ export {
   type DocumentFormattedMarkdownOverlayProps,
   type ImagePreviewOverlayProps,
   type PDFPreviewOverlayProps,
+  ActivityCardsOverlay,
+  type ActivityCardsOverlayProps,
 } from './components/overlay'
 
 // File classification (for link interceptor)
@@ -191,6 +232,14 @@ export {
 
 // Utilities
 export { cn } from './lib/utils'
+export {
+  setDismissibleLayerBridge,
+  getDismissibleLayerBridge,
+  type DismissibleLayerBridge,
+  type DismissibleLayerRegistration,
+  type DismissibleLayerSnapshot,
+  type DismissibleLayerType,
+} from './lib/dismissible-layer-bridge'
 
 // Layout constants and hooks
 export {
@@ -208,6 +257,7 @@ export {
   parseGrepResult,
   parseGlobResult,
   extractOverlayData,
+  extractOverlayCards,
   type ReadResult,
   type BashResult,
   type GrepResult,
@@ -218,17 +268,11 @@ export {
   type JSONOverlayData,
   type DocumentOverlayData,
   type OverlayData,
+  type OverlayCard,
 } from './lib/tool-parsers'
 
 // Turn utilities (pure functions)
 export * from './components/chat/turn-utils'
-
-// Action Cards
-export {
-  ActionCard,
-  type ActionCardProps,
-  type ActionCardAction,
-} from './components/cards/ActionCard'
 
 // Icons
 export {

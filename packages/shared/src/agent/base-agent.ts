@@ -13,7 +13,7 @@
  * Provider-specific behavior (chat, abort, capabilities) is implemented in subclasses.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { AgentEvent } from '@craft-agent/core/types';
@@ -22,6 +22,10 @@ import type { ThinkingLevel } from './thinking-levels.ts';
 import { DEFAULT_THINKING_LEVEL } from './thinking-levels.ts';
 import type { PermissionMode } from './mode-manager.ts';
 import type { LoadedSource } from '../sources/types.ts';
+import { buildCallLlmRequest, type LLMQueryRequest, type LLMQueryResult } from './llm-tool.ts';
+import { getLlmConnections, getDefaultLlmConnection } from '../config/storage.ts';
+import { loadAllSources } from '../sources/storage.ts';
+import type { ApiServerConfig } from '../mcp/mcp-pool.ts';
 
 import type {
   AgentBackend,
@@ -33,6 +37,9 @@ import type {
   SourceActivationCallback,
   SdkMcpServerConfig,
   BackendConfig,
+  PostInitResult,
+  BridgeUpdateContext,
+  RecoveryMessage,
 } from './backend/types.ts';
 import { AbortReason } from './backend/types.ts';
 import type { AuthRequest } from './session-scoped-tools.ts';
@@ -45,20 +52,18 @@ import { PromptBuilder } from './core/prompt-builder.ts';
 import { PathProcessor } from './core/path-processor.ts';
 import { ConfigWatcherManager, type ConfigWatcherManagerCallbacks } from './core/config-watcher-manager.ts';
 import { UsageTracker, type UsageUpdate } from './core/usage-tracker.ts';
-import { getSessionPlansPath, getSessionDataPath } from '../sessions/storage.ts';
+import { PrerequisiteManager } from './core/prerequisite-manager.ts';
+
+// Automation system for agent events
+import type { AutomationSystem } from '../automations/automation-system.ts';
+import type { AgentEvent as AutomationAgentEvent, SdkAutomationInput } from '../automations/types.ts';
+import { getSessionPlansPath, getSessionDataPath, getSessionPath } from '../sessions/storage.ts';
 import { getMiniAgentSystemPrompt } from '../prompts/system.ts';
 import { buildTitlePrompt, buildRegenerateTitlePrompt, validateTitle } from '../utils/title-generator.ts';
-import {
-  handleLargeResponse,
-  estimateTokens,
-  TOKEN_LIMIT,
-  type SummarizationContext,
-  type HandleLargeResponseResult,
-} from '../utils/large-response.ts';
 
 // Skill extraction for Codex/Copilot backends (Claude uses native SDK Skill tool)
-import { parseMentions, stripAllMentions } from '../mentions/index.ts';
-import { loadWorkspaceSkills } from '../skills/storage.ts';
+import { parseMentions, stripAllMentions, resolveFileMentions } from '../mentions/index.ts';
+import { loadAllSkills } from '../skills/storage.ts';
 
 // ============================================================
 // Mini Agent Configuration
@@ -79,11 +84,56 @@ export interface MiniAgentConfig {
   minimizeThinking: boolean;
 }
 
+// ============================================================
+// Spawn Session Types
+// ============================================================
+
+export interface SpawnSessionRequest {
+  prompt: string;
+  name?: string;
+  llmConnection?: string;
+  model?: string;
+  enabledSourceSlugs?: string[];
+  permissionMode?: PermissionMode;
+  labels?: string[];
+  workingDirectory?: string;
+  attachments?: Array<{ path: string; name?: string }>;
+}
+
+export interface SpawnSessionResult {
+  sessionId: string;
+  name: string;
+  status: 'started';
+  connection?: string;
+  model?: string;
+}
+
+export interface SpawnSessionHelpResult {
+  connections: Array<{
+    slug: string;
+    name: string;
+    isDefault: boolean;
+    providerType: string;
+    models: string[];
+    defaultModel?: string;
+  }>;
+  sources: Array<{
+    slug: string;
+    name: string;
+    type: string;
+    enabled: boolean;
+  }>;
+  defaults: {
+    defaultConnection: string | null;
+    permissionMode: string;
+  };
+}
+
 /** Tool list for mini agents - quick config edits only */
 export const MINI_AGENT_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash'] as const;
 
-/** MCP servers for mini agents - minimal set */
-export const MINI_AGENT_MCP_KEYS = ['session', 'craft-agents-docs'] as const;
+/** MCP servers for mini agents - minimal set (docs tools are now bundled in session) */
+export const MINI_AGENT_MCP_KEYS = ['session'] as const;
 
 // ============================================================
 // BaseAgent Abstract Class
@@ -98,6 +148,7 @@ export const MINI_AGENT_MCP_KEYS = ['session', 'craft-agents-docs'] as const;
  * - Callback declarations for UI integration
  *
  * Subclasses must implement:
+ * - backendName: Display name for error messages ('Claude', 'Codex', etc.)
  * - chat(): Provider-specific agentic loop
  * - abort(): Provider-specific abort handling
  * - capabilities(): Provider-specific capabilities
@@ -106,6 +157,15 @@ export const MINI_AGENT_MCP_KEYS = ['session', 'craft-agents-docs'] as const;
  * - runMiniCompletion(): Simple text completion using backend's auth
  */
 export abstract class BaseAgent implements AgentBackend {
+  // ============================================================
+  // Backend Identity
+  // ============================================================
+  protected abstract backendName: string;
+
+  /** Whether this backend supports session branching. Subclasses can override. */
+  protected _supportsBranching = true;
+  get supportsBranching(): boolean { return this._supportsBranching; }
+
   // ============================================================
   // Configuration (protected for subclass access)
   // ============================================================
@@ -118,7 +178,6 @@ export abstract class BaseAgent implements AgentBackend {
   // ============================================================
   protected _model: string;
   protected _thinkingLevel: ThinkingLevel;
-  protected _ultrathinkOverride: boolean = false;
 
   // ============================================================
   // Core Modules (protected for subclass access)
@@ -129,6 +188,8 @@ export abstract class BaseAgent implements AgentBackend {
   protected pathProcessor: PathProcessor;
   protected configWatcherManager: ConfigWatcherManager | null = null;
   protected usageTracker: UsageTracker;
+  protected prerequisiteManager: PrerequisiteManager;
+  protected automationSystem?: AutomationSystem;
 
   // ============================================================
   // Additional State (protected for subclass access)
@@ -148,6 +209,8 @@ export abstract class BaseAgent implements AgentBackend {
   onDebug: ((message: string) => void) | null = null;
   onSourceActivationRequest: SourceActivationCallback | null = null;
   onUsageUpdate: ((update: UsageUpdate) => void) | null = null;
+  onBackendAuthRequired: ((reason: string) => void) | null = null;
+  onSpawnSession: ((request: SpawnSessionRequest) => Promise<SpawnSessionResult>) | null = null;
 
   // ============================================================
   // Constructor
@@ -194,6 +257,15 @@ export abstract class BaseAgent implements AgentBackend {
       onUsageUpdate: (update) => this.onUsageUpdate?.(update),
       onDebug: (msg) => this.debug(msg),
     });
+
+    // PrerequisiteManager: blocks source tool calls until guide.md is read
+    this.prerequisiteManager = new PrerequisiteManager({
+      workspaceRootPath: config.workspace.rootPath,
+      onDebug: (msg) => this.debug(msg),
+    });
+
+    // AutomationSystem: workspace-level automations from automations.json
+    this.automationSystem = config.automationSystem;
   }
 
   // ============================================================
@@ -226,7 +298,7 @@ export abstract class BaseAgent implements AgentBackend {
 
     this.configWatcherManager = new ConfigWatcherManager(
       {
-        workspaceRootPath: this.workingDirectory,
+        workspaceRootPath: this.config.workspace.rootPath,
         isHeadless: this.config.isHeadless,
         onDebug: (msg) => this.debug(msg),
       },
@@ -256,6 +328,22 @@ export abstract class BaseAgent implements AgentBackend {
    */
   protected debug(message: string): void {
     this.onDebug?.(message);
+  }
+
+  /**
+   * Fire an automation agent event (from automations.json) via AutomationSystem.
+   * Catches all errors — automations must never break the agent flow.
+   *
+   * Non-Claude backends call this directly. ClaudeAgent uses SDK's buildSdkHooks() instead.
+   *
+   * @param signal - Optional AbortSignal for cancelling automation execution on abort
+   */
+  protected async emitAutomationEvent(event: AutomationAgentEvent, input: SdkAutomationInput, signal?: AbortSignal): Promise<void> {
+    try {
+      await this.automationSystem?.executeAgentEvent(event, input, signal);
+    } catch (err) {
+      this.debug(`Automation event ${event} failed: ${err}`);
+    }
   }
 
   // ============================================================
@@ -354,11 +442,6 @@ export abstract class BaseAgent implements AgentBackend {
     this.debug(`Thinking level set to: ${level}`);
   }
 
-  setUltrathinkOverride(enabled: boolean): void {
-    this._ultrathinkOverride = enabled;
-    this.debug(`Ultrathink override: ${enabled ? 'ENABLED' : 'disabled'}`);
-  }
-
   // ============================================================
   // Permission Mode (delegated to PermissionManager)
   // ============================================================
@@ -412,7 +495,19 @@ export abstract class BaseAgent implements AgentBackend {
    */
   clearHistory(): void {
     this.usageTracker.reset();
+    this.prerequisiteManager.resetReadState();
     this.debug('History cleared');
+  }
+
+  /**
+   * Reset prerequisite read state (e.g., on context compaction).
+   * After compaction the LLM no longer has guide content in context,
+   * so it must re-read before using source tools.
+   * Also resets seen sources so guide paths re-appear in source introductions.
+   */
+  resetPrerequisiteState(): void {
+    this.prerequisiteManager.resetReadState();
+    this.sourceManager.resetSeenSources();
   }
 
   /**
@@ -456,17 +551,27 @@ export abstract class BaseAgent implements AgentBackend {
    *
    * Subclasses may override to handle provider-specific MCP setup.
    */
-  setSourceServers(
+  async setSourceServers(
     mcpServers: Record<string, SdkMcpServerConfig>,
     apiServers: Record<string, unknown>,
     intendedSlugs?: string[]
-  ): void {
+  ): Promise<void> {
     // Update SourceManager state (common tracking)
     this.sourceManager.updateActiveState(
       Object.keys(mcpServers),
       Object.keys(apiServers),
       intendedSlugs
     );
+
+    // Sync the centralized MCP client pool (if available)
+    // Both MCP sources and API sources are routed through the pool.
+    if (this.config.mcpPool) {
+      try {
+        await this.config.mcpPool.sync(mcpServers, apiServers as Record<string, ApiServerConfig>);
+      } catch (err) {
+        this.debug(`Failed to sync MCP pool: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   getActiveSourceSlugs(): string[] {
@@ -639,12 +744,86 @@ Please continue the conversation naturally from where we left off.
   }
 
   /**
+   * Build one-time branch seed context for sessions branched from an earlier message.
+   * Ensures the first turn in the new branch only sees transcript up to the selected branch point.
+   */
+  protected buildBranchSeedContext(messages?: RecoveryMessage[]): string | null {
+    if (!messages || messages.length === 0) return null;
+
+    // Keep seed payload bounded to avoid oversized first-turn prompts.
+    const bounded = messages.slice(-24);
+
+    const formattedMessages = bounded
+      .map((m) => {
+        const role = m.type === 'user' ? 'User' : 'Assistant';
+        const content =
+          m.content.length > 1200
+            ? m.content.slice(0, 1200) + '...[truncated]'
+            : m.content;
+        return `[${role}]: ${content}`;
+      })
+      .join('\n\n');
+
+    return `<branch_seed_context>
+This is a branched conversation. The context below is the parent transcript up to the selected branch point.
+Ignore and do not assume any parent messages that came after this cutoff.
+
+${formattedMessages}
+</branch_seed_context>`;
+  }
+
+  /**
    * Clear session ID and notify callbacks.
    * Called when session resume fails and we need to start fresh.
    */
   protected clearSessionForRecovery(): void {
     this.config.onSdkSessionIdCleared?.();
     this.debug('Session cleared for recovery');
+  }
+
+  // ============================================================
+  // Path Helpers
+  // ============================================================
+
+  /**
+   * Get the session storage path for this agent's session.
+   * Convenience wrapper around getSessionPath() with null-checking.
+   *
+   * @returns Session path, or undefined if session/workspace not configured
+   */
+  protected getSessionStoragePath(): string | undefined {
+    if (!this.config.session?.id || !this.config.workspace.rootPath) return undefined;
+    return getSessionPath(this.config.workspace.rootPath, this.config.session.id);
+  }
+
+  // ============================================================
+  // Lifecycle (postInit, applyBridgeUpdates)
+  // ============================================================
+
+  /**
+   * Post-construction initialization.
+   * Default: no-op (auth already handled for Claude/Pi API-key).
+   * Override in backends that need post-construction auth injection.
+   */
+  async postInit(): Promise<PostInitResult> {
+    return { authInjected: true };
+  }
+
+  /**
+   * Apply bridge/config updates mid-session.
+   * Default: no-op for backends that don't use bridge-mcp-server (Claude, Pi).
+   * Override in Codex/Copilot to regenerate config or write bridge files.
+   */
+  async applyBridgeUpdates(_context: BridgeUpdateContext): Promise<void> {
+    // No-op by default
+  }
+
+  /**
+   * Ensure branch sessions are backend-ready before first user message.
+   * Default implementation is a no-op.
+   */
+  async ensureBranchReady(): Promise<void> {
+    // No-op by default
   }
 
   // ============================================================
@@ -667,77 +846,139 @@ Please continue the conversation naturally from where we left off.
     this.permissionManager.clearWhitelists();
     this.sourceManager.resetSeenSources();
     this.usageTracker.reset();
+
+    // Disconnect MCP pool to avoid connection leaks
+    if (this.config.mcpPool) {
+      this.config.mcpPool.disconnectAll().catch(err => {
+        this.debug(`Failed to disconnect MCP pool: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+
     this.debug('Base agent destroyed');
   }
 
   // ============================================================
-  // Skill Content (shared across backends)
+  // Skill Path Resolution (shared across backends)
   // ============================================================
 
   /**
-   * SKILL INJECTION STRATEGY
-   * ClaudeAgent: Uses the SDK's built-in Skill tool for native discovery.
-   * CodexAgent: Reads SKILL.md and injects content as <skill> XML blocks,
-   *   because Codex app-server only discovers skills from its own paths.
-   */
-  protected getSkillContent(skillPath: string): string | null {
-    const filePath = join(skillPath, 'SKILL.md')
-    return existsSync(filePath) ? readFileSync(filePath, 'utf-8') : null
-  }
-
-  /**
-   * Extract skill mentions from a message and return formatted skill contents.
+   * Extract skill mentions from a message and resolve their SKILL.md paths.
    *
-   * Parses [skill:slug] or [skill:workspaceId:slug] mentions, loads the
-   * corresponding SKILL.md files, and wraps them in XML tags.
-   *
-   * Used by CodexAgent and CopilotAgent to inject skill content into messages.
-   * (ClaudeAgent uses the SDK's native Skill tool instead.)
+   * Parses [skill:slug] or [skill:workspaceId:slug] mentions, resolves the
+   * corresponding SKILL.md file paths. Does NOT read the files — the model
+   * must read them itself (enforced by PrerequisiteManager).
    *
    * @param message - The user message containing potential skill mentions
    * @returns Object with:
-   *   - skillContents: Array of formatted skill XML blocks
+   *   - skillPaths: Map of slug → resolved SKILL.md absolute path
    *   - cleanMessage: Message with mentions stripped, or default directive
+   *   - missingSkills: Array of skill slugs that were mentioned but not found
    */
-  protected extractSkillContent(message: string): {
-    skillContents: string[];
+  protected extractSkillPaths(message: string): {
+    skillPaths: Map<string, string>;
     cleanMessage: string;
+    missingSkills: string[];
   } {
     const workspaceRoot = this.config.workspace?.rootPath ?? this.workingDirectory;
-    const skills = loadWorkspaceSkills(workspaceRoot);
+    const projectRoot = this.config.session?.workingDirectory;
+    const skills = loadAllSkills(workspaceRoot, projectRoot);
     const skillSlugs = skills.map(s => s.slug);
 
-    this.debug(`[extractSkillContent] Available skills: ${skillSlugs.join(', ')}`);
+    this.debug(`[extractSkillPaths] Available skills: ${skillSlugs.join(', ')}`);
 
     const parsed = parseMentions(message, skillSlugs, []);
-    this.debug(`[extractSkillContent] Parsed skills: ${JSON.stringify(parsed.skills)}`);
+    this.debug(`[extractSkillPaths] Parsed skills: ${JSON.stringify(parsed.skills)}`);
+    if (parsed.invalidSkills && parsed.invalidSkills.length > 0) {
+      this.debug(`[extractSkillPaths] Invalid skills: ${JSON.stringify(parsed.invalidSkills)}`);
+    }
 
-    // Read matched SKILL.md files and wrap in XML tags
-    const skillContents: string[] = [];
+    // Resolve SKILL.md paths for matched skills
+    const skillPaths = new Map<string, string>();
     for (const slug of parsed.skills) {
       const skill = skills.find(s => s.slug === slug);
       if (skill) {
-        const content = this.getSkillContent(skill.path);
-        if (content) {
-          this.debug(`[extractSkillContent] Loaded skill ${skill.slug} (${content.length} chars)`);
-          skillContents.push(`<skill name="${skill.slug}">\n${content}\n</skill>`);
+        const skillMdPath = join(skill.path, 'SKILL.md');
+        if (existsSync(skillMdPath)) {
+          skillPaths.set(slug, skillMdPath);
+          this.debug(`[extractSkillPaths] Resolved skill ${slug} → ${skillMdPath}`);
         } else {
-          this.debug(`[extractSkillContent] SKILL.md not found: ${skill.path}`);
+          this.debug(`[extractSkillPaths] SKILL.md not found: ${skillMdPath}`);
         }
       }
     }
 
-    // Strip all bracket mentions from the message text
-    const stripped = stripAllMentions(message).trim();
+    // Strip control mentions (skills, sources) from the message text
+    const stripped = stripAllMentions(message);
+
+    // Resolve [file:path] and [folder:path] to absolute paths
+    const workDir = this.config.session?.workingDirectory ?? this.workingDirectory;
+    const resolved = resolveFileMentions(stripped, workDir).trim();
 
     // If user sent only skill mentions with no other text, add a directive
-    const cleanMessage = (!stripped && skillContents.length > 0)
-      ? 'Follow the skill instructions above.'
-      : stripped;
+    const cleanMessage = (!resolved && skillPaths.size > 0)
+      ? 'Follow the skill instructions from the files listed above.'
+      : resolved;
 
-    this.debug(`[extractSkillContent] Clean message: "${cleanMessage.slice(0, 100)}...", skills: ${skillContents.length}`);
+    this.debug(`[extractSkillPaths] Clean message: "${cleanMessage.slice(0, 100)}...", skills: ${skillPaths.size}`);
 
-    return { skillContents, cleanMessage };
+    return {
+      skillPaths,
+      cleanMessage,
+      missingSkills: parsed.invalidSkills || []
+    };
+  }
+
+  /**
+   * Format a directive telling the model to read skill SKILL.md files before proceeding.
+   * Called from chat() — all agents get the same directive prepended to their message.
+   */
+  protected formatSkillDirective(skillPaths: Map<string, string>): string {
+    if (skillPaths.size === 0) return '';
+    const pathList = [...skillPaths.entries()]
+      .map(([slug, path]) => `- ${path} (skill: ${slug})`)
+      .join('\n');
+    return `Before proceeding with the user's request, you MUST read the following skill instruction files using the Read tool or \`cat\` via Bash:\n${pathList}\n\nDo not take any other action until you have read these files.`;
+  }
+
+  // ============================================================
+  // Chat entry point (template method)
+  // ============================================================
+
+  /**
+   * Send a message and stream back events.
+   * Validates skill mentions, registers prerequisites, prepends read directive,
+   * then delegates to chatImpl. All skill logic is handled here — chatImpl
+   * never sees skill paths.
+   */
+  async *chat(
+    message: string,
+    attachments?: FileAttachment[],
+    options?: ChatOptions
+  ): AsyncGenerator<AgentEvent> {
+    const { skillPaths, cleanMessage, missingSkills } = this.extractSkillPaths(message);
+    if (missingSkills.length > 0) {
+      yield { type: 'error', message: `Skill(s) not found: ${missingSkills.join(', ')}` };
+      yield { type: 'complete' };
+      return;
+    }
+
+    // Register skill prerequisites — blocks all tools until SKILL.md files are read.
+    if (skillPaths.size > 0) {
+      this.prerequisiteManager.registerSkillPrerequisites([...skillPaths.values()]);
+    }
+
+    // Prepend branch seed context (for seeded branch sessions) and skill directive.
+    const branchSeedContext = this.buildBranchSeedContext(this.config.getBranchSeedMessages?.());
+    if (branchSeedContext) {
+      this.config.markBranchSeedApplied?.();
+    }
+
+    // Prepend read directive to the message so the model reads SKILL.md first.
+    const directive = this.formatSkillDirective(skillPaths);
+    const messageParts = [branchSeedContext, directive, cleanMessage].filter(Boolean);
+    const effectiveMessage = messageParts.join('\n\n');
+
+    yield* this.chatImpl(effectiveMessage, attachments, options);
   }
 
   // ============================================================
@@ -745,10 +986,16 @@ Please continue the conversation naturally from where we left off.
   // ============================================================
 
   /**
-   * Send a message and stream back events.
-   * This is the core agentic loop - handles tool execution, permission checks, etc.
+   * Provider-specific chat implementation.
+   * Called by chat() after skill validation, prerequisite registration,
+   * and directive injection. The message already contains any skill
+   * read directives — subclasses don't handle skills at all.
+   *
+   * @param message - User message (may have skill read directive prepended)
+   * @param attachments - File attachments
+   * @param options - Chat options (resume, retry, etc.)
    */
-  abstract chat(
+  protected abstract chatImpl(
     message: string,
     attachments?: FileAttachment[],
     options?: ChatOptions
@@ -764,6 +1011,15 @@ Please continue the conversation naturally from where we left off.
    * Used for auth requests, plan submissions where we need synchronous abort.
    */
   abstract forceAbort(reason: AbortReason): void;
+
+  /**
+   * Redirect the agent mid-stream. Default: abort and let session layer re-send.
+   * Override in backends that support native steering (e.g., Pi's steer()).
+   */
+  redirect(_message: string): boolean {
+    this.forceAbort(AbortReason.Redirect);
+    return false;
+  }
 
   /**
    * Check if currently processing a query.
@@ -785,6 +1041,109 @@ Please continue the conversation naturally from where we left off.
    */
   abstract runMiniCompletion(prompt: string): Promise<string | null>;
 
+  /**
+   * Execute an LLM query using the agent's auth infrastructure.
+   * Used by call_llm tool (via queryFn callback) and potentially by runMiniCompletion.
+   *
+   * Each backend implements this using its own SDK/session mechanism:
+   * - ClaudeAgent: SDK query() with OAuth
+   * - CodexAgent: Ephemeral thread on app-server
+   * - CopilotAgent: Ephemeral CopilotSession
+   *
+   * @param request - The query request (prompt, model, systemPrompt, etc.)
+   * @returns The model's response text and optional token usage
+   */
+  abstract queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult>;
+
+  /**
+   * Pre-execute a call_llm request: resolve attachments, validate model, run query.
+   * Shared across all backends. Codex overrides validateCallLlmModel() for provider filtering.
+   */
+  protected async preExecuteCallLlm(input: Record<string, unknown>): Promise<LLMQueryResult> {
+    const sessionPath = getSessionPath(this.config.workspace.rootPath, this._sessionId);
+    const request = await buildCallLlmRequest(input, {
+      backendName: this.backendName,
+      sessionPath,
+      validateModel: this.validateCallLlmModel?.bind(this),
+    });
+    return this.queryLlm(request);
+  }
+
+  /**
+   * Optional model validation hook for call_llm.
+   * Override in subclasses to filter models (e.g., Codex rejects non-OpenAI models).
+   * Return undefined to fall back to miniModel.
+   */
+  protected validateCallLlmModel?(modelId: string): string | undefined;
+
+  /**
+   * Pre-execute a spawn_session request: handle help mode or delegate to onSpawnSession.
+   * Shared across all backends.
+   */
+  protected async preExecuteSpawnSession(
+    input: Record<string, unknown>
+  ): Promise<SpawnSessionResult | SpawnSessionHelpResult> {
+    // Help mode — return available config info
+    if (input.help) {
+      return this.getSpawnSessionHelp();
+    }
+
+    // Spawn mode — validate and delegate
+    const prompt = input.prompt as string | undefined;
+    if (!prompt?.trim()) {
+      throw new Error('prompt is required when not in help mode. Call with help=true to see available options.');
+    }
+
+    if (!this.onSpawnSession) {
+      throw new Error('spawn_session is not available in this context.');
+    }
+
+    const request: SpawnSessionRequest = {
+      prompt,
+      name: input.name as string | undefined,
+      llmConnection: input.llmConnection as string | undefined,
+      model: input.model as string | undefined,
+      enabledSourceSlugs: input.enabledSourceSlugs as string[] | undefined,
+      permissionMode: input.permissionMode as SpawnSessionRequest['permissionMode'],
+      labels: input.labels as string[] | undefined,
+      workingDirectory: input.workingDirectory as string | undefined,
+      attachments: input.attachments as SpawnSessionRequest['attachments'],
+    };
+
+    return this.onSpawnSession(request);
+  }
+
+  /**
+   * Get available connections, models, and sources for spawn_session help mode.
+   */
+  protected getSpawnSessionHelp(): SpawnSessionHelpResult {
+    const connections = getLlmConnections();
+    const defaultConnectionSlug = getDefaultLlmConnection();
+    const allSources = loadAllSources(this.config.workspace.rootPath);
+    const activeSlugs = this.sourceManager.getActiveSlugs();
+
+    return {
+      connections: connections.map(c => ({
+        slug: c.slug,
+        name: c.name,
+        isDefault: c.slug === defaultConnectionSlug,
+        providerType: c.providerType,
+        models: (c.models || []).map(m => typeof m === 'string' ? m : m.id),
+        defaultModel: c.defaultModel,
+      })),
+      sources: allSources.map(s => ({
+        slug: s.config.slug,
+        name: s.config.name,
+        type: s.config.type,
+        enabled: activeSlugs.has(s.config.slug),
+      })),
+      defaults: {
+        defaultConnection: defaultConnectionSlug,
+        permissionMode: this.permissionManager.getPermissionMode(),
+      },
+    };
+  }
+
   // ============================================================
   // Title Generation (shared implementation using runMiniCompletion)
   // ============================================================
@@ -794,11 +1153,12 @@ Please continue the conversation naturally from where we left off.
    * Uses runMiniCompletion with the same auth as the main agent.
    *
    * @param message - The user's message to generate a title from
+   * @param options.language - Preferred language for the title
    * @returns Generated title (2-5 words), or null if generation fails
    */
-  async generateTitle(message: string): Promise<string | null> {
+  async generateTitle(message: string, options?: { language?: string }): Promise<string | null> {
     try {
-      const prompt = buildTitlePrompt(message);
+      const prompt = buildTitlePrompt(message, options);
       const result = await this.runMiniCompletion(prompt);
       return validateTitle(result);
     } catch (error) {
@@ -809,59 +1169,22 @@ Please continue the conversation naturally from where we left off.
 
   /**
    * Regenerate a session title based on recent conversation context.
-   * Uses recent messages to capture what the session has evolved into.
+   * Uses a spread of messages (first, middle, last) to capture the session's purpose.
    *
-   * @param recentUserMessages - The last few user messages
+   * @param recentUserMessages - Spread of user messages
    * @param lastAssistantResponse - The most recent assistant response
+   * @param options.language - Preferred language for the title
    * @returns Generated title (2-5 words), or null if generation fails
    */
-  async regenerateTitle(recentUserMessages: string[], lastAssistantResponse: string): Promise<string | null> {
+  async regenerateTitle(recentUserMessages: string[], lastAssistantResponse: string, options?: { language?: string }): Promise<string | null> {
     try {
-      const prompt = buildRegenerateTitlePrompt(recentUserMessages, lastAssistantResponse);
+      const prompt = buildRegenerateTitlePrompt(recentUserMessages, lastAssistantResponse, options);
       const result = await this.runMiniCompletion(prompt);
       return validateTitle(result);
     } catch (error) {
       this.debug(`[regenerateTitle] Failed: ${error}`);
       return null;
     }
-  }
-
-  // ============================================================
-  // Large Response Handling (shared implementation using runMiniCompletion)
-  // ============================================================
-
-  /**
-   * Handle a large tool result: save to disk, summarize, and format.
-   * Uses runMiniCompletion with the same auth as the main agent.
-   *
-   * @param text - The large response text
-   * @param sessionPath - Path to the session folder
-   * @param context - Context about the tool call
-   * @returns Result with formatted message + file path, or null if not large enough
-   */
-  async handleLargeToolResult(
-    text: string,
-    sessionPath: string,
-    context: SummarizationContext
-  ): Promise<HandleLargeResponseResult | null> {
-    try {
-      return await handleLargeResponse({
-        text,
-        sessionPath,
-        context,
-        summarize: this.runMiniCompletion.bind(this),
-      });
-    } catch (error) {
-      this.debug(`[handleLargeToolResult] Failed: ${error}`);
-      return null;
-    }
-  }
-
-  /**
-   * Check if a response is large enough to need handling.
-   */
-  isLargeResponse(text: string): boolean {
-    return estimateTokens(text) > TOKEN_LIMIT;
   }
 
   /**

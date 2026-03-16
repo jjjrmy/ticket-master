@@ -56,6 +56,27 @@ export async function handleSourceOAuthTrigger(
     );
   }
 
+  // Try silent refresh only if source is already authenticated.
+  // If connectionStatus is 'needs_auth' or isAuthenticated is false,
+  // skip refresh and go straight to browser authorization flow.
+  if (source.isAuthenticated && ctx.credentialManager) {
+    const workspaceId = basename(ctx.workspacePath) || '';
+    const loadedSource = {
+      config: source,
+      guide: null,
+      folderPath: '',
+      workspaceRootPath: ctx.workspacePath,
+      workspaceId,
+    };
+
+    const refreshedToken = await ctx.credentialManager.refresh(loadedSource);
+    if (refreshedToken) {
+      return successResponse(
+        `Token for source '${sourceSlug}' has been refreshed successfully. The source is ready — proceed with using its tools directly.`
+      );
+    }
+  }
+
   // Build auth request
   const authRequest: McpOAuthAuthRequest = {
     type: 'oauth',

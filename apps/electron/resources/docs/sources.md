@@ -2,6 +2,10 @@
 
 This guide explains how to configure sources (MCP servers, APIs, local filesystems) in Craft Agent.
 
+> **CLI-first workflow (recommended):** Use `craft-agent source ...` commands instead of editing source config files directly.
+> - `craft-agent source --help`
+> - Canonical command reference: [craft-cli.md](./craft-cli.md)
+
 ## Source Setup Process
 
 When a user wants to add a new source, follow this conversational setup process to create a tailored, well-documented integration.
@@ -20,11 +24,29 @@ mcp__craft-agents-docs__SearchCraftAgents({ query: "{service} source setup" })
 1. **Read the guide content** carefully
 2. **Pay special attention to the "Setup Hints" section** - it contains critical instructions
 3. **Follow any CRITICAL/MANDATORY instructions** before proceeding (e.g., GitHub requires checking for `gh` CLI first)
-4. **ALWAYS verify current API endpoints via WebSearch** - URLs change frequently
+4. **ALWAYS verify current API endpoints via WebSearch and/or in-app browser** - URLs and docs change frequently
 
 **Why this matters:** Some services have important prerequisites or gotchas that MUST be checked before creating a source. Skipping this step can lead to failed setups or redundant configurations.
 
 **Also check the "Common Providers" section** at the bottom of this document — it contains service-specific configuration requirements (e.g., Figma needs `clientName` and `callbackPath` overrides, GitHub needs bearer auth instead of OAuth). These details won't appear in generic web search results.
+
+### 0.5. Choose Source vs Browser Path (RECOMMENDED PRE-FLIGHT)
+
+Sources remain the default for reusable integrations. Before building a new source, ask: **Is this repeatable integration work, or a one-off/UI-driven task?**
+
+**Prefer creating/using a source when:**
+- The workflow is repeatable and likely to be reused
+- Structured querying/reporting is needed
+- Team consistency and automation matter
+- API/MCP auth is stable enough to maintain
+
+**Prefer in-app browser first (or as fallback) when:**
+- Auth/setup is known to be brittle (common with some Gmail/Microsoft scenarios)
+- The user needs a one-off task completed quickly
+- The API is limited, unstable, or missing required operations
+- The workflow is UI-first and not worth full integration overhead
+
+If you choose browser-first, still offer optional source setup later when the user needs repeatability.
 
 ### 1. Understand User Intent
 
@@ -43,20 +65,27 @@ Example questions:
 ### 2. Research the Service
 
 Use available tools to learn about the service:
-- **WebSearch**: Find official documentation, API references, best practices
+- **WebSearch/WebFetch**: Find official documentation, API references, best practices
+- **In-app browser tools**: Use when docs are dynamic, interactive, or behind login
 - **Look up**: Rate limits, quotas, authentication methods
 - **Identify**: Key endpoints or tools relevant to user's stated goals
 - **Note**: Any limitations or gotchas to document
+
+### Source vs Browser: Practical Examples
+
+- **Gmail/Microsoft setup keeps failing auth:** attempt source setup, but confirm browser fallback for immediate task completion.
+- **Need a one-off export from an admin UI:** use browser directly; skip full source setup unless recurring.
+- **API lacks the required endpoint but UI supports it:** use browser as preferred path and document limitation.
 
 ### 3. Configure Intelligently
 
 Based on research and user intent, create `config.json` with **ALL required fields**:
 
-**Required fields:**
+**Core fields:**
 - `id` - **REQUIRED**: Unique identifier string. Format: `{slug}_{random}` (e.g., `linear_a1b2c3d4`). Generate the random part with any method (e.g., 8 hex chars).
 - `name`, `slug`, `provider`, `type` - Basic identification
-- `icon` - **REQUIRED**: URL to the service's favicon, logo, or app icon. Search the web to find an appropriate icon that looks like an app icon. The icon is auto-downloaded and cached locally. Use an emoji as fallback.
-- `tagline` - **REQUIRED**: Short description for agent context (e.g., "Issue tracking, sprint planning, and project management")
+- `icon` - **RECOMMENDED**: URL to the service's favicon, logo, or app icon. The icon is auto-downloaded and cached locally. Use an emoji as fallback.
+- `tagline` - **RECOMMENDED**: Short description for agent context (e.g., "Issue tracking, sprint planning, and project management")
 - Type-specific config (`mcp`, `api`, or `local`)
 - Authentication method appropriate for the service
 
@@ -233,7 +262,7 @@ Each source folder contains:
   "provider": "provider-name",
   "type": "mcp" | "api" | "local",
 
-  // REQUIRED: Icon and tagline for UI and agent context
+  // RECOMMENDED: Icon and tagline for better UI and agent context
   "icon": "https://example.com/favicon.ico",  // URL (auto-downloaded) or emoji
   "tagline": "Brief description for agent context",
 
@@ -739,9 +768,10 @@ Requires `clientName: "Codex"` and `callbackPath: "/callback"` in the mcp config
 **Always follow the conversational setup process** (see above). The key steps:
 
 1. **Ask before creating**: Understand user intent, scope, and common tasks
-2. **Research before configuring**: Use WebSearch to find docs, best practices, limitations
-3. **Tailor guide.md to context**: Include specific projects/teams the user mentioned
-4. **Test before declaring done**: Validate config, trigger auth, verify connection
+2. **Choose the right path**: Confirm if this should be a source or a browser-first one-off workflow
+3. **Research before configuring**: Use WebSearch/WebFetch and browser tools as needed
+4. **Tailor guide.md to context**: Include specific projects/teams the user mentioned
+5. **Test before declaring done**: Validate config, trigger auth, verify connection
 
 Technical steps:
 

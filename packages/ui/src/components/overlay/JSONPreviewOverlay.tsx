@@ -66,7 +66,7 @@ export interface JSONPreviewOverlayProps {
   onClose: () => void
   /** Parsed JSON data to display */
   data: unknown
-  /** File path — shows dual-trigger menu badge with "Open" + "Reveal in Finder" */
+  /** File path — shows dual-trigger menu badge with "Open" + "Reveal in {file manager}" */
   filePath?: string
   /** Title to display in header (fallback when no filePath) */
   title?: string
@@ -109,9 +109,14 @@ export function JSONPreviewOverlay({
     return theme === 'dark' ? craftAgentDarkTheme : craftAgentLightTheme
   }, [theme])
 
-  // Recursively parse any stringified JSON within the data for better display
+  // Recursively parse any stringified JSON within the data for better display.
+  // Guard: @uiw/react-json-view crashes on null/undefined/primitive values — wrap them
+  // in an object so the viewer can render them safely.
   const processedData = useMemo(() => {
-    return deepParseJson(data) as object
+    const parsed = deepParseJson(data)
+    if (parsed === null || parsed === undefined) return { '(empty)': null }
+    if (typeof parsed !== 'object') return { '(root)': parsed }
+    return parsed as object
   }, [data])
 
   return (
